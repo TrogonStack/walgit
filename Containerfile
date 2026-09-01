@@ -24,7 +24,10 @@ RUN pnpm run build && test -f dist/index.html && test -f dist/repos.js
 
 # ---- 2. rust build ------------------------------------------------------------------------
 FROM docker.io/library/rust:1.97-bookworm AS build
-RUN apt-get update && apt-get install -y --no-install-recommends protobuf-compiler pkg-config cmake perl python3 \
+# libprotobuf-dev, not just protobuf-compiler: Debian ships protoc in one package and the
+# well-known types it resolves `import "google/protobuf/timestamp.proto"` against in the other,
+# and --no-install-recommends means the second one has to be asked for by name.
+RUN apt-get update && apt-get install -y --no-install-recommends protobuf-compiler libprotobuf-dev pkg-config cmake perl python3 \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /src
 COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
