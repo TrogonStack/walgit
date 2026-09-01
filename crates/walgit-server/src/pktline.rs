@@ -8,15 +8,11 @@ pub const MAX_DATA_LEN: usize = 65516;
 
 /// Encode a data line into `buf`. Panics if `data` exceeds [`MAX_DATA_LEN`].
 pub fn encode_line(buf: &mut Vec<u8>, data: &[u8]) {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
     assert!(data.len() <= MAX_DATA_LEN, "pkt-line too long");
     let len = data.len() + 4;
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    buf.extend_from_slice(&[
-        HEX[(len >> 12) & 0xf],
-        HEX[(len >> 8) & 0xf],
-        HEX[(len >> 4) & 0xf],
-        HEX[len & 0xf],
-    ]);
+    let nib = |shift: usize| HEX.get((len >> shift) & 0xf).copied().unwrap_or(b'0');
+    buf.extend_from_slice(&[nib(12), nib(8), nib(4), nib(0)]);
     buf.extend_from_slice(data);
 }
 

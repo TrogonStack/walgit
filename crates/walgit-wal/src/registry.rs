@@ -1,4 +1,4 @@
-//! Registry: process-wide map of RepoId -> Arc<RepoHandle>.
+//! Registry: process-wide map of `RepoId` -> Arc<RepoHandle>.
 
 use std::str::FromStr;
 use std::sync::Arc;
@@ -95,18 +95,17 @@ impl Registry {
         let prefixed = Prefixed::new(self.store.clone(), prefix);
 
         // Read manifest (NotFound if absent)
-        let (meta, manifest) = match get_message::<Manifest>(&prefixed, keys::MANIFEST).await? {
-            Some(v) => v,
-            None => return Err(WalError::NotFound),
+        let Some((meta, manifest)) = get_message::<Manifest>(&prefixed, keys::MANIFEST).await?
+        else {
+            return Err(WalError::NotFound);
         };
 
         // Open or init local repo (LocalRepo joins owner/name.git onto the root).
-        let local = match LocalRepo::open(&self.cache_root, id)? {
-            Some(l) => l,
-            None => {
-                let format = parse_object_format(&manifest.object_format);
-                LocalRepo::init(&self.cache_root, id, format)?
-            }
+        let local = if let Some(l) = LocalRepo::open(&self.cache_root, id)? {
+            l
+        } else {
+            let format = parse_object_format(&manifest.object_format);
+            LocalRepo::init(&self.cache_root, id, format)?
         };
 
         // Load state
@@ -183,7 +182,7 @@ impl Registry {
         Ok(())
     }
 
-    /// CAS-create manifest.pb (PutMode::Create). Err(AlreadyExists) on 412.
+    /// CAS-create manifest.pb (`PutMode::Create`). Err(AlreadyExists) on 412.
     pub async fn create(
         &self,
         id: &RepoId,
@@ -341,8 +340,8 @@ impl Registry {
         Ok(repos)
     }
 
-    /// Disk cache maintenance: evict idle repos beyond cache.max_bytes / evict_idle_after.
-    pub async fn evict_idle(&self) -> Result<EvictReport, WalError> {
+    /// Disk cache maintenance: evict idle repos beyond `cache.max_bytes` / `evict_idle_after`.
+    pub fn evict_idle(&self) -> Result<EvictReport, WalError> {
         let evict_after = self.cfg.cache.evict_idle_after;
         // D25: budget mode evicts past `cache.max_bytes`; disk mode only under
         // disk pressure (filesystem of `cache.dir` above `disk_high_watermark`)
@@ -355,6 +354,11 @@ impl Registry {
                     if frac <= self.cfg.cache.disk_high_watermark {
                         return Ok(EvictReport::default());
                     }
+                    #[allow(
+                        clippy::cast_possible_truncation,
+                        clippy::cast_sign_loss,
+                        reason = "the saturating float-to-int cast is the intended rounding"
+                    )]
                     let low = ((self.cfg.cache.disk_high_watermark - 0.10).max(0.0) * total as f64)
                         as u64;
                     // Other data on the filesystem counts against us: target =
@@ -385,7 +389,7 @@ impl Registry {
 
         // Collect idle repos. In-use checks happen again while evicting: a
         // request may acquire a ReadGuard after this snapshot.
-        for entry in self.repos.iter() {
+        for entry in &self.repos {
             let handle = entry.value();
             let last_access = handle.last_access();
             if now.duration_since(last_access) > evict_after {
@@ -464,16 +468,26 @@ fn dir_size(path: &std::path::Path) -> u64 {
     walk(path, &mut std::collections::HashSet::new())
 }
 
+/// statvfs field widths differ per platform, so widen through a generic bound rather
+/// than a conversion that is redundant on one target and required on another.
+fn widen<T: Into<u64>>(v: T) -> u64 {
+    v.into()
+}
+
 /// (used, total) bytes of the filesystem holding `path` (statvfs).
+#[allow(unsafe_code)]
 fn disk_usage(path: &std::path::Path) -> Option<(u64, u64)> {
     use std::ffi::CString;
     use std::os::unix::ffi::OsStrExt;
     let c = CString::new(path.as_os_str().as_bytes()).ok()?;
+    // SAFETY: statvfs is a plain C struct of integers, so all-zero is a valid value.
     let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
-    if unsafe { libc::statvfs(c.as_ptr(), &mut st) } != 0 {
+    // SAFETY: `c` is a live NUL-terminated CString and `st` is a live, correctly
+    // typed statvfs that the call only writes into.
+    if unsafe { libc::statvfs(c.as_ptr(), &raw mut st) } != 0 {
         return None;
     }
-    let total = st.f_blocks as u64 * st.f_frsize as u64;
-    let avail = st.f_bavail as u64 * st.f_frsize as u64;
+    let total = widen(st.f_blocks) * widen(st.f_frsize);
+    let avail = widen(st.f_bavail) * widen(st.f_frsize);
     Some((total.saturating_sub(avail), total))
 }

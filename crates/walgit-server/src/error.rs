@@ -3,7 +3,7 @@
 //! 200 response per the smart HTTP contract. Only transport/auth/routing errors
 //! become HTTP error statuses.
 
-use axum::http::StatusCode;
+use axum::http::{HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 
 #[derive(Debug)]
@@ -70,7 +70,7 @@ impl IntoResponse for ApiError {
         if self.status() == StatusCode::UNAUTHORIZED {
             resp.headers_mut().insert(
                 axum::http::header::WWW_AUTHENTICATE,
-                "Bearer realm=\"walgit\"".parse().unwrap(),
+                HeaderValue::from_static("Bearer realm=\"walgit\""),
             );
         }
         // 503s are transient by contract (placement refusal during a fallback,
@@ -78,7 +78,7 @@ impl IntoResponse for ApiError {
         if status == StatusCode::SERVICE_UNAVAILABLE {
             resp.headers_mut().insert(
                 axum::http::header::RETRY_AFTER,
-                axum::http::HeaderValue::from_static("15"),
+                HeaderValue::from_static("15"),
             );
         }
         resp
@@ -90,6 +90,47 @@ impl From<walgit_store::StoreError> for ApiError {
         match e {
             walgit_store::StoreError::NotFound { key } => ApiError::NotFound(key),
             other => ApiError::Internal(other.to_string()),
+        }
+    }
+}
+
+impl From<crate::auth::AuthError> for ApiError {
+    fn from(e: crate::auth::AuthError) -> Self {
+        match e {
+            crate::auth::AuthError::Invalid | crate::auth::AuthError::Unauthorized => {
+                ApiError::Unauthorized
+            }
+            crate::auth::AuthError::Forbidden => ApiError::Forbidden,
+            crate::auth::AuthError::Unavailable => {
+                ApiError::ServiceUnavailable("auth provider unavailable".into())
+            }
+        }
+    }
+}
+
+impl From<walgit_git::GitError> for ApiError {
+    fn from(e: walgit_git::GitError) -> Self {
+        ApiError::Internal(format!("git: {e}"))
+    }
+}
+
+impl From<walgit_bundle::BundleError> for ApiError {
+    fn from(e: walgit_bundle::BundleError) -> Self {
+        ApiError::Internal(format!("bundle: {e}"))
+    }
+}
+
+impl From<walgit_wal::WalError> for ApiError {
+    fn from(e: walgit_wal::WalError) -> Self {
+        match &e {
+            walgit_wal::WalError::NotFound => ApiError::NotFound(e.to_string()),
+            walgit_wal::WalError::TooLarge { .. } => ApiError::ServiceUnavailable(e.to_string()),
+            // A store call that timed out / was throttled: fail fast, let the
+            // client retry (never hang the request on the bucket).
+            walgit_wal::WalError::Store(se) if se.is_retryable() => {
+                ApiError::ServiceUnavailable(format!("object store: {se}"))
+            }
+            _ => ApiError::Internal(format!("wal: {e}")),
         }
     }
 }

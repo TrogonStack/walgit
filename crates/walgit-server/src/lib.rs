@@ -77,18 +77,15 @@ pub struct AppState {
 }
 
 impl AppState {
-    /// Build a full AppState from a config + store (memory or opened backend).
-    pub async fn new(
-        cfg: Arc<walgit_config::Config>,
-        store: DynStore,
-    ) -> anyhow::Result<Arc<Self>> {
+    /// Build a full `AppState` from a config + store (memory or opened backend).
+    pub fn new(cfg: &Arc<walgit_config::Config>, store: DynStore) -> anyhow::Result<Arc<Self>> {
         let registry = walgit_wal::Registry::new(store.clone(), cfg.clone());
-        let bridge = bridge::Bridge::new(&cfg, registry.clone());
+        let bridge = bridge::Bridge::new(cfg, registry.clone());
         let bundle_source: Arc<dyn walgit_bundle::BundleSource> =
             Arc::new(RegistryBundleSource(registry.clone()));
         let bundles = walgit_bundle::Bundler::new_with_source(bundle_source, cfg.clone());
         let metrics_handle = metrics::install()?;
-        let tls = tls::load(&cfg)?;
+        let tls = tls::load(cfg)?;
         if let Some(t) = &tls {
             tracing::info!(fingerprint = %t.fingerprint, mode = ?cfg.server.tls.mode, "TLS terminated in-process");
         }
@@ -97,10 +94,10 @@ impl AppState {
             store,
             registry,
             bundles,
-            auth: auth::Authenticator::new(&cfg),
+            auth: auth::Authenticator::new(cfg),
             semaphores: middleware::RepoSemaphores::new(cfg.server.max_concurrent_per_repo),
             inflight: Arc::new(middleware::Inflight::default()),
-            caches: cache::ServerCaches::new(&cfg),
+            caches: cache::ServerCaches::new(cfg),
             metrics_handle,
             lfs_upstream: lfs_upstream::Upstream::new(),
             readiness: prewarm::Readiness::new(),
@@ -143,7 +140,8 @@ pub fn router(state: Arc<AppState>) -> Router {
             state.clone(),
             web::require_auth,
         ));
-    let inner = Router::new()
+
+    Router::new()
         .merge(
             web::api::router(state.clone())
                 .with_state(())
@@ -176,7 +174,7 @@ pub fn router(state: Arc<AppState>) -> Router {
                  body: Body| async move {
                     bridge::http_notify(&st, &headers, body)
                         .await
-                        .unwrap_or_else(|e| e.into_response())
+                        .unwrap_or_else(axum::response::IntoResponse::into_response)
                 },
             ),
         )
@@ -194,7 +192,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         ))
         // A panicking handler must only fail its own request (500), never the process.
         .layer(tower_http::catch_panic::CatchPanicLayer::custom(
-            panic_response,
+            |err: Box<dyn std::any::Any + Send + 'static>| panic_response(&*err),
         ))
         // `Server: walgit/<ver> (<kind>; <who>)` on every response (incl. errors,
         // SSE, git pkt streams): which machine answered, without logs. The UI
@@ -222,26 +220,24 @@ pub fn router(state: Arc<AppState>) -> Router {
             state.inflight.clone(),
             middleware::request_id,
         ))
-        .with_state(state);
-    inner
+        .with_state(state)
 }
 
 async fn host_from_authority(mut req: Request<Body>) -> Request<Body> {
-    if !req.headers().contains_key(axum::http::header::HOST) {
-        if let Some(auth) = req.uri().authority().map(|a| a.to_string()) {
-            if let Ok(v) = axum::http::HeaderValue::from_str(&auth) {
-                req.headers_mut().insert(axum::http::header::HOST, v);
-            }
-        }
+    if !req.headers().contains_key(axum::http::header::HOST)
+        && let Some(auth) = req.uri().authority().map(ToString::to_string)
+        && let Ok(v) = axum::http::HeaderValue::from_str(&auth)
+    {
+        req.headers_mut().insert(axum::http::header::HOST, v);
     }
     req
 }
 
-fn panic_response(err: Box<dyn std::any::Any + Send + 'static>) -> Response {
+fn panic_response(err: &(dyn std::any::Any + Send + 'static)) -> Response {
     let msg = err
         .downcast_ref::<String>()
         .cloned()
-        .or_else(|| err.downcast_ref::<&str>().map(|s| s.to_string()))
+        .or_else(|| err.downcast_ref::<&str>().map(ToString::to_string))
         .unwrap_or_else(|| "unknown panic".to_string());
     tracing::error!(panic = %msg, "request handler panicked");
     (
@@ -285,7 +281,7 @@ fn spawn_runtime_watchdog(
                     })
                     .map(|pages| pages * 4096 / (1024 * 1024));
                 tracing::warn!(
-                    gap_ms = gap.as_millis() as u64,
+                    gap_ms = u64::try_from(gap.as_millis()).unwrap_or(u64::MAX),
                     inflight,
                     tasks_running,
                     lock_wait_max_ms = walgit_wal::lockwait::max_wait_ms(),
@@ -344,14 +340,16 @@ pub(crate) async fn dispatch_route(
             }
             (&Method::POST, "git-upload-pack") => {
                 let _permit = acquire(st, route).await;
-                smart::upload_pack(st, route, &headers, body.take().unwrap()).await
+                smart::upload_pack(st, route, &headers, body.take().unwrap_or_else(Body::empty))
+                    .await
             }
             (&Method::POST, "git-receive-pack") => {
                 let _permit = acquire(st, route).await;
-                smart::receive_pack(st, route, &headers, body.take().unwrap()).await
+                smart::receive_pack(st, route, &headers, body.take().unwrap_or_else(Body::empty))
+                    .await
             }
             (&Method::POST, "info/lfs/objects/batch") => {
-                let bytes = collect_body(body.take().unwrap()).await?;
+                let bytes = collect_body(body.take().unwrap_or_else(Body::empty)).await?;
                 lfs::batch(st, route, &headers, bytes).await
             }
             (&Method::GET | &Method::HEAD, s)
@@ -360,10 +358,10 @@ pub(crate) async fn dispatch_route(
                 lfs::get_object(st, route, &method, &headers, &query, peer).await
             }
             (&Method::PUT, s) if s.starts_with("info/lfs/objects/") => {
-                lfs::put_object(st, route, &headers, body.take().unwrap()).await
+                lfs::put_object(st, route, &headers, body.take().unwrap_or_else(Body::empty)).await
             }
             (&Method::POST, "info/lfs/verify") => {
-                let bytes = collect_body(body.take().unwrap()).await?;
+                let bytes = collect_body(body.take().unwrap_or_else(Body::empty)).await?;
                 lfs::verify(st, route, &headers, bytes).await
             }
             (&Method::GET, "bundles/list") => {
@@ -382,7 +380,7 @@ pub(crate) async fn dispatch_route(
             // Admin routes reach here only through `/{o}/{r}/api[-browser]/…` (web::v1).
             (&Method::GET, "policy") => policy::http_get(st, route, &headers).await,
             (&Method::PUT, "policy") => {
-                policy::http_put(st, route, &headers, body.take().unwrap()).await
+                policy::http_put(st, route, &headers, body.take().unwrap_or_else(Body::empty)).await
             }
             (&Method::DELETE, "policy") => policy::http_delete(st, route, &headers).await,
             (&Method::GET, "settings") => settings::http_get(st, route, &headers).await,
@@ -394,18 +392,43 @@ pub(crate) async fn dispatch_route(
                 settings::http_describe(st, route, &headers).await
             }
             (&Method::PUT, "settings") => {
-                settings::http_put(st, route, &headers, &query, body.take().unwrap()).await
+                settings::http_put(
+                    st,
+                    route,
+                    &headers,
+                    &query,
+                    body.take().unwrap_or_else(Body::empty),
+                )
+                .await
             }
             (&Method::DELETE, "settings") => settings::http_delete(st, route, &headers).await,
             (&Method::POST, "settings/validate") => {
-                settings::http_validate(st, route, &headers, body.take().unwrap()).await
+                settings::http_validate(
+                    st,
+                    route,
+                    &headers,
+                    body.take().unwrap_or_else(Body::empty),
+                )
+                .await
             }
             (&Method::POST, "policy/validate") => {
-                settings::http_policy_validate(st, route, &headers, body.take().unwrap()).await
+                settings::http_policy_validate(
+                    st,
+                    route,
+                    &headers,
+                    body.take().unwrap_or_else(Body::empty),
+                )
+                .await
             }
             (&Method::POST, "policy/dry-run") => {
-                settings::http_policy_dry_run(st, route, &headers, &query, body.take().unwrap())
-                    .await
+                settings::http_policy_dry_run(
+                    st,
+                    route,
+                    &headers,
+                    &query,
+                    body.take().unwrap_or_else(Body::empty),
+                )
+                .await
             }
             _ => Err(ApiError::NotFound(format!("no route for {method} {sub}"))),
         }
@@ -463,7 +486,10 @@ impl TcpAccept {
     }
 
     pub fn local_addr(&self) -> std::io::Result<std::net::SocketAddr> {
-        self.listeners[0].local_addr()
+        self.listeners
+            .first()
+            .ok_or_else(|| std::io::Error::other("no listener"))?
+            .local_addr()
     }
 
     pub fn addrs(&self) -> Vec<std::net::SocketAddr> {
@@ -507,7 +533,7 @@ impl axum::serve::Listener for NodelayListener {
     }
 }
 
-/// Enable TCP_NODELAY on an accepted stream. Applied via `Listener::tap_io` so
+/// Enable `TCP_NODELAY` on an accepted stream. Applied via `Listener::tap_io` so
 /// the connection stays a plain `TcpStream` and axum's blanket `Connected` impl
 /// for `TapIo` supplies the peer `SocketAddr` to `ConnectInfo` (used by the
 /// accel-redirect loopback check). Git's receive-pack status is many small
@@ -527,7 +553,7 @@ pub async fn serve(
     let addr = state.cfg.server.listen;
     let state_for_shutdown = state.clone();
     prewarm::spawn(state.clone());
-    bridge::spawn_sweeper(state.clone());
+    bridge::spawn_sweeper(&state);
     spawn_runtime_watchdog(state.registry.tasks().clone(), state.inflight.clone());
     let app = router(state);
     let listener = TcpAccept::bind(addr).await?;
@@ -572,27 +598,24 @@ pub async fn serve(
         tokio::time::sleep(std::time::Duration::from_secs(2)).await;
     };
     let serving = async move {
-        match tls {
-            Some(t) => {
-                axum::serve(
-                    tls::TlsListener {
-                        tcp: listener,
-                        acceptor: t.acceptor.clone(),
-                    },
-                    app,
-                )
-                .with_graceful_shutdown(graceful)
-                .await
-            }
-            None => {
-                use axum::serve::ListenerExt;
-                axum::serve(
-                    NodelayListener(listener).tap_io(set_nodelay),
-                    app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
-                )
-                .with_graceful_shutdown(graceful)
-                .await
-            }
+        if let Some(t) = tls {
+            axum::serve(
+                tls::TlsListener {
+                    tcp: listener,
+                    acceptor: t.acceptor.clone(),
+                },
+                app,
+            )
+            .with_graceful_shutdown(graceful)
+            .await
+        } else {
+            use axum::serve::ListenerExt;
+            axum::serve(
+                NodelayListener(listener).tap_io(set_nodelay),
+                app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+            )
+            .with_graceful_shutdown(graceful)
+            .await
         }
     };
     // In-flight requests get `server.drain_timeout` from phase 2 on (a stuck
@@ -601,7 +624,7 @@ pub async fn serve(
     let bound = state_for_shutdown.cfg.server.drain_timeout;
     tokio::select! {
         r = serving => r?,
-        _ = async { phase2.notified().await; tokio::time::sleep(bound).await } => {
+        () = async { phase2.notified().await; tokio::time::sleep(bound).await } => {
             tracing::warn!(?bound, "shutdown: in-flight requests still open past server.drain_timeout; exiting");
         }
     }
@@ -700,18 +723,14 @@ impl walgit_bundle::BundleSource for RegistryBundleSource {
                     };
                 }
                 Err(e) => {
-                    tracing::warn!(repo = %id, error = %e, "remote reader unavailable for bundle build; using git")
+                    tracing::warn!(repo = %id, error = %e, "remote reader unavailable for bundle build; using git");
                 }
             }
         }
-        let linked = h
-            .local()
-            .packs()
-            .map(|ps| {
-                ps.iter()
-                    .any(|p| h.local().pack_path(&p.checksum).is_symlink())
-            })
-            .unwrap_or(false);
+        let linked = h.local().packs().is_ok_and(|ps| {
+            ps.iter()
+                .any(|p| h.local().pack_path(&p.checksum).is_symlink())
+        });
         if linked {
             return walgit_bundle::BundleEngine::Gix { faulter: None };
         }
@@ -755,7 +774,7 @@ mod listen_tests {
             .await
             .unwrap();
         let port = m.local_addr().unwrap().port();
-        if !m.addrs().iter().any(|a| a.is_ipv6()) {
+        if !m.addrs().iter().any(std::net::SocketAddr::is_ipv6) {
             return; // no IPv6 on this host
         }
         tokio::net::TcpStream::connect((std::net::Ipv6Addr::LOCALHOST, port))

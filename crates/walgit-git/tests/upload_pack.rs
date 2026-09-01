@@ -1,3 +1,14 @@
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing,
+    clippy::many_single_char_names
+)]
+// clippy.toml exempts #[test] functions from the panic-path lints, but not the plain
+// helper functions beside them in the same file. A panic in a fixture builder is how
+// that fixture reports it could not be built, exactly as in the tests it serves.
+
 mod common;
 
 use walgit_git::pkt::Protocol;
@@ -672,10 +683,10 @@ async fn fetch_skips_gitlink_entries() {
         // present.
         let (_blobs, commits, trees, _tags) = cm::pack_object_types(&pack);
         assert_eq!(commits, 2, "unexpected commit count ({filter:?})");
-        if filter != Some("tree:0") {
-            assert!(trees >= 1, "tree missing ({filter:?})");
-        } else {
+        if filter == Some("tree:0") {
             assert_eq!(trees, 0, "tree:0 sends no trees");
+        } else {
+            assert!(trees >= 1, "tree missing ({filter:?})");
         }
         let tmp = cm::fresh_bare();
         let pack_path = tmp.path().join("objects/pack/pack-test.pack");
@@ -694,12 +705,16 @@ async fn fetch_skips_gitlink_entries() {
     }
 }
 
+#[allow(
+    clippy::case_sensitive_file_extension_comparisons,
+    reason = "git names these files itself, in lowercase; an ASCII-insensitive compare would accept names this code never writes"
+)]
 /// Engine comparison on a real repository (`WALGIT_BENCH_REPO=<path to .git
 /// or worktree>`; e.g. `walgit synth --size l`). Prints wall times for a
 /// diff-sized fetch (want HEAD, have HEAD~50) and a full clone, both engines.
 /// `cargo test -p walgit-git --test upload_pack bench_fetch_engines -- --ignored --nocapture`
 #[tokio::test]
-#[ignore]
+#[ignore = "benchmark; needs WALGIT_BENCH_REPO"]
 async fn bench_fetch_engines() {
     let Ok(src_path) = std::env::var("WALGIT_BENCH_REPO") else {
         eprintln!("WALGIT_BENCH_REPO not set; skipping");

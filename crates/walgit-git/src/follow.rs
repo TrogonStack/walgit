@@ -13,6 +13,7 @@
 //! credential helper that reads it from the environment — never argv.
 
 use std::collections::HashMap;
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
@@ -42,11 +43,11 @@ impl FetchedDelta {
 
 /// Fetch `refs` from `upstream` into the scratch for `(owner, name)` under `dir`,
 /// negotiating from `have` (`ref → oid` we hold; missing = fetch its history).
-pub async fn fetch_refs(
+pub async fn fetch_refs<S: ::std::hash::BuildHasher>(
     upstream: &str,
     token: Option<&str>,
     serving_objects: &Path,
-    have: &HashMap<String, String>,
+    have: &HashMap<String, String, S>,
     refs: &[String],
     scratch: &Path,
 ) -> Result<FetchedDelta, GitError> {
@@ -121,8 +122,12 @@ pub async fn fetch_refs(
         let mut input = String::new();
         for r in refs {
             match have.get(r) {
-                Some(oid) => input.push_str(&format!("update {} {oid}\n", follow_ref(r))),
-                None => input.push_str(&format!("delete {}\n", follow_ref(r))),
+                Some(oid) => {
+                    let _ = writeln!(input, "update {} {oid}", follow_ref(r));
+                }
+                None => {
+                    let _ = writeln!(input, "delete {}", follow_ref(r));
+                }
             }
         }
         let mut child = git(&["update-ref", "--stdin"])
@@ -131,7 +136,10 @@ pub async fn fetch_refs(
             .map_err(GitError::Io)?;
         {
             use tokio::io::AsyncWriteExt;
-            let mut stdin = child.stdin.take().expect("stdin");
+            let mut stdin = child
+                .stdin
+                .take()
+                .ok_or_else(|| GitError::Io(std::io::Error::other("git update-ref stdin")))?;
             stdin
                 .write_all(input.as_bytes())
                 .await

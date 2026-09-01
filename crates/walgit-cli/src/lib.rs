@@ -200,7 +200,7 @@ enum Command {
         /// How often to fold the buffer's small packs (`git repack --geometric=2 --write-midx`).
         #[arg(long, default_value = "1h", value_parser = humantime::parse_duration)]
         repack_every: std::time::Duration,
-        /// Where the destination's bearer token comes from: `token` ($WALGIT_TOKEN), `gcloud` (a Google
+        /// Where the destination's bearer token comes from: `token` ($`WALGIT_TOKEN`), `gcloud` (a Google
         /// ID token for you) or `gce` (this VM's service account via the metadata server).
         #[arg(long, value_enum, default_value_t = mirror::Identity::Token)]
         identity: mirror::Identity,
@@ -474,7 +474,7 @@ fn run(config: &std::path::Path, command: Command) -> Result<()> {
     // Required for rustls 0.23+ — multiple providers in the dep tree; select one.
     rustls::crypto::aws_lc_rs::default_provider()
         .install_default()
-        .expect("install rustls aws_lc_rs provider");
+        .map_err(|_| anyhow::anyhow!("a rustls crypto provider is already installed"))?;
 
     let cfg = load_config(config);
     tracing_init(&cfg);
@@ -489,14 +489,14 @@ fn run(config: &std::path::Path, command: Command) -> Result<()> {
 async fn dispatch(command: Command, cfg: Config) -> Result<()> {
     let cfg = std::sync::Arc::new(cfg);
     match command {
-        Command::Config { action } => config_cmd::run(action, &cfg).await,
+        Command::Config { action } => config_cmd::run(action, &cfg),
         Command::Synth {
             out,
             size,
             commits,
             files,
             seed,
-        } => synth::run(out, size, commits, files, seed).await,
+        } => synth::run(&out, size, commits, files, seed),
         Command::Serve => serve::run(&cfg).await,
         Command::Compact {
             repo,

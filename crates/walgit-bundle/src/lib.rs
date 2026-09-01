@@ -6,9 +6,9 @@
 //! The [`Bundler`] is the public entry point. It depends on a [`BundleSource`]
 //! trait that provides repo-scoped access (local git repo + [`Prefixed`] store
 //! + `head_seq`). When `walgit_wal::Registry` lands it will implement
-//! `BundleSource` (impl lives in this crate) and the `new` signature will
-//! accept `Arc<Registry>` directly. Until then, [`Bundler::new_with_source`]
-//! accepts any `BundleSource` impl (used by tests).
+//!   `BundleSource` (impl lives in this crate) and the `new` signature will
+//!   accept `Arc<Registry>` directly. Until then, [`Bundler::new_with_source`]
+//!   accepts any `BundleSource` impl (used by tests).
 //!
 //! The core operations in [`ops`] take a [`walgit_git::LocalRepo`] + [`Prefixed`]
 //! store so they are unit-testable with upstream `git` + [`MemoryStore`] without
@@ -171,8 +171,8 @@ impl Bundler {
         Arc::new(Self {
             source,
             cfg,
-            gates: Default::default(),
-            lease_ttl: Duration::from_secs(30 * 60),
+            gates: parking_lot::Mutex::default(),
+            lease_ttl: Duration::from_mins(30),
         })
     }
 
@@ -190,7 +190,6 @@ impl Bundler {
     }
 
     fn find_strategy<'a>(
-        &self,
         cfg: &'a Config,
         name: &str,
     ) -> Result<&'a walgit_config::BundleStrategy, BundleError> {
@@ -235,7 +234,7 @@ impl Bundler {
         cut: &ops::Cut,
     ) -> Result<BundleEntry, BundleError> {
         let cfg = self.cfg_for(handle);
-        let strat = self.find_strategy(cfg, strategy_name)?;
+        let strat = Self::find_strategy(cfg, strategy_name)?;
         let store = &handle.store;
         let refs = slots::default_refs(&cfg.bundles, strat);
 
@@ -295,8 +294,7 @@ impl Bundler {
                     .iter()
                     .filter(|t| {
                         walgit_git::gix_hash::ObjectId::from_hex(t.oid.as_bytes())
-                            .map(|o| handle.local.has_object(&o))
-                            .unwrap_or(false)
+                            .is_ok_and(|o| handle.local.has_object(&o))
                     })
                     .map(|t| t.oid.clone())
                     .collect();
@@ -469,7 +467,7 @@ impl Bundler {
         // them as `too-small` (a later measurement or a build replaces it).
         let gates = self.gates.lock();
         if !gates.is_empty() {
-            for r in rows.iter_mut() {
+            for r in &mut rows {
                 if r.status == slots::SlotStatus::Missing
                     && let Some(c) = gates.get(&(
                         handle.local.path().display().to_string(),
@@ -584,8 +582,7 @@ impl Bundler {
                                 .iter()
                                 .filter(|t| {
                                     walgit_git::gix_hash::ObjectId::from_hex(t.oid.as_bytes())
-                                        .map(|o| handle.local.has_object(&o))
-                                        .unwrap_or(false)
+                                        .is_ok_and(|o| handle.local.has_object(&o))
                                 })
                                 .map(|t| t.oid.clone())
                                 .collect();
@@ -639,12 +636,11 @@ impl Bundler {
     ) -> Result<Option<BundleEntry>, BundleError> {
         let mut handle = self.source.open_repo(id).await?;
         let cfg = self.cfg_for(&handle).clone();
-        let strat = self.find_strategy(&cfg, strategy)?.clone();
+        let strat = Self::find_strategy(&cfg, strategy)?.clone();
         let strat = &strat;
         let store = handle.store.clone();
-        let lease = match ops::try_acquire_lease(&store, &strat.name, self.lease_ttl).await? {
-            Some(l) => l,
-            None => return Ok(None),
+        let Some(lease) = ops::try_acquire_lease(&store, &strat.name, self.lease_ttl).await? else {
+            return Ok(None);
         };
         let res: Result<Option<BundleEntry>, BundleError> = async {
             let fresh = ops::read_list(&store).await?.unwrap_or_default();
@@ -697,7 +693,7 @@ impl Bundler {
                     }
                     Ok(None)
                 }
-                Err(BundleError::NoNewObjects) | Err(BundleError::NoRefs) => Ok(None),
+                Err(BundleError::NoNewObjects | BundleError::NoRefs) => Ok(None),
                 Err(e) => Err(e),
             }
         }
@@ -736,12 +732,10 @@ impl Bundler {
             if missing.is_empty() {
                 continue;
             }
-            let lease = match ops::try_acquire_lease(store, &strat.name, self.lease_ttl).await? {
-                Some(l) => l,
-                None => {
-                    debug!(strategy = %strat.name, "lease held, skipping");
-                    continue;
-                }
+            let Some(lease) = ops::try_acquire_lease(store, &strat.name, self.lease_ttl).await?
+            else {
+                debug!(strategy = %strat.name, "lease held, skipping");
+                continue;
             };
             let res: Result<(), BundleError> = async {
                 if !prepared {
@@ -853,14 +847,10 @@ pub async fn bundle_engine(handle: &walgit_wal::RepoHandle) -> BundleEngine {
             }
         }
     }
-    let linked = handle
-        .local()
-        .packs()
-        .map(|ps| {
-            ps.iter()
-                .any(|p| handle.local().pack_path(&p.checksum).is_symlink())
-        })
-        .unwrap_or(false);
+    let linked = handle.local().packs().is_ok_and(|ps| {
+        ps.iter()
+            .any(|p| handle.local().pack_path(&p.checksum).is_symlink())
+    });
     if linked {
         return BundleEngine::Gix { faulter: None };
     }
@@ -869,7 +859,7 @@ pub async fn bundle_engine(handle: &walgit_wal::RepoHandle) -> BundleEngine {
 
 #[cfg(feature = "wal")]
 mod wal_impl {
-    use super::*;
+    use super::{BundleEngine, BundleError, BundleRepoHandle, BundleSource, RepoId, bundle_engine};
     use walgit_wal::{Registry, WalError};
 
     fn wal_err(e: WalError) -> BundleError {

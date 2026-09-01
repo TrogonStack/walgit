@@ -1,4 +1,4 @@
-//! Browser sign-in: the OpenID Connect authorization-code flow against
+//! Browser sign-in: the `OpenID` Connect authorization-code flow against
 //! `server.auth.issuer`, done by walgit itself. `GET /_auth/login?next=/p`
 //! redirects to the issuer's `authorization_endpoint` (from discovery),
 //! `GET /_auth/callback` exchanges the code at the `token_endpoint`, verifies the
@@ -11,6 +11,7 @@
 //! to paste into the credential helper; `GET` renders the small page that does it.
 //! Tokens are stateless — rotating `session_secret` revokes them all.
 
+use std::fmt::Write as _;
 use std::sync::Arc;
 
 use axum::{
@@ -71,7 +72,7 @@ fn loopback_origin(st: &AppState, headers: &HeaderMap) -> bool {
     let base = crate::smart::request_base_url(st, headers);
     let host = base.split("://").nth(1).unwrap_or(&base);
     let host = host.split('/').next().unwrap_or(host);
-    let host = host.rsplit_once(':').map(|(h, _)| h).unwrap_or(host);
+    let host = host.rsplit_once(':').map_or(host, |(h, _)| h);
     host == "walgit.localhost" || host == "localhost" || host == "127.0.0.1" || host == "[::1]"
 }
 
@@ -116,8 +117,7 @@ fn walgit_origin(st: &AppState, headers: &HeaderMap) -> String {
 fn now() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
+        .map_or(0, |d| d.as_secs())
 }
 
 fn urlencode(s: &str) -> String {
@@ -125,9 +125,11 @@ fn urlencode(s: &str) -> String {
     for b in s.bytes() {
         match b {
             b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                out.push(b as char)
+                out.push(b as char);
             }
-            _ => out.push_str(&format!("%{b:02X}")),
+            _ => {
+                let _ = write!(out, "%{b:02X}");
+            }
         }
     }
     out
@@ -147,17 +149,20 @@ async fn login(
         )
             .into_response();
     }
-    let disco = match st.auth.discovery().await {
-        Ok(d) => d,
-        Err(_) => {
-            return (
-                StatusCode::SERVICE_UNAVAILABLE,
-                "identity provider unavailable (OIDC discovery failed)",
-            )
-                .into_response();
-        }
+    let Ok(disco) = st.auth.discovery().await else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "identity provider unavailable (OIDC discovery failed)",
+        )
+            .into_response();
     };
-    let (client_id, _) = st.auth.oauth_client().unwrap();
+    let Some((client_id, _)) = st.auth.oauth_client() else {
+        return (
+            StatusCode::NOT_IMPLEMENTED,
+            "OAuth client is not configured",
+        )
+            .into_response();
+    };
     let next = safe_next(q.next);
     let nonce: u64 = rand::random();
     let payload = format!("{}\n{nonce:x}\n{next}", now() + STATE_TTL_SECS);
@@ -179,7 +184,7 @@ async fn login(
     );
     // Google honours `hd` as a domain hint on its account chooser; other issuers ignore it.
     if let Some(hd) = st.cfg.server.auth.allowed_domains.first() {
-        url.push_str(&format!("&hd={}", urlencode(hd)));
+        let _ = write!(url, "&hd={}", urlencode(hd));
     }
     let mut r = Redirect::to(&url).into_response();
     r.headers_mut()
@@ -187,6 +192,10 @@ async fn login(
     r
 }
 
+#[allow(
+    clippy::expect_used,
+    reason = "the client builds unless the TLS backend is unavailable, and then the process cannot serve at all"
+)]
 async fn exchange_code(
     token_endpoint: &str,
     form: &[(&str, &str); 5],
@@ -196,19 +205,24 @@ async fn exchange_code(
         .timeout(std::time::Duration::from_secs(15))
         .build()
         .expect("reqwest client");
-    let mut last = None;
-    for attempt in 1u8..=2 {
+    let mut attempt = 1u8;
+    loop {
         match client.post(token_endpoint).form(form).send().await {
             Ok(r) => return Ok(r),
             Err(e) if attempt < 2 && (e.is_connect() || e.is_timeout()) => {
                 tracing::warn!(attempt, error = %e, "oauth token exchange retrying");
-                last = Some(e);
+                attempt += 1;
                 tokio::time::sleep(std::time::Duration::from_millis(200)).await;
             }
             Err(e) => return Err(e),
         }
     }
-    Err(last.expect("retry left an error"))
+}
+
+fn set_session_cookie(r: &mut Response, cookie: &str) {
+    if let Ok(v) = HeaderValue::from_str(cookie) {
+        r.headers_mut().insert(header::SET_COOKIE, v);
+    }
 }
 
 #[derive(serde::Deserialize)]
@@ -306,8 +320,7 @@ async fn callback(
     // Public origin: the callback ran there; the cookie is already right — go to `next`.
     if !loopback_origin(&st, &headers) {
         let mut r = Redirect::to(&next).into_response();
-        r.headers_mut()
-            .insert(header::SET_COOKIE, HeaderValue::from_str(&cookie).unwrap());
+        set_session_cookie(&mut r, &cookie);
         r.headers_mut()
             .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
         return r;
@@ -325,8 +338,7 @@ async fn callback(
         None => next.clone(),
     };
     let mut r = Redirect::to(&dest).into_response();
-    r.headers_mut()
-        .insert(header::SET_COOKIE, HeaderValue::from_str(&cookie).unwrap());
+    set_session_cookie(&mut r, &cookie);
     r.headers_mut()
         .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
     r
@@ -359,8 +371,7 @@ async fn claimed(
     }
     let cookie = session_set_cookie(&st, &headers, value);
     let mut r = Redirect::to(&next).into_response();
-    r.headers_mut()
-        .insert(header::SET_COOKIE, HeaderValue::from_str(&cookie).unwrap());
+    set_session_cookie(&mut r, &cookie);
     r.headers_mut()
         .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
     r
@@ -373,8 +384,7 @@ async fn logout(State(st): State<Arc<AppState>>, headers: HeaderMap) -> Response
         cookie_site(&st, secure)
     );
     let mut r = Redirect::to("/").into_response();
-    r.headers_mut()
-        .insert(header::SET_COOKIE, HeaderValue::from_str(&cookie).unwrap());
+    set_session_cookie(&mut r, &cookie);
     r
 }
 

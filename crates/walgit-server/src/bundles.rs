@@ -1,6 +1,6 @@
 //! Bundle serving: `GET /{repo}/bundles/list` (git bundle-list text, no-cache)
 //! and `GET|HEAD /{repo}/bundles/{strategy}/{name}` (streamed bundle with
-//! strong ETag = store version, immutable caching, Range/If-Range,
+//! strong `ETag` = store version, immutable caching, Range/If-Range,
 //! If-None-Match, HEAD — `static_object`).
 
 use axum::http::{HeaderMap, Method, StatusCode};
@@ -29,7 +29,11 @@ pub async fn list(
     if !st.cfg.bundles.advertise {
         return Err(ApiError::NotFound("bundles disabled".into()));
     }
-    let principal = st.auth.require_read(headers).await.map_err(auth_err)?;
+    let principal = st
+        .auth
+        .require_read(headers)
+        .await
+        .map_err(ApiError::from)?;
     // This principal tried bundle-uri (see `smart::bundle_fallback_allowed`).
     st.caches.bundle_attempts.insert(
         format!("{}\0{}", route.id, principal.name),
@@ -79,7 +83,7 @@ pub async fn list(
         .bundles
         .render_list(&route.id, &base, filter.as_deref(), fulls)
         .await
-        .map_err(bundle_err)?;
+        .map_err(ApiError::from)?;
     match text {
         Some(t) => {
             st.caches
@@ -96,17 +100,17 @@ fn render_bundle_list_response(text: String) -> Response {
     let h = resp.headers_mut();
     h.insert(
         axum::http::header::CONTENT_TYPE,
-        "text/plain; charset=utf-8".parse().unwrap(),
+        axum::http::HeaderValue::from_static("text/plain; charset=utf-8"),
     );
     h.insert(
         axum::http::header::CACHE_CONTROL,
-        "no-cache".parse().unwrap(),
+        axum::http::HeaderValue::from_static("no-cache"),
     );
     resp
 }
 
 /// `GET|HEAD /{repo}/bundles/{strategy}/{name}` — streamed from the store
-/// with the full immutable-object contract (strong ETag, 304, Range/If-Range,
+/// with the full immutable-object contract (strong `ETag`, 304, Range/If-Range,
 /// HEAD, Content-Length); see `static_object`.
 pub async fn object(
     st: &AppState,
@@ -115,7 +119,11 @@ pub async fn object(
     headers: &HeaderMap,
     peer: Option<std::net::SocketAddr>,
 ) -> Result<Response, ApiError> {
-    let _ = st.auth.require_read(headers).await.map_err(auth_err)?;
+    let _ = st
+        .auth
+        .require_read(headers)
+        .await
+        .map_err(ApiError::from)?;
     let handle = open_repo(st, &route.id, false).await?;
     let store = handle.store().clone();
 
@@ -145,21 +153,6 @@ pub async fn object(
     .await
 }
 
-fn auth_err(e: crate::auth::AuthError) -> ApiError {
-    match e {
-        crate::auth::AuthError::Invalid | crate::auth::AuthError::Unauthorized => {
-            ApiError::Unauthorized
-        }
-        crate::auth::AuthError::Forbidden => ApiError::Forbidden,
-        crate::auth::AuthError::Unavailable => {
-            ApiError::ServiceUnavailable("auth provider unavailable".into())
-        }
-    }
-}
-fn bundle_err(e: walgit_bundle::BundleError) -> ApiError {
-    ApiError::Internal(format!("bundle: {e}"))
-}
-
 /// Full bundle = header ∘ the single tier-2 base pack, refs from the checkpoint
 /// at the base's seq (written now when the base is at head and none exists).
 /// Full bundle = header (refs at the base's seq) ∘ tier-2 base pack via GCS
@@ -182,12 +175,13 @@ pub async fn compose_full_from_base(
     // The base is the tier-2 pack that is not a derived history pack (D18:
     // `compact --base` publishes both at tier 2; the weekly composes the base).
     let bases = walgit_wal::base_packs(&manifest);
-    anyhow::ensure!(
-        bases.len() == 1,
-        "compose needs exactly one tier-2 base pack (found {}; history packs excluded): an imported pack set — the base rebuild unit (`compact --base`) collapses it first",
-        bases.len()
-    );
-    let base = bases[0].clone();
+    let [base] = bases.as_slice() else {
+        anyhow::bail!(
+            "compose needs exactly one tier-2 base pack (found {}; history packs excluded): an imported pack set — the base rebuild unit (`compact --base`) collapses it first",
+            bases.len()
+        );
+    };
+    let base = (*base).clone();
     let seq = base.seq;
     let store = handle.store();
     // Refs at the base's seq: the checkpoint there when one exists (the rebuild checkpoints right
@@ -196,18 +190,17 @@ pub async fn compose_full_from_base(
     // rig's weekly compose failed every pass for as long as the churn kept refs moving, 2026-08-22);
     // only a log folded away below the base's seq with no checkpoint before it is unrecoverable.
     let refs_key = walgit_proto::keys::checkpoint_refs_key(seq);
-    let snap = match store.get_bytes(&refs_key).await? {
-        Some((_, bytes)) => walgit_proto::v1::RefSnapshot::decode(bytes.as_ref())?,
-        None => {
-            info!(
-                base_seq = seq,
-                head = manifest.head_seq,
-                "no checkpoint at the base's seq: replaying the refs at that seq from the WAL for the compose"
-            );
-            handle.refs_at_seq(seq).await.map_err(|e| {
-                anyhow::anyhow!("refs at the base's seq {seq} (head {}): {e} — run `walgit compact --base` again so a checkpoint exists at the base", manifest.head_seq)
-            })?
-        }
+    let snap = if let Some((_, bytes)) = store.get_bytes(&refs_key).await? {
+        walgit_proto::v1::RefSnapshot::decode(bytes.as_ref())?
+    } else {
+        info!(
+            base_seq = seq,
+            head = manifest.head_seq,
+            "no checkpoint at the base's seq: replaying the refs at that seq from the WAL for the compose"
+        );
+        handle.refs_at_seq(seq).await.map_err(|e| {
+            anyhow::anyhow!("refs at the base's seq {seq} (head {}): {e} — run `walgit compact --base` again so a checkpoint exists at the base", manifest.head_seq)
+        })?
     };
     let list = walgit_bundle::ops::read_list(store)
         .await?
@@ -232,7 +225,7 @@ pub async fn compose_full_from_base(
             .filter(|p| p.kind == walgit_proto::v1::PackKind::History as i32 && p.derived_from == base.checksum)
             .max_by_key(|p| p.seq)
             .cloned()
-            .ok_or_else(|| anyhow::anyhow!("strategy {strategy} is filtered but base {} has no history pack (D18) to compose; rebuild the base with git.history_pack on", &base.checksum[..12]))?,
+            .ok_or_else(|| anyhow::anyhow!("strategy {strategy} is filtered but base {} has no history pack (D18) to compose; rebuild the base with git.history_pack on", base.checksum.get(..12).unwrap_or(&base.checksum)))?,
         None => base.clone(),
     };
     let pack_path = handle

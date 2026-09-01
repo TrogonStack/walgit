@@ -5,12 +5,13 @@ pub mod trailers;
 pub mod ui;
 pub mod v1;
 
+use std::fmt::Write as _;
 use std::sync::Arc;
 
 use axum::{
     body::Body,
     extract::{Request, State},
-    http::{StatusCode, header},
+    http::{HeaderValue, StatusCode, header},
     middleware::Next,
     response::{IntoResponse, Redirect, Response},
 };
@@ -32,25 +33,26 @@ pub async fn canonical_browser_host(
         || path.starts_with("/services/public");
     let browser = is_browser(req.headers());
     let get = req.method() == axum::http::Method::GET || req.method() == axum::http::Method::HEAD;
-    if get && browser && !skip {
-        if let Some(dest) = walgit_localhost_host(
+    if get
+        && browser
+        && !skip
+        && let Some(dest) = walgit_localhost_host(
             req.headers()
                 .get(header::HOST)
                 .and_then(|v| v.to_str().ok()),
-        ) {
-            let scheme = if st.cfg.tls_enabled() {
-                "https"
-            } else {
-                "http"
-            };
-            let pq = req
-                .uri()
-                .path_and_query()
-                .map(|p| p.as_str())
-                .unwrap_or("/");
-            let loc = format!("{scheme}://{dest}{pq}");
-            return (StatusCode::FOUND, [(header::LOCATION, loc)]).into_response();
-        }
+        )
+    {
+        let scheme = if st.cfg.tls_enabled() {
+            "https"
+        } else {
+            "http"
+        };
+        let pq = req
+            .uri()
+            .path_and_query()
+            .map_or("/", http::uri::PathAndQuery::as_str);
+        let loc = format!("{scheme}://{dest}{pq}");
+        return (StatusCode::FOUND, [(header::LOCATION, loc)]).into_response();
     }
     next.run(req).await
 }
@@ -112,8 +114,7 @@ pub async fn require_auth(
                 let next_url = req
                     .uri()
                     .path_and_query()
-                    .map(|pq| pq.as_str().to_string())
-                    .unwrap_or_else(|| "/".to_string());
+                    .map_or_else(|| "/".to_string(), |pq| pq.as_str().to_string());
                 let q = url_encode(&next_url);
                 return Redirect::temporary(&format!("/_auth/login?next={q}")).into_response();
             }
@@ -147,7 +148,7 @@ pub async fn require_auth(
             if status == StatusCode::UNAUTHORIZED {
                 resp.headers_mut().insert(
                     header::WWW_AUTHENTICATE,
-                    "Bearer realm=\"walgit\"".parse().unwrap(),
+                    HeaderValue::from_static("Bearer realm=\"walgit\""),
                 );
             }
             resp
@@ -160,9 +161,11 @@ pub(crate) fn url_encode(s: &str) -> String {
     for b in s.bytes() {
         match b {
             b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                out.push(b as char)
+                out.push(b as char);
             }
-            _ => out.push_str(&format!("%{b:02X}")),
+            _ => {
+                let _ = write!(out, "%{b:02X}");
+            }
         }
     }
     out

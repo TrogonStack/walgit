@@ -11,6 +11,7 @@
 //! re-uploading the pack*: bundle = header object ∘ pack object via compose
 //! (GCS), so a fresh `git clone` gets its bytes straight from the bucket/CDN.
 
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
@@ -32,6 +33,10 @@ use walgit_store::{
 
 use crate::cli::parse_repo_id;
 
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "one field per CLI flag; the flags are independent"
+)]
 pub struct DirectOptions {
     pub from: PathBuf,
     pub repo: String,
@@ -83,7 +88,7 @@ struct LocalPack {
 /// Start over even when the target's manifest moved since an interrupted import began, or
 /// re-publish a completed import (a new seq superseding the previous one).
 impl DirectOptions {
-    fn marker_path(&self, pack_dir: &Path, id: &walgit_git::RepoId) -> PathBuf {
+    fn marker_path(pack_dir: &Path, id: &walgit_git::RepoId) -> PathBuf {
         pack_dir
             .parent()
             .unwrap_or(pack_dir)
@@ -92,6 +97,10 @@ impl DirectOptions {
     }
 }
 
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "a report of independent yes/no outcomes; grouping them would only hide what each one means"
+)]
 /// What a run did — the resumability contract in numbers (`tests/import_resume.rs`).
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct ImportReport {
@@ -153,14 +162,14 @@ pub struct ImportMarker {
 }
 
 fn entry_to_hex(e: &BundleEntry) -> String {
-    e.encode_to_vec()
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect()
+    e.encode_to_vec().iter().fold(String::new(), |mut acc, b| {
+        let _ = write!(acc, "{b:02x}");
+        acc
+    })
 }
 fn entry_from_hex(s: &str) -> Option<BundleEntry> {
     let bytes: Option<Vec<u8>> = (0..s.len() / 2)
-        .map(|i| u8::from_str_radix(&s[2 * i..2 * i + 2], 16).ok())
+        .map(|i| u8::from_str_radix(s.get(2 * i..2 * i + 2)?, 16).ok())
         .collect();
     BundleEntry::decode(bytes?.as_slice()).ok()
 }
@@ -187,7 +196,9 @@ fn read_import_marker(path: &Path) -> Option<ImportMarker> {
 }
 
 fn write_import_marker(path: &Path, m: &ImportMarker) -> Result<()> {
-    std::fs::create_dir_all(path.parent().unwrap())?;
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
     let tmp = path.with_extension("json.tmp");
     std::fs::write(&tmp, serde_json::to_vec_pretty(m)?)?;
     std::fs::rename(&tmp, path)?;
@@ -388,7 +399,7 @@ pub async fn run_with_store(
                 m.head_seq,
                 m.packs.len()
             );
-            let marker_path = opts.marker_path(&pack_dir, &id);
+            let marker_path = DirectOptions::marker_path(&pack_dir, &id);
             let _ = std::fs::remove_file(&marker_path);
             report.noop = true;
             report.seq = m.head_seq;
@@ -402,17 +413,18 @@ pub async fn run_with_store(
             );
         }
     }
-    let marker_path = opts.marker_path(&pack_dir, &id);
+    let marker_path = DirectOptions::marker_path(&pack_dir, &id);
     let current_version = base_version.as_ref().map(|v| v.as_str().to_string());
-    let mut marker = match decide_resume(
-        read_import_marker(&marker_path).as_ref(),
+    let existing = read_import_marker(&marker_path);
+    let decision = decide_resume(
+        existing.as_ref(),
         &repo_key,
         &tips,
         current_version.as_deref(),
         force,
-    ) {
-        ResumeDecision::Resume => {
-            let m = read_import_marker(&marker_path).unwrap();
+    );
+    let mut marker = match (decision, existing) {
+        (ResumeDecision::Resume, Some(m)) => {
             println!(
                 "resuming import started at manifest {:?} (phase {:?} done, {} object(s) uploaded)",
                 m.base_manifest_version,
@@ -422,11 +434,11 @@ pub async fn run_with_store(
             report.resumed = true;
             m
         }
-        ResumeDecision::Refuse { started_at, now } => bail!(
+        (ResumeDecision::Refuse { started_at, now }, _) => bail!(
             "an interrupted import of {id} started when the manifest was {started_at:?}; it is {now:?} now (someone pushed or imported). \
              Re-run with --force to start over from the current state (the partial uploads are reused where their checksums match)"
         ),
-        ResumeDecision::Fresh => {
+        (ResumeDecision::Fresh | ResumeDecision::Resume, _) => {
             if marker_path.exists() {
                 println!(
                     "discarding an interrupted import of a different intent or base (marker {})",
@@ -437,8 +449,8 @@ pub async fn run_with_store(
                 repo: repo_key.clone(),
                 tips_hash: tips.clone(),
                 base_manifest_version: current_version.clone(),
-                base_head_seq: base_manifest.as_ref().map(|m| m.head_seq).unwrap_or(0),
-                seq: base_manifest.as_ref().map(|m| m.head_seq).unwrap_or(0) + 1,
+                base_head_seq: base_manifest.as_ref().map_or(0, |m| m.head_seq),
+                seq: base_manifest.as_ref().map_or(0, |m| m.head_seq) + 1,
                 phase: ImportPhase::Started,
                 uploaded: Vec::new(),
                 history_pack: None,
@@ -463,7 +475,7 @@ pub async fn run_with_store(
              these refs (`git pack-objects --revs` with them) or narrow `--refs`",
             missing.len(),
             pack_dir.display(),
-            missing[0]
+            missing.first().map_or("", String::as_str)
         );
         println!(
             "verified: {} ref tip(s){} present in the pack set ({:.1}s)",
@@ -485,9 +497,12 @@ pub async fn run_with_store(
 
     // ---- side-files: one commit-graph layer next to the base (file presence = done) ----------
     if marker.phase < ImportPhase::SideFiles {
-        if opts.commit_graph && packs[0].commit_graph.is_none() {
+        if opts.commit_graph
+            && let Some(base) = packs.first_mut()
+            && base.commit_graph.is_none()
+        {
             let t = Instant::now();
-            let side = packs[0].pack.with_extension("commit-graph");
+            let side = base.pack.with_extension("commit-graph");
             build_commit_graph_layer(&git_dir, &side)?;
             println!(
                 "commit-graph: {} bytes in {:.1}s -> {}",
@@ -495,7 +510,7 @@ pub async fn run_with_store(
                 t.elapsed().as_secs_f64(),
                 side.display()
             );
-            packs[0].commit_graph = Some(side);
+            base.commit_graph = Some(side);
             report.built_commit_graph = true;
         }
         marker.phase = ImportPhase::SideFiles;
@@ -504,6 +519,10 @@ pub async fn run_with_store(
     }
 
     // ---- history pack (D18), reused from the marker / the walgit-history dir -------------
+    let base_checksum = packs
+        .first()
+        .map(|p| p.checksum.clone())
+        .unwrap_or_default();
     if opts.history_pack && !packs.iter().any(|p| p.history_of.is_some()) {
         let dir = pack_dir
             .parent()
@@ -518,39 +537,36 @@ pub async fn run_with_store(
                 // A history pack of this base left by an earlier run whose marker is gone.
                 scan_packs(&dir).ok().and_then(|v| {
                     v.into_iter()
-                        .find(|p| p.history_of.as_deref() == Some(packs[0].checksum.as_str()))
+                        .find(|p| p.history_of.as_deref() == Some(base_checksum.as_str()))
                         .map(|p| p.pack)
                 })
             });
-        let hp = match reuse {
-            Some(pack) => {
-                let v = scan_packs(&dir)?;
-                let hp = v
-                    .into_iter()
-                    .find(|p| p.pack == pack)
-                    .context("history pack vanished")?;
-                println!(
-                    "history pack {} reused from {}",
-                    hp.checksum,
-                    hp.pack.display()
-                );
-                hp
-            }
-            None => {
-                let t = Instant::now();
-                std::fs::create_dir_all(&dir)?;
-                let hp = build_history_pack(&git_dir, &dir, &packs[0].checksum)?;
-                println!(
-                    "history pack {}: {} bytes, {} objects (commits + trees) in {:.1}s -> {}",
-                    hp.checksum,
-                    hp.pack_size,
-                    hp.object_count,
-                    t.elapsed().as_secs_f64(),
-                    hp.pack.display()
-                );
-                report.built_history_pack = true;
-                hp
-            }
+        let hp = if let Some(pack) = reuse {
+            let v = scan_packs(&dir)?;
+            let hp = v
+                .into_iter()
+                .find(|p| p.pack == pack)
+                .context("history pack vanished")?;
+            println!(
+                "history pack {} reused from {}",
+                hp.checksum,
+                hp.pack.display()
+            );
+            hp
+        } else {
+            let t = Instant::now();
+            std::fs::create_dir_all(&dir)?;
+            let hp = build_history_pack(&git_dir, &dir, &base_checksum)?;
+            println!(
+                "history pack {}: {} bytes, {} objects (commits + trees) in {:.1}s -> {}",
+                hp.checksum,
+                hp.pack_size,
+                hp.object_count,
+                t.elapsed().as_secs_f64(),
+                hp.pack.display()
+            );
+            report.built_history_pack = true;
+            hp
         };
         marker.history_pack = Some(hp.pack.clone());
         packs.push(hp);
@@ -577,12 +593,12 @@ pub async fn run_with_store(
             }
         );
     }
-    if object_packs > 1 || packs[0].bitmap.is_none() {
+    let base_has_bitmap = packs.first().is_some_and(|p| p.bitmap.is_some());
+    if object_packs > 1 || !base_has_bitmap {
         eprintln!(
-            "note: {} pack(s), bitmap={} — for fastest serving import ONE pack built with \
+            "note: {} pack(s), bitmap={base_has_bitmap} — for fastest serving import ONE pack built with \
              `git pack-objects --all --write-bitmap-index <dir>/pack`",
             packs.len(),
-            packs[0].bitmap.is_some()
         );
     }
 
@@ -646,7 +662,7 @@ pub async fn run_with_store(
             async move {
                 st.head(&key)
                     .await
-                    .map(|m| m.map(|m| m.size == size).unwrap_or(false))
+                    .map(|m| m.is_some_and(|m| m.size == size))
             }
         }))
         .await;
@@ -724,7 +740,6 @@ pub async fn run_with_store(
 
     // ---- checkpoint refs (small, idempotent re-put) -----------------------------------------
     let refs_key = keys::checkpoint_refs_key(seq);
-    let mut snap = snap;
     snap.seq = seq;
     snap.object_format = format.as_str().to_string();
     snap.created_at = Some(time::now());
@@ -743,20 +758,17 @@ pub async fn run_with_store(
     let mut bundle_key = String::new();
     let mut bundle_entry: Option<BundleEntry> = marker.bundle.as_deref().and_then(entry_from_hex);
     if opts.bundle && bundle_entry.is_none() {
-        if object_packs != 1 {
-            eprintln!(
-                "--bundle needs exactly one object pack (got {object_packs}); skipping bundle"
-            );
-        } else {
+        if object_packs == 1 {
             let strategy = opts.bundle_strategy.clone().unwrap_or_else(|| {
                 cfg.bundles
                     .strategy
                     .iter()
                     .find(|s| s.kind == walgit_config::BundleKind::Full)
-                    .map(|s| s.name.clone())
-                    .unwrap_or_else(|| "import".to_string())
+                    .map_or_else(|| "import".to_string(), |s| s.name.clone())
             });
-            let p0 = &packs[0];
+            let p0 = packs
+                .first()
+                .ok_or_else(|| anyhow::anyhow!("no pack to bundle"))?;
             match walgit_bundle::ops::compose_full(
                 &repo_store,
                 &p0.checksum,
@@ -785,6 +797,10 @@ pub async fn run_with_store(
                 }
                 Err(e) => eprintln!("bundle publish failed (import continues): {e:#}"),
             }
+        } else {
+            eprintln!(
+                "--bundle needs exactly one object pack (got {object_packs}); skipping bundle"
+            );
         }
     }
     if let Some(e) = &bundle_entry {
@@ -838,7 +854,7 @@ pub async fn run_with_store(
         packs: pack_refs,
         updated_at: Some(time::now()),
         writer: format!("walgit-import@{}", hostname()),
-        revision: base_manifest.as_ref().map(|m| m.revision).unwrap_or(0) + 1,
+        revision: base_manifest.as_ref().map_or(0, |m| m.revision) + 1,
         settings: None,
     };
     let mode = match base_version {
@@ -858,7 +874,7 @@ pub async fn run_with_store(
             println!(
                 "published {} at seq {} (manifest {})",
                 id, seq, meta.version
-            )
+            );
         }
         Err(StoreError::PreconditionFailed { .. }) => {
             bail!(
@@ -907,8 +923,7 @@ pub async fn run_with_store(
 
 fn hostname() -> String {
     std::fs::read_to_string("/etc/hostname")
-        .map(|s| s.trim().to_string())
-        .unwrap_or_else(|_| "local".into())
+        .map_or_else(|_| "local".into(), |s| s.trim().to_string())
 }
 
 fn count_loose(git_dir: &Path) -> u64 {
@@ -1014,7 +1029,11 @@ pub fn verify_refs_in_packs(
             .stderr(std::process::Stdio::piped())
             .spawn()
             .with_context(|| format!("git {}", args.join(" ")))?;
-        child.stdin.take().unwrap().write_all(stdin.as_bytes())?;
+        child
+            .stdin
+            .take()
+            .context("git stdin")?
+            .write_all(stdin.as_bytes())?;
         Ok(child.wait_with_output()?)
     };
     // Tips first (cheap, names the exact ref problem).
@@ -1080,7 +1099,7 @@ fn scan_packs(dir: &Path) -> Result<Vec<LocalPack>> {
             idx,
         });
     }
-    out.sort_by(|a, b| b.pack_size.cmp(&a.pack_size));
+    out.sort_by_key(|p| std::cmp::Reverse(p.pack_size));
     Ok(out)
 }
 
@@ -1109,7 +1128,11 @@ fn build_history_pack(git_dir: &Path, dir: &Path, base: &str) -> Result<LocalPac
         .stdout(std::process::Stdio::piped())
         .spawn()
         .context("git pack-objects --filter=blob:none")?;
-    child.stdin.take().unwrap().write_all(&tips.stdout)?;
+    child
+        .stdin
+        .take()
+        .context("git pack-objects stdin")?
+        .write_all(&tips.stdout)?;
     let out = child.wait_with_output()?;
     anyhow::ensure!(
         out.status.success(),
@@ -1172,7 +1195,7 @@ fn idx_object_count(idx: &Path) -> Result<u64> {
     f.seek(SeekFrom::Start(8 + 255 * 4))?;
     let mut b = [0u8; 4];
     f.read_exact(&mut b)?;
-    Ok(u32::from_be_bytes(b) as u64)
+    Ok(u64::from(u32::from_be_bytes(b)))
 }
 
 /// Git bundle header for `snap` (HEAD + refs/heads/* + refs/tags/*), no prerequisites.
@@ -1202,7 +1225,7 @@ where
             .await
         {
             Ok(meta) => return Ok((meta.version, new_list)),
-            Err(StoreError::PreconditionFailed { .. }) => continue,
+            Err(StoreError::PreconditionFailed { .. }) => {}
             Err(e) => return Err(e.into()),
         }
     }
@@ -1275,7 +1298,7 @@ mod tests {
         let ahead = git(&src, &["rev-parse", "HEAD"]);
 
         assert!(
-            verify_refs_in_packs(&packs, &[main_tip.clone()], true)
+            verify_refs_in_packs(&packs, std::slice::from_ref(&main_tip), true)
                 .unwrap()
                 .is_empty()
         );
@@ -1322,7 +1345,7 @@ mod tests {
             .unwrap();
         assert!(out.status.success());
         assert!(
-            verify_refs_in_packs(&packs, &[tip.clone()], false)
+            verify_refs_in_packs(&packs, std::slice::from_ref(&tip), false)
                 .unwrap()
                 .is_empty(),
             "tip is there"
@@ -1359,8 +1382,8 @@ mod resume_tests {
         sh(d.path(), &["init", "-q", "-b", "main", "."]);
         sh(d.path(), &["config", "user.email", "t@t"]);
         sh(d.path(), &["config", "user.name", "T"]);
-        for i in 0..3 {
-            std::fs::write(d.path().join(format!("f{i}")), vec![b'a' + i as u8; 20_000]).unwrap();
+        for i in 0u8..3 {
+            std::fs::write(d.path().join(format!("f{i}")), vec![b'a' + i; 20_000]).unwrap();
             sh(d.path(), &["add", "."]);
             sh(d.path(), &["commit", "-q", "-m", &format!("c{i}")]);
         }
@@ -1465,7 +1488,7 @@ mod resume_tests {
             .unwrap()
             .join("objects")
             .join("pack");
-        let marker_path = opts(src.path(), repo).marker_path(&pack_dir, &id);
+        let marker_path = DirectOptions::marker_path(&pack_dir, &id);
         // Uploads are counted from the marker's done set (the report is lost with a killed run).
         let mut prev_uploaded = 0usize;
         let mut total_uploaded = 0usize;
@@ -1528,8 +1551,10 @@ mod resume_tests {
         .unwrap();
         let mut expected = 0usize;
         for p in &m.packs {
-            expected +=
-                2 + p.has_rev as usize + p.has_bitmap as usize + p.has_commit_graph as usize;
+            expected += 2
+                + usize::from(p.has_rev)
+                + usize::from(p.has_bitmap)
+                + usize::from(p.has_commit_graph);
         }
         assert_eq!(
             total_uploaded, expected,

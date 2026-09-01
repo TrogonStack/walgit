@@ -34,7 +34,7 @@ pub async fn run(cfg: &Arc<Config>) -> Result<()> {
     std::fs::create_dir_all(&cfg.cache.dir).ok();
 
     // AppState::new constructs the registry, bundler, auth, semaphores, metrics.
-    let state = AppState::new(cfg.clone(), store).await?;
+    let state = AppState::new(cfg, store)?;
 
     // Spawn background loops for non-serving roles.
     let mut bg_handles = Vec::new();
@@ -73,18 +73,22 @@ pub async fn run(cfg: &Arc<Config>) -> Result<()> {
     let shutdown = async {
         #[cfg(unix)]
         {
-            let mut sigterm = signal::unix::signal(signal::unix::SignalKind::terminate())
-                .expect("install SIGTERM handler");
-            let mut sigint = signal::unix::signal(signal::unix::SignalKind::interrupt())
-                .expect("install SIGINT handler");
-            tokio::select! {
-                _ = sigterm.recv() => info!("received SIGTERM, shutting down"),
-                _ = sigint.recv() => info!("received SIGINT, shutting down"),
+            if let (Ok(mut sigterm), Ok(mut sigint)) = (
+                signal::unix::signal(signal::unix::SignalKind::terminate()),
+                signal::unix::signal(signal::unix::SignalKind::interrupt()),
+            ) {
+                tokio::select! {
+                    _ = sigterm.recv() => info!("received SIGTERM, shutting down"),
+                    _ = sigint.recv() => info!("received SIGINT, shutting down"),
+                }
+            } else {
+                let _ = signal::ctrl_c().await;
+                info!("received Ctrl-C, shutting down");
             }
         }
         #[cfg(not(unix))]
         {
-            signal::ctrl_c().await.expect("ctrl_c");
+            let _ = signal::ctrl_c().await;
             info!("received Ctrl-C, shutting down");
         }
     };
@@ -106,7 +110,7 @@ async fn compact_loop(registry: Arc<walgit_wal::Registry>, cfg: Arc<Config>) {
         info!("compaction disabled by config, loop exiting");
         return;
     }
-    let interval = std::time::Duration::from_secs(60);
+    let interval = std::time::Duration::from_mins(1);
     loop {
         tokio::time::sleep(interval).await;
         if let Err(e) = run_compaction_pass(&registry, &cfg).await {
@@ -152,7 +156,7 @@ async fn bundle_loop(bundler: Arc<walgit_bundle::Bundler>, cfg: Arc<Config>) {
         info!("bundles disabled by config, loop exiting");
         return;
     }
-    let interval = std::time::Duration::from_secs(60);
+    let interval = std::time::Duration::from_mins(1);
     loop {
         tokio::time::sleep(interval).await;
         let now = std::time::SystemTime::now();
