@@ -18,6 +18,10 @@ concurrency:
   # and that commit's immutable sha- tag would then never exist.
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
+# Least privilege by default: only publish-canary needs a write scope, and it asks for it itself.
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
 
@@ -89,8 +93,8 @@ jobs:
   # same green run that just tested the commit: a red main never produces a canary tag, and there
   # is no workflow_run indirection re-deriving the SHA from an event payload.
   #
-  #   ghcr.io/<owner>/walgit:canary   moving tag, always the newest green main
-  #   ghcr.io/<owner>/walgit:sha-<7>  immutable, what a rollback or a bug report pins to
+  #   ghcr.io/<owner>/walgit:canary    moving tag, always the newest green main
+  #   ghcr.io/<owner>/walgit:sha-<40>  immutable, what a rollback or a bug report pins to
   #
   # Re-running a run on the same commit is safe: it rebuilds and moves both tags to the new
   # image. The tag set is a pure function of the commit, but the digest is not (the build is
@@ -105,28 +109,34 @@ jobs:
       # The only write scope this workflow needs; GITHUB_TOKEN carries nothing else.
       packages: write
     steps:
-      - uses: actions/checkout@v4
-      - uses: docker/setup-buildx-action@v3
+      # This job holds a token that can write packages, so its actions are pinned to commit SHAs:
+      # a moving tag would let an upstream compromise reach the registry. The other jobs read only.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          # Nothing here runs git again; leaving the token in .git/config only widens the blast radius.
+          persist-credentials: false
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
 
-      - uses: docker/login-action@v3
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # type=sha with format=short is exactly sha-<first 7 of the commit>; both tags and the OCI
-      # source/revision labels come from one place rather than hand-built strings.
+      # format=long, not short: a seven-character prefix is a namespace that collides, and the
+      # collision would silently move an older commit's immutable tag onto a newer image. Both tags
+      # and the OCI source/revision labels come from one place rather than hand-built strings.
       - name: Derive tags and labels
         id: meta
-        uses: docker/metadata-action@v5
+        uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5.10.0
         with:
           images: ghcr.io/${{ github.repository }}
           tags: |
             type=raw,value=canary
-            type=sha,format=short,prefix=sha-
+            type=sha,format=long,prefix=sha-
 
       - name: Build and push
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
         with:
           context: .
           file: Containerfile
