@@ -96,9 +96,9 @@ jobs:
   #   ghcr.io/<owner>/walgit:canary    moving tag, always the newest green main
   #   ghcr.io/<owner>/walgit:sha-<40>  immutable, what a rollback or a bug report pins to
   #
-  # Re-running a run on the same commit is safe: it rebuilds and moves both tags to the new
-  # image. The tag set is a pure function of the commit, but the digest is not (the build is
-  # not bit-reproducible), so a re-run republishes rather than no-ops.
+  # Re-running a run on the same commit is safe, and it does NOT touch an existing sha- tag: the
+  # build is not bit-reproducible, so republishing that tag would repoint what a rollback pinned to
+  # at a digest nobody chose. A re-run moves `canary` only; the sha- tag is written once, ever.
   publish-canary:
     name: publish canary image
     needs: [build-test, e2e]
@@ -123,6 +123,22 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      # GHCR rejects an uppercase path, and github.repository carries the owner's real casing.
+      - name: Resolve the image name
+        id: image
+        run: echo "name=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+
+      # "Immutable" has to mean it: if this commit already has a sha- tag, leave it at the digest
+      # it already points to and let this run move `canary` alone.
+      - name: Decide whether the rollback tag is still unwritten
+        id: rollback
+        run: |
+          if docker buildx imagetools inspect "${{ steps.image.outputs.name }}:sha-${GITHUB_SHA}" >/dev/null 2>&1; then
+            echo "unwritten=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "unwritten=true" >> "$GITHUB_OUTPUT"
+          fi
+
       # format=long, not short: a seven-character prefix is a namespace that collides, and the
       # collision would silently move an older commit's immutable tag onto a newer image. Both tags
       # and the OCI source/revision labels come from one place rather than hand-built strings.
@@ -130,10 +146,10 @@ jobs:
         id: meta
         uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5.10.0
         with:
-          images: ghcr.io/${{ github.repository }}
+          images: ${{ steps.image.outputs.name }}
           tags: |
             type=raw,value=canary
-            type=sha,format=long,prefix=sha-
+            type=sha,format=long,prefix=sha-,enable=${{ steps.rollback.outputs.unwritten }}
 
       - name: Build and push
         uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
