@@ -8,6 +8,10 @@ t5 := `if command -v timeout >/dev/null 2>&1; then echo "timeout 300"; elif comm
 t10 := `if command -v timeout >/dev/null 2>&1; then echo "timeout 600"; elif command -v gtimeout >/dev/null 2>&1; then echo "gtimeout 600"; else echo ""; fi`
 t15 := `if command -v timeout >/dev/null 2>&1; then echo "timeout 900"; elif command -v gtimeout >/dev/null 2>&1; then echo "gtimeout 900"; else echo ""; fi`
 
+# The fast tier's package selections, shared by the build and the run of each line.
+fast_pkgs := "-p walgit-store -p walgit-git -p walgit-wal -p walgit-bundle"
+server_fast := "-p walgit-server --test web_api --test web_ui --test api_v1 --test static_http --test maintain --test routing_prefix --test lfs_upstream --test drain"
+
 # Default: show available targets.
 default:
     @just --list
@@ -80,10 +84,16 @@ dev-store-stop:
 # Fast tier (default, < 1 min): unit tests + the quick integration suites.
 # Never run `cargo test --workspace --no-fail-fast` interactively: a single
 # hung test blocks for the whole timeout. Use `just e2e` / `just ci` below.
+# Each line builds before it runs, and every package selection resolves features on its own,
+# so a line can spend minutes recompiling dependencies the previous line already built. The
+# watchdog is here to catch a hung test, not a cold compile: build untimed first, run under it.
 test:
+    cargo test --workspace --lib --bins --no-run
     {{t5}} cargo test --workspace --lib --bins
-    {{t5}} cargo test -p walgit-store -p walgit-git -p walgit-wal -p walgit-bundle --tests
-    {{t5}} cargo test -p walgit-server --test web_api --test web_ui --test api_v1 --test static_http --test maintain --test routing_prefix --test lfs_upstream --test drain
+    cargo test {{fast_pkgs}} --tests --no-run
+    {{t5}} cargo test {{fast_pkgs}} --tests
+    cargo test {{server_fast}} --no-run
+    {{t5}} cargo test {{server_fast}}
 
 # Smart-HTTP end-to-end against real git (≈ 20 s) — run when touching smart.rs/receive/upload-pack/wal.
 e2e *ARGS:
