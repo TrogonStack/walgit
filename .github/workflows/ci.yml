@@ -13,7 +13,10 @@ on:
 
 concurrency:
   group: ci-${{ github.ref }}
-  cancel-in-progress: true
+  # Superseded PR pushes are worth cancelling; main is not. A cancelled main run takes
+  # publish-canary down with it (run-level cancellation ignores job-level concurrency),
+  # and that commit's immutable sha- tag would then never exist.
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 env:
   CARGO_TERM_COLOR: always
@@ -89,7 +92,9 @@ jobs:
   #   ghcr.io/<owner>/walgit:canary   moving tag, always the newest green main
   #   ghcr.io/<owner>/walgit:sha-<7>  immutable, what a rollback or a bug report pins to
   #
-  # Idempotent: re-running a run on the same commit rewrites both tags to the same digest.
+  # Re-running a run on the same commit is safe: it rebuilds and moves both tags to the new
+  # image. The tag set is a pure function of the commit, but the digest is not (the build is
+  # not bit-reproducible), so a re-run republishes rather than no-ops.
   publish-canary:
     name: publish canary image
     needs: [build-test, e2e]
