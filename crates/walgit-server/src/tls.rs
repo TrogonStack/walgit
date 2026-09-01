@@ -42,8 +42,18 @@ pub fn load(cfg: &Config) -> anyhow::Result<Option<Arc<Tls>>> {
     let (cert_pem, key_pem) = match cfg.server.tls.mode {
         TlsMode::Off => return Ok(None),
         TlsMode::Files => {
-            let cert = cfg.server.tls.cert.as_ref().expect("validated");
-            let key = cfg.server.tls.key.as_ref().expect("validated");
+            let cert = cfg
+                .server
+                .tls
+                .cert
+                .as_ref()
+                .context("server.tls.cert is required when server.tls.mode is \"files\"")?;
+            let key = cfg
+                .server
+                .tls
+                .key
+                .as_ref()
+                .context("server.tls.key is required when server.tls.mode is \"files\"")?;
             (
                 std::fs::read_to_string(cert)
                     .with_context(|| format!("reading server.tls.cert {}", cert.display()))?,
@@ -63,11 +73,14 @@ pub fn load(cfg: &Config) -> anyhow::Result<Option<Arc<Tls>>> {
     let key: PrivateKeyDer<'static> = rustls_pemfile::private_key(&mut key_pem.as_bytes())
         .context("parsing TLS private key PEM")?
         .ok_or_else(|| anyhow::anyhow!("TLS key PEM holds no private key"))?;
+    let leaf = certs
+        .first()
+        .context("TLS certificate PEM holds no certificate")?;
     let fingerprint = {
         use sha2::Digest;
         format!(
             "sha256:{}",
-            hex::encode(sha2::Sha256::digest(certs[0].as_ref()))
+            hex::encode(sha2::Sha256::digest(leaf.as_ref()))
         )
     };
     let mut sc = rustls::ServerConfig::builder_with_provider(Arc::new(
@@ -106,7 +119,7 @@ fn self_signed(dir: &Path, hostnames: &[String]) -> anyhow::Result<(String, Stri
         rcgen::CertificateParams::new(hostnames.to_vec()).context("certificate params")?;
     params.distinguished_name.push(
         rcgen::DnType::CommonName,
-        hostnames.first().map(String::as_str).unwrap_or("walgit"),
+        hostnames.first().map_or("walgit", String::as_str),
     );
     params.not_before = rcgen::date_time_ymd(2024, 1, 1);
     params.not_after = rcgen::date_time_ymd(2124, 1, 1);
@@ -137,7 +150,7 @@ fn write_private(path: &Path, body: &str) -> anyhow::Result<()> {
 }
 
 /// `axum::serve::Listener` that wraps every accepted TCP connection in a
-/// lazily-handshaking TLS stream (TCP_NODELAY set, like the plain listener).
+/// lazily-handshaking TLS stream (`TCP_NODELAY` set, like the plain listener).
 pub struct TlsListener {
     pub(crate) tcp: TcpAccept,
     pub acceptor: TlsAcceptor,

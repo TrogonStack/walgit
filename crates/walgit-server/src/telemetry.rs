@@ -57,10 +57,10 @@ fn resolve_project_id(cfg: &Config) -> Option<String> {
     if let Some(p) = &cfg.telemetry.trace_project {
         return Some(p.clone());
     }
-    if let Ok(p) = std::env::var("GOOGLE_CLOUD_PROJECT") {
-        if !p.is_empty() {
-            return Some(p);
-        }
+    if let Ok(p) = std::env::var("GOOGLE_CLOUD_PROJECT")
+        && !p.is_empty()
+    {
+        return Some(p);
     }
     // Probe metadata only when the documented GCE override is present. Off-GCP,
     // resolving metadata.google.internal can otherwise stall startup.
@@ -123,6 +123,10 @@ struct SpanData {
     fields: Map<String, Value>,
 }
 
+#[allow(
+    clippy::type_complexity,
+    reason = "a shared test sink; naming the alias would not make the nesting clearer"
+)]
 /// A custom `tracing` layer that emits Cloud Logging structured JSON.
 ///
 /// * **Events** produce a JSON line immediately with `severity` = event level.
@@ -188,7 +192,7 @@ impl CloudLoggingLayer {
     }
 
     /// Build the base JSON record with standard Cloud Logging fields.
-    fn base_record(&self, severity: &str, message: &str) -> Map<String, Value> {
+    fn base_record(severity: &str, message: &str) -> Map<String, Value> {
         let mut map = Map::new();
         map.insert("severity".into(), json!(severity));
         map.insert("message".into(), json!(message));
@@ -246,7 +250,7 @@ where
             .values
             .get("trace_id")
             .and_then(|v| v.as_str())
-            .map(|s| s.to_string());
+            .map(ToString::to_string);
         let parent_trace = ctx
             .span(id)
             .and_then(|s| s.parent())
@@ -289,7 +293,7 @@ where
 
     fn on_event(&self, event: &Event<'_>, ctx: Context<'_, S>) {
         let metadata = event.metadata();
-        let severity = level_to_severity(metadata.level());
+        let severity = level_to_severity(*metadata.level());
 
         let mut visitor = FieldCollector::default();
         event.record(&mut visitor);
@@ -298,10 +302,9 @@ where
             .values
             .get("message")
             .and_then(|v| v.as_str())
-            .map(|s| s.to_string())
-            .unwrap_or_else(|| metadata.name().to_string());
+            .map_or_else(|| metadata.name().to_string(), ToString::to_string);
 
-        let mut record = self.base_record(severity, &message);
+        let mut record = Self::base_record(severity, &message);
         record.insert("target".into(), json!(metadata.target()));
 
         // Ancestor span fields (root→leaf), then event fields (override).
@@ -325,8 +328,7 @@ where
         if let Some(t) = visitor.values.get("trace_id").and_then(|v| v.as_str()) {
             let sid = trace
                 .as_ref()
-                .map(|t| t.1.clone())
-                .unwrap_or_else(generate_span_id);
+                .map_or_else(generate_span_id, |t| t.1.clone());
             trace = Some((t.to_string(), sid));
         }
         if let Some((tid, sid)) = trace {
@@ -348,12 +350,13 @@ where
                 return;
             }
             let end = data.last_exit.unwrap_or_else(Instant::now);
-            let elapsed_ms = end.duration_since(data.start).as_millis() as u64;
-            record = self.base_record(level_to_severity(&data.level), data.name);
+            let elapsed_ms =
+                u64::try_from(end.duration_since(data.start).as_millis()).unwrap_or(u64::MAX);
+            record = Self::base_record(level_to_severity(data.level), data.name);
             record.insert("elapsed_ms".into(), json!(elapsed_ms));
             // Close deferred well past the last poll (a lingering child): say so
             // separately instead of inflating the work's duration.
-            let idle_ms = end.elapsed().as_millis() as u64;
+            let idle_ms = u64::try_from(end.elapsed().as_millis()).unwrap_or(u64::MAX);
             if idle_ms >= 1000 {
                 record.insert("close_deferred_ms".into(), json!(idle_ms));
             }
@@ -381,13 +384,12 @@ where
 // Helpers
 // ---------------------------------------------------------------------------
 
-fn level_to_severity(level: &Level) -> &'static str {
+fn level_to_severity(level: Level) -> &'static str {
     match level {
-        &Level::ERROR => "ERROR",
-        &Level::WARN => "WARNING",
-        &Level::INFO => "INFO",
-        &Level::DEBUG => "DEBUG",
-        &Level::TRACE => "DEBUG",
+        Level::ERROR => "ERROR",
+        Level::WARN => "WARNING",
+        Level::INFO => "INFO",
+        Level::DEBUG | Level::TRACE => "DEBUG",
     }
 }
 
@@ -410,7 +412,7 @@ struct FieldCollector {
 
 impl Visit for FieldCollector {
     fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
-        let s = format!("{:?}", value);
+        let s = format!("{value:?}");
         self.values.insert(field.name().to_string(), json!(s));
     }
 
@@ -446,7 +448,7 @@ impl Visit for FieldCollector {
 
 /// Parse the `X-Cloud-Trace-Context` header.
 /// Format: `TRACE_ID/SPAN_ID;o=TRACE_TRUE`
-/// Returns the trace_id (32-char hex).
+/// Returns the `trace_id` (32-char hex).
 pub fn parse_x_cloud_trace_context(header: &str) -> Option<String> {
     let trace_id = header.split('/').next()?;
     let trimmed = trace_id.trim();
@@ -460,11 +462,11 @@ pub fn parse_x_cloud_trace_context(header: &str) -> Option<String> {
 
 /// Parse the W3C `traceparent` header.
 /// Format: `00-TRACE_ID-PARENT_ID-TRACE_FLAGS`
-/// Returns the trace_id (32-char hex).
+/// Returns the `trace_id` (32-char hex).
 pub fn parse_traceparent(header: &str) -> Option<String> {
     let parts: Vec<&str> = header.split('-').collect();
-    if parts.len() >= 4 {
-        let trace_id = parts[1].trim();
+    if let [_, trace_id, _, _, ..] = parts.as_slice() {
+        let trace_id = trace_id.trim();
         if trace_id.len() == 32 && trace_id.chars().all(|c| c.is_ascii_hexdigit()) {
             return Some(trace_id.to_lowercase());
         }
@@ -478,15 +480,14 @@ pub fn extract_trace_id(headers: &axum::http::HeaderMap) -> Option<String> {
     if let Some(v) = headers
         .get("x-cloud-trace-context")
         .and_then(|v| v.to_str().ok())
+        && let Some(tid) = parse_x_cloud_trace_context(v)
     {
-        if let Some(tid) = parse_x_cloud_trace_context(v) {
-            return Some(tid);
-        }
+        return Some(tid);
     }
-    if let Some(v) = headers.get("traceparent").and_then(|v| v.to_str().ok()) {
-        if let Some(tid) = parse_traceparent(v) {
-            return Some(tid);
-        }
+    if let Some(v) = headers.get("traceparent").and_then(|v| v.to_str().ok())
+        && let Some(tid) = parse_traceparent(v)
+    {
+        return Some(tid);
     }
     None
 }
@@ -500,7 +501,7 @@ static PROJECT_ID: OnceLock<Option<String>> = OnceLock::new();
 /// Initialise `tracing-subscriber` from `[telemetry]`.
 ///
 /// * `log_format` selects JSON (Cloud Logging) or pretty (human).
-/// * `log_filter` is the default EnvFilter; `RUST_LOG` overrides it entirely.
+/// * `log_filter` is the default `EnvFilter`; `RUST_LOG` overrides it entirely.
 /// * When JSON, installs a [`CloudLoggingLayer`] that emits structured JSON
 ///   with Cloud Logging trace correlation and span-close performance lines.
 pub fn tracing_init(cfg: &Config) {
@@ -577,7 +578,7 @@ mod tests {
         assert_eq!(CloudLoggingLayer::span_kind("noprefix"), "other");
     }
 
-    /// Verify that extract_trace_id works with both header formats.
+    /// Verify that `extract_trace_id` works with both header formats.
     #[test]
     fn extract_trace_id_from_headers() {
         let mut headers = axum::http::HeaderMap::new();

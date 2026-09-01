@@ -82,7 +82,11 @@ pub async fn batch(
     if !st.cfg.lfs.enabled {
         return Err(ApiError::NotFound("lfs disabled".into()));
     }
-    let _ = st.auth.require_read(headers).await.map_err(auth_err)?;
+    let _ = st
+        .auth
+        .require_read(headers)
+        .await
+        .map_err(ApiError::from)?;
     not_served_here(st, &route.id)?;
     let handle = open_repo(st, &route.id, false).await?;
     let store = handle.store().clone();
@@ -109,7 +113,7 @@ pub async fn batch(
                 .batch(upstream, cfg.upstream.token_env.as_deref(), &missing)
                 .await
         }
-        _ => Default::default(),
+        _ => std::collections::HashMap::default(),
     };
 
     let mut objs = Vec::with_capacity(body.objects.len());
@@ -166,7 +170,7 @@ pub async fn batch(
                     .ok()
                     .flatten()
                     .unwrap_or_else(|| format!("{base}/info/lfs/objects/{}", o.oid)),
-                _ => format!("{base}/info/lfs/objects/{}", o.oid),
+                walgit_config::BundleServe::Proxy => format!("{base}/info/lfs/objects/{}", o.oid),
             };
             actions.download = Some(Action {
                 href,
@@ -203,13 +207,13 @@ pub async fn batch(
     let mut resp = (StatusCode::OK, json).into_response();
     resp.headers_mut().insert(
         axum::http::header::CONTENT_TYPE,
-        "application/vnd.git-lfs+json".parse().unwrap(),
+        axum::http::HeaderValue::from_static("application/vnd.git-lfs+json"),
     );
     Ok(resp)
 }
 
 /// `GET|HEAD /{repo}/info/lfs/objects/{oid}` — stream the object with the full
-/// immutable-object contract (strong ETag, 304, Range/If-Range, HEAD,
+/// immutable-object contract (strong `ETag`, 304, Range/If-Range, HEAD,
 /// Content-Length); see `static_object`. LFS objects are sha256-addressed.
 pub async fn get_object(
     st: &AppState,
@@ -222,7 +226,11 @@ pub async fn get_object(
     if !st.cfg.lfs.enabled {
         return Err(ApiError::NotFound("lfs disabled".into()));
     }
-    let _ = st.auth.require_read(headers).await.map_err(auth_err)?;
+    let _ = st
+        .auth
+        .require_read(headers)
+        .await
+        .map_err(ApiError::from)?;
     not_served_here(st, &route.id)?;
     let oid = route_sub_last(&route.subpath)?;
     require_lfs_oid(oid)?;
@@ -262,6 +270,10 @@ pub async fn get_object(
     }
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one parameter per piece of already-parsed request state; a wrapper struct would only be built and destructured at the single call site"
+)]
 /// An object we lack but `lfs.upstream` has: stream it to the client while
 /// tee-ing into a spool file; after a complete, sha256-verified read the spool
 /// is `put` into the store (never on a short or mismatching read). No Range on
@@ -289,12 +301,12 @@ async fn read_through(
         return Err(ApiError::NotFound("object not found".into()));
     };
     if *method == axum::http::Method::HEAD {
-        return Ok(Response::builder()
+        return Response::builder()
             .status(StatusCode::OK)
             .header(axum::http::header::CONTENT_LENGTH, obj.size)
             .header(axum::http::header::CONTENT_TYPE, "application/octet-stream")
             .body(Body::empty())
-            .unwrap());
+            .map_err(|e| ApiError::Internal(e.to_string()));
     }
     let (len, mut upstream_body) = st
         .lfs_upstream
@@ -371,13 +383,13 @@ async fn read_through(
         let _ = tokio::fs::remove_file(&spool_path).await;
     });
     let stream = tokio_stream::wrappers::ReceiverStream::new(rx);
-    Ok(Response::builder()
+    Response::builder()
         .status(StatusCode::OK)
         .header(axum::http::header::CONTENT_LENGTH, len)
         .header(axum::http::header::CONTENT_TYPE, "application/octet-stream")
         .header(axum::http::header::CACHE_CONTROL, "no-store")
         .body(Body::from_stream(stream))
-        .unwrap())
+        .map_err(|e| ApiError::Internal(e.to_string()))
 }
 
 /// `PUT /{repo}/info/lfs/objects/{oid}` — stream upload, verify size + sha256.
@@ -387,10 +399,16 @@ pub async fn put_object(
     headers: &HeaderMap,
     body: Body,
 ) -> Result<Response, ApiError> {
+    use sha2::{Digest, Sha256};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     if !st.cfg.lfs.enabled {
         return Err(ApiError::NotFound("lfs disabled".into()));
     }
-    let _ = st.auth.require_write(headers).await.map_err(auth_err)?;
+    let _ = st
+        .auth
+        .require_write(headers)
+        .await
+        .map_err(ApiError::from)?;
     not_served_here(st, &route.id)?;
     let oid = route_sub_last(&route.subpath)?;
     require_lfs_oid(oid)?;
@@ -405,8 +423,6 @@ pub async fn put_object(
             .map_err(|e| ApiError::Internal(e.to_string()))?,
     );
     let mut reader = body_to_async_read(body);
-    use sha2::{Digest, Sha256};
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let mut hasher = Sha256::new();
     let mut n = 0u64;
     let mut buf = vec![0u8; 64 * 1024];
@@ -422,8 +438,9 @@ pub async fn put_object(
         if n > max {
             return Err(ApiError::PayloadTooLarge);
         }
-        hasher.update(&buf[..k]);
-        file.write_all(&buf[..k])
+        let read = buf.get(..k).unwrap_or_default();
+        hasher.update(read);
+        file.write_all(read)
             .await
             .map_err(|e| ApiError::Internal(e.to_string()))?;
     }
@@ -441,7 +458,7 @@ pub async fn put_object(
             PutMode::Overwrite.into(),
         )
         .await
-        .map_err(store_err)?;
+        .map_err(ApiError::from)?;
     Ok(StatusCode::OK.into_response())
 }
 
@@ -458,11 +475,15 @@ pub async fn verify(
     let body: BatchObject = serde_json::from_slice(&body_bytes)
         .map_err(|e| ApiError::BadRequest(format!("invalid lfs verify: {e}")))?;
     require_lfs_oid(&body.oid)?;
-    let _ = st.auth.require_write(headers).await.map_err(auth_err)?;
+    let _ = st
+        .auth
+        .require_write(headers)
+        .await
+        .map_err(ApiError::from)?;
     let handle = open_repo(st, &route.id, false).await?;
     let store = handle.store().clone();
     let key = keys::lfs_key(&body.oid);
-    let meta = store.head(&key).await.map_err(store_err)?;
+    let meta = store.head(&key).await.map_err(ApiError::from)?;
     match meta {
         Some(m) if m.size == body.size => Ok(StatusCode::OK.into_response()),
         Some(_) => Err(ApiError::BadRequest("lfs size mismatch".into())),
@@ -505,19 +526,4 @@ fn base_url(st: &AppState, route: &RepoRoute, headers: &HeaderMap) -> String {
         crate::smart::request_base_url(st, headers),
         route.id
     )
-}
-
-fn auth_err(e: crate::auth::AuthError) -> ApiError {
-    match e {
-        crate::auth::AuthError::Invalid | crate::auth::AuthError::Unauthorized => {
-            ApiError::Unauthorized
-        }
-        crate::auth::AuthError::Forbidden => ApiError::Forbidden,
-        crate::auth::AuthError::Unavailable => {
-            ApiError::ServiceUnavailable("auth provider unavailable".into())
-        }
-    }
-}
-fn store_err(e: walgit_store::StoreError) -> ApiError {
-    e.into()
 }

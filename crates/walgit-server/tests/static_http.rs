@@ -1,6 +1,17 @@
 //! HTTP contract of immutable store objects (LFS here; bundles share the same
-//! `static_object` path) and of the embedded UI assets: strong ETags, 304,
+//! `static_object` path) and of the embedded UI assets: strong `ETags`, 304,
 //! Range/If-Range, HEAD, Content-Length, precompressed encodings.
+
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing,
+    clippy::many_single_char_names
+)]
+// clippy.toml exempts #[test] functions from the panic-path lints, but not the plain
+// helper functions beside them in the same file. A panic in a fixture builder is how
+// that fixture reports it could not be built, exactly as in the tests it serves.
 
 mod harness;
 
@@ -167,6 +178,10 @@ async fn lfs_object_full_http_contract() -> Result<()> {
     Ok(())
 }
 
+#[allow(
+    clippy::case_sensitive_file_extension_comparisons,
+    reason = "the build writes these asset names itself, always lowercase"
+)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn ui_assets_etag_304_and_precompressed() -> Result<()> {
     let server = Server::start().await?;

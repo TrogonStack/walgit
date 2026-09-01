@@ -161,7 +161,7 @@ impl Bridge {
                 // Another bridge instance advanced it: our emission was a
                 // duplicate (dedup key), theirs stands.
                 Err(StoreError::PreconditionFailed { .. }) => {
-                    tracing::warn!(repo = %id, "events bridge: cursor CAS lost (two bridges?)")
+                    tracing::warn!(repo = %id, "events bridge: cursor CAS lost (two bridges?)");
                 }
                 Err(e) => return Err(e.into()),
             }
@@ -195,7 +195,7 @@ impl Bridge {
                 }
                 Ok(_) => {}
                 Err(e) => {
-                    tracing::warn!(repo = %id, error = %e, "events bridge: sweep catch-up failed")
+                    tracing::warn!(repo = %id, error = %e, "events bridge: sweep catch-up failed");
                 }
             }
         }
@@ -262,19 +262,21 @@ impl Bridge {
 fn notified_keys(v: &serde_json::Value) -> Vec<String> {
     let mut keys = Vec::new();
     // GCS → Pub/Sub push envelope.
-    let attrs = &v["message"]["attributes"];
-    if attrs["eventType"] == "OBJECT_FINALIZE"
-        && let Some(k) = attrs["objectId"].as_str()
+    if let Some(attrs) = v.pointer("/message/attributes")
+        && attrs.get("eventType").and_then(serde_json::Value::as_str) == Some("OBJECT_FINALIZE")
+        && let Some(k) = attrs.get("objectId").and_then(serde_json::Value::as_str)
     {
         keys.push(k.to_string());
     }
     // S3 event notification (also what MinIO/rustfs/Ceph emit).
-    if let Some(records) = v["Records"].as_array() {
+    if let Some(records) = v.get("Records").and_then(serde_json::Value::as_array) {
         for r in records {
-            if r["eventName"]
-                .as_str()
+            if r.get("eventName")
+                .and_then(serde_json::Value::as_str)
                 .is_some_and(|e| e.starts_with("ObjectCreated"))
-                && let Some(k) = r["s3"]["object"]["key"].as_str()
+                && let Some(k) = r
+                    .pointer("/s3/object/key")
+                    .and_then(serde_json::Value::as_str)
             {
                 // S3 URL-encodes keys in notifications.
                 keys.push(
@@ -285,9 +287,12 @@ fn notified_keys(v: &serde_json::Value) -> Vec<String> {
                             if i == 0 {
                                 return part.to_string();
                             }
-                            match u8::from_str_radix(part.get(..2).unwrap_or(""), 16) {
-                                Ok(b) => format!("{}{}", b as char, &part[2..]),
-                                Err(_) => format!("%{part}"),
+                            match (
+                                u8::from_str_radix(part.get(..2).unwrap_or(""), 16),
+                                part.get(2..),
+                            ) {
+                                (Ok(b), Some(rest)) => format!("{}{rest}", b as char),
+                                _ => format!("%{part}"),
                             }
                         })
                         .collect(),
@@ -314,7 +319,11 @@ pub async fn http_notify(
 ) -> Result<axum::response::Response, crate::error::ApiError> {
     use crate::error::ApiError;
     use axum::response::IntoResponse;
-    let _ = st.auth.require_read(headers).await.map_err(auth_err)?;
+    let _ = st
+        .auth
+        .require_read(headers)
+        .await
+        .map_err(ApiError::from)?;
     let Some(bridge) = &st.bridge else {
         return Err(ApiError::NotFound(
             "events bridge is not enabled here".into(),
@@ -341,21 +350,8 @@ pub async fn http_notify(
     Ok(axum::Json(reports).into_response())
 }
 
-fn auth_err(e: crate::auth::AuthError) -> crate::error::ApiError {
-    use crate::error::ApiError;
-    match e {
-        crate::auth::AuthError::Invalid | crate::auth::AuthError::Unauthorized => {
-            ApiError::Unauthorized
-        }
-        crate::auth::AuthError::Forbidden => ApiError::Forbidden,
-        crate::auth::AuthError::Unavailable => {
-            ApiError::ServiceUnavailable("auth provider unavailable".into())
-        }
-    }
-}
-
 /// `events.sweep_interval` timer (0 = off).
-pub fn spawn_sweeper(state: Arc<crate::AppState>) {
+pub fn spawn_sweeper(state: &Arc<crate::AppState>) {
     let Some(bridge) = state.bridge.clone() else {
         return;
     };

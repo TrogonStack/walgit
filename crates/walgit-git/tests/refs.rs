@@ -1,3 +1,14 @@
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing,
+    clippy::many_single_char_names
+)]
+// clippy.toml exempts #[test] functions from the panic-path lints, but not the plain
+// helper functions beside them in the same file. A panic in a fixture builder is how
+// that fixture reports it could not be built, exactly as in the tests it serves.
+
 mod common;
 
 use std::time::Instant;
@@ -255,7 +266,7 @@ fn ref_view_lookups_are_logarithmic_and_overlay_aware() {
     let mut view = RefView::new(snap.clone());
     assert_eq!(
         view.get("refs/heads/ref-123456").as_deref(),
-        Some(format!("{:040x}", 123456).as_str())
+        Some(format!("{:040x}", 123_456).as_str())
     );
     assert_eq!(
         view.get("HEAD").as_deref(),
