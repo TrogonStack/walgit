@@ -127,7 +127,8 @@ open https://walgit.localhost:8080/
 
 * `walgit.standalone.toml` — the one-machine shape (self-signed TLS, rustfs, every role). Start here.
 * `walgit.example.toml` — every key with its default and a comment.
-* `Containerfile`, `flake.nix` — an OCI image and a Nix package/devshell.
+* `Containerfile`, `flake.nix` — an OCI image and a Nix package/devshell. Every green push to `main` publishes
+  that image to `ghcr.io/<owner>/walgit` as `canary` (moving) and `sha-<7>` (immutable: what a rollback pins to).
 * `deploy/nginx.conf.example` — an optional nginx in front: public TLS, one `auth_request` per credential, and
   **byte offload**: walgit answers bundle/LFS downloads with `X-Accel-Redirect` and nginx streams + caches the
   object from the bucket itself (S3 presigned or GCS with walgit's bearer). The file documents the contract.
