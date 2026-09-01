@@ -1,5 +1,6 @@
 use bytes::{Bytes, BytesMut};
 use futures::StreamExt;
+use std::fmt::Write as _;
 
 use crate::{ByteStream, Result, StoreError};
 
@@ -9,16 +10,15 @@ pub async fn collect(mut body: ByteStream, size_hint: usize) -> Result<Bytes> {
     let mut buf: Option<BytesMut> = None;
     while let Some(chunk) = body.next().await {
         let chunk = chunk?;
-        match (&mut first, &mut buf) {
-            (None, None) => first = Some(chunk),
-            (Some(_), None) => {
-                let f = first.take().unwrap();
-                let mut b = BytesMut::with_capacity(size_hint.max(f.len() + chunk.len()));
-                b.extend_from_slice(&f);
-                b.extend_from_slice(&chunk);
-                buf = Some(b);
-            }
-            (_, Some(b)) => b.extend_from_slice(&chunk),
+        if let Some(b) = &mut buf {
+            b.extend_from_slice(&chunk);
+        } else if let Some(f) = first.take() {
+            let mut b = BytesMut::with_capacity(size_hint.max(f.len() + chunk.len()));
+            b.extend_from_slice(&f);
+            b.extend_from_slice(&chunk);
+            buf = Some(b);
+        } else {
+            first = Some(chunk);
         }
     }
     Ok(match (first, buf) {
@@ -39,11 +39,6 @@ pub fn file_stream(
     range: Option<std::ops::Range<u64>>,
     chunk: usize,
 ) -> ByteStream {
-    use tokio::io::{AsyncReadExt, AsyncSeekExt};
-    return async_stream_file(path, range, chunk)
-        .map(|r| r.map_err(StoreError::other))
-        .boxed();
-
     fn async_stream_file(
         path: std::path::PathBuf,
         range: Option<std::ops::Range<u64>>,
@@ -63,10 +58,10 @@ pub fn file_stream(
                             Err(e) => return Some((Err(e), State::Done)),
                         },
                     };
-                    if start > 0 {
-                        if let Err(e) = f.seek(std::io::SeekFrom::Start(start)).await {
-                            return Some((Err(e), State::Done));
-                        }
+                    if start > 0
+                        && let Err(e) = f.seek(std::io::SeekFrom::Start(start)).await
+                    {
+                        return Some((Err(e), State::Done));
                     }
                     read_next(f, remaining, chunk).await
                 }
@@ -87,7 +82,7 @@ pub fn file_stream(
         if remaining == 0 {
             return None;
         }
-        let want = (chunk as u64).min(remaining) as usize;
+        let want = usize::try_from((chunk as u64).min(remaining)).unwrap_or(usize::MAX);
         let mut buf = BytesMut::with_capacity(want);
         // read_buf reads at most capacity; loop until we get `want` or EOF.
         while buf.len() < want {
@@ -123,6 +118,10 @@ pub fn file_stream(
         },
         Done,
     }
+    use tokio::io::{AsyncReadExt, AsyncSeekExt};
+    async_stream_file(path, range, chunk)
+        .map(|r| r.map_err(StoreError::other))
+        .boxed()
 }
 
 /// Exponential backoff with full jitter. `attempt` starts at 0.
@@ -134,7 +133,7 @@ pub fn backoff(
     use rand::Rng;
     let exp = base.saturating_mul(1u32 << attempt.min(16));
     let cap = exp.min(max);
-    let jitter = rand::rng().random_range(0..=cap.as_millis() as u64);
+    let jitter = rand::rng().random_range(0..=u64::try_from(cap.as_millis()).unwrap_or(u64::MAX));
     std::time::Duration::from_millis(jitter)
 }
 
@@ -268,9 +267,11 @@ pub fn encode_path(key: &str) -> String {
     for b in key.bytes() {
         match b {
             b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' | b'/' => {
-                out.push(b as char)
+                out.push(b as char);
             }
-            _ => out.push_str(&format!("%{b:02X}")),
+            _ => {
+                let _ = write!(out, "%{b:02X}");
+            }
         }
     }
     out

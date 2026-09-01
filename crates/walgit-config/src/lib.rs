@@ -2,7 +2,11 @@
 //! `WALGIT__SECTION__KEY=value` (double underscore = nesting), applied after
 //! the file is parsed. `PORT` (a serverless host) overrides `server.listen` port.
 
-use std::{net::SocketAddr, path::PathBuf, time::Duration};
+use std::{
+    net::{IpAddr, Ipv4Addr, SocketAddr},
+    path::PathBuf,
+    time::Duration,
+};
 
 use anyhow::{Context, Result};
 pub use bytesize::ByteSize;
@@ -11,6 +15,7 @@ pub use std::str::FromStr;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
+#[derive(Default)]
 pub struct Config {
     pub server: ServerConfig,
     pub store: StoreConfig,
@@ -48,8 +53,8 @@ pub struct ServerConfig {
     pub drain_timeout: Duration,
     /// Max size of a single pushed pack accepted over HTTP.
     pub max_push_bytes: ByteSize,
-    /// Roles this instance performs. a serverless host: fronts get ["serve"], the
-    /// single maintenance instance ["maintain"] (checkpoint / bundle / compact
+    /// Roles this instance performs. a serverless host: fronts get `["serve"]`, the
+    /// single maintenance instance `["maintain"]` (checkpoint / bundle / compact
     /// loops over every repo; `compact` and `bundle` are its sub-roles). Empty = all.
     pub roles: Vec<Role>,
     pub auth: AuthConfig,
@@ -199,7 +204,7 @@ pub enum AuthMode {
     None,
     /// Static tokens from the config (`tokens`), bearer or basic.
     Token,
-    /// OpenID Connect: browser sign-in through the issuer, ID tokens as bearers, plus
+    /// `OpenID` Connect: browser sign-in through the issuer, ID tokens as bearers, plus
     /// walgit-issued access tokens for git — and `tokens` for robots.
     Oidc,
 }
@@ -336,6 +341,9 @@ pub struct CacheConfig {
     pub store_mount: Option<PathBuf>,
 }
 
+// Each bool is one documented TOML key. Grouping them into sub-structs to satisfy
+// the lint would change the config file's shape, which is a user-facing contract.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct WalConfig {
@@ -449,12 +457,12 @@ fn default_all_repos() -> Vec<String> {
 impl Default for MaintenanceConfig {
     fn default() -> Self {
         MaintenanceConfig {
-            interval: Duration::from_secs(60),
+            interval: Duration::from_mins(1),
             checkpoints: true,
             max_pack_bytes: ByteSize::b(0),
             disk: MaintainerDisk::Tmpfs,
             host: None,
-            fsck_interval: Duration::from_secs(7 * 24 * 3600),
+            fsck_interval: Duration::from_hours(168),
             follow_interval: Duration::from_secs(30),
         }
     }
@@ -469,6 +477,7 @@ impl Default for MaintenanceConfig {
 ///   everywhere, so the edge's read-only fallback (D29) works.
 /// * **maintain**: the maintainer loop's units (checkpoints, bundles, compaction,
 ///   fsck/repair) — only on hosts with the `maintain` role.
+///
 /// Placement is by rule, not by capacity: a repo is either this host's or not.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
@@ -528,6 +537,9 @@ pub enum RepackEngine {
     Git,
 }
 
+// Each bool is one documented TOML key. Grouping them into sub-structs to satisfy
+// the lint would change the config file's shape, which is a user-facing contract.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct BundlesConfig {
@@ -681,6 +693,9 @@ pub struct UpstreamConfig {
     pub follow: Vec<String>,
 }
 
+// Each bool is one documented TOML key. Grouping them into sub-structs to satisfy
+// the lint would change the config file's shape, which is a user-facing contract.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct GitConfig {
@@ -763,7 +778,7 @@ impl Default for EventsConfig {
         EventsConfig {
             webhook_url: None,
             webhook_secret: None,
-            sweep_interval: Duration::from_secs(300),
+            sweep_interval: Duration::from_mins(5),
         }
     }
 }
@@ -808,6 +823,18 @@ pub const SETTINGS_SECTIONS: &[&str] = &["bundles", "maintenance", "compaction",
 /// D24: maximum size of a settings document.
 pub const SETTINGS_MAX_BYTES: usize = 16 * 1024;
 
+/// Recursively merge `from` into `into`, table by table; non-table values replace.
+fn merge(into: &mut toml::Table, from: &toml::Table) {
+    for (k, v) in from {
+        match (into.get_mut(k), v) {
+            (Some(toml::Value::Table(a)), toml::Value::Table(b)) => merge(a, b),
+            _ => {
+                into.insert(k.clone(), v.clone());
+            }
+        }
+    }
+}
+
 impl Config {
     /// D24: the effective configuration for one repository = this (the host's
     /// walgit.toml ⊕ env) with the repository's settings TOML merged on top.
@@ -836,16 +863,6 @@ impl Config {
             );
         }
         let mut doc: toml::Table = toml::Table::try_from(self).context("serializing config")?;
-        fn merge(into: &mut toml::Table, from: &toml::Table) {
-            for (k, v) in from {
-                match (into.get_mut(k), v) {
-                    (Some(toml::Value::Table(a)), toml::Value::Table(b)) => merge(a, b),
-                    _ => {
-                        into.insert(k.clone(), v.clone());
-                    }
-                }
-            }
-        }
         merge(&mut doc, &overrides);
         let cfg: Config = doc.try_into().context("settings: applying")?;
         cfg.validate()
@@ -857,7 +874,7 @@ impl Config {
     /// never `upstream.token_env` (that name is host-only).
     pub fn public_settings_toml(&self) -> Result<String> {
         let mut doc: toml::Table = toml::Table::try_from(self).context("serializing config")?;
-        doc.retain(|k, _| SETTINGS_SECTIONS.iter().any(|s| *s == k));
+        doc.retain(|k, _| SETTINGS_SECTIONS.contains(&k));
         if let Some(toml::Value::Table(u)) = doc.get_mut("upstream") {
             u.remove("token_env");
         }
@@ -882,7 +899,7 @@ impl Config {
             CacheMode::Auto => self.maintenance.disk == MaintainerDisk::Ssd,
         }
     }
-    /// Bundle strategies form chains of calendar slots (docs/BUNDLE_URI_DESIGN.md §4):
+    /// Bundle strategies form chains of calendar slots (`docs/BUNDLE_URI_DESIGN.md` §4):
     /// every `schedule` is a 6-field UTC cron (or an `@alias`) that parses; an
     /// incremental names a `base` that exists and whose chain ends in a full
     /// strategy; each chain has exactly one full root; `keep >= 1` on fulls.
@@ -987,7 +1004,7 @@ fn env_placement_overrides(doc: &toml::Table, vars_seen: &[String]) -> Option<to
     let keys: Vec<String> = vars_seen
         .iter()
         .filter_map(|k| k.strip_prefix("WALGIT__PLACEMENT__"))
-        .map(|k| k.to_ascii_lowercase())
+        .map(str::to_ascii_lowercase)
         .collect();
     if keys.is_empty() {
         return None;
@@ -1009,33 +1026,14 @@ pub fn repo_listed(list: &[String], owner: &str, name: &str) -> bool {
     })
 }
 
-impl Default for Config {
-    fn default() -> Self {
-        Config {
-            server: ServerConfig::default(),
-            store: StoreConfig::default(),
-            cache: CacheConfig::default(),
-            wal: WalConfig::default(),
-            compaction: CompactionConfig::default(),
-            maintenance: MaintenanceConfig::default(),
-            bundles: BundlesConfig::default(),
-            placement: PlacementConfig::default(),
-            lfs: LfsConfig::default(),
-            upstream: UpstreamConfig::default(),
-            git: GitConfig::default(),
-            telemetry: TelemetryConfig::default(),
-            events: EventsConfig::default(),
-        }
-    }
-}
 impl Default for ServerConfig {
     fn default() -> Self {
         ServerConfig {
-            listen: "127.0.0.1:8080".parse().unwrap(),
+            listen: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8080),
             http2: true,
             max_concurrent_requests: 512,
             max_concurrent_per_repo: 64,
-            request_timeout: Duration::from_secs(3600),
+            request_timeout: Duration::from_hours(1),
             drain_timeout: Duration::from_secs(20),
             max_push_bytes: ByteSize::gib(64),
             roles: vec![],
@@ -1063,8 +1061,8 @@ impl Default for AuthConfig {
             admin_emails: vec![],
             admin_domains: vec![],
             session_secret: None,
-            session_ttl: Duration::from_secs(30 * 24 * 3600),
-            access_token_ttl: Duration::from_secs(90 * 24 * 3600),
+            session_ttl: Duration::from_hours(720),
+            access_token_ttl: Duration::from_hours(2160),
             oauth_client_id: None,
             oauth_client_secret: None,
         }
@@ -1113,7 +1111,7 @@ impl Default for CacheConfig {
             mode: CacheMode::Auto,
             max_bytes: ByteSize::gib(20),
             disk_high_watermark: 0.9,
-            evict_idle_after: Duration::from_secs(6 * 3600),
+            evict_idle_after: Duration::from_hours(6),
             prewarm: vec![],
             prewarm_parallelism: 2,
             prewarm_ready_timeout: Duration::ZERO,
@@ -1136,7 +1134,7 @@ impl Default for WalConfig {
             push_broker_token: None,
             push_broker_buffer_bytes: ByteSize::mib(64),
             snapshot_every_entries: 256,
-            checkpoint_interval: Duration::from_secs(3600),
+            checkpoint_interval: Duration::from_hours(1),
             checkpoint_tail_bytes: ByteSize::mib(8),
             cas_max_retries: 16,
             fsck_objects: true,
@@ -1155,8 +1153,8 @@ impl Default for CompactionConfig {
             factor: 2,
             trigger_packs: 16,
             trigger_bytes: ByteSize::gib(1),
-            lease_ttl: Duration::from_secs(600),
-            retention_superseded: Duration::from_secs(7 * 24 * 3600),
+            lease_ttl: Duration::from_mins(10),
+            retention_superseded: Duration::from_hours(168),
             engine: RepackEngine::Git,
         }
     }
@@ -1205,7 +1203,7 @@ impl Default for BundlesConfig {
                 },
             ],
             serve_via: BundleServe::Proxy,
-            signed_url_ttl: Duration::from_secs(3600),
+            signed_url_ttl: Duration::from_hours(1),
             advertise: true,
             advertise_filtered: false,
             require: Vec::new(),
@@ -1222,7 +1220,7 @@ impl Default for LfsConfig {
         LfsConfig {
             enabled: true,
             serve_via: BundleServe::Proxy,
-            signed_url_ttl: Duration::from_secs(3600),
+            signed_url_ttl: Duration::from_hours(1),
             max_object_bytes: ByteSize::gib(16),
         }
     }
@@ -1304,8 +1302,8 @@ impl Config {
                 continue;
             };
             vars_seen.push(k.clone());
-            let path: Vec<String> = rest.split("__").map(|s| s.to_ascii_lowercase()).collect();
-            if path.is_empty() || path.iter().any(|p| p.is_empty()) {
+            let path: Vec<String> = rest.split("__").map(str::to_ascii_lowercase).collect();
+            if path.is_empty() || path.iter().any(String::is_empty) {
                 continue;
             }
             let value: toml::Value = v
@@ -1320,16 +1318,19 @@ impl Config {
                     path: &[String],
                     value: toml::Value,
                 ) -> std::result::Result<(), String> {
-                    if path.len() == 1 {
-                        cur.insert(path[0].clone(), value);
+                    let Some((head, rest)) = path.split_first() else {
+                        return Err("empty key path".to_string());
+                    };
+                    if rest.is_empty() {
+                        cur.insert(head.clone(), value);
                         return Ok(());
                     }
                     let next = cur
-                        .entry(path[0].clone())
-                        .or_insert_with(|| toml::Value::Table(Default::default()))
+                        .entry(head.clone())
+                        .or_insert_with(|| toml::Value::Table(toml::Table::default()))
                         .as_table_mut()
-                        .ok_or_else(|| format!("{} is not a table", path[0]))?;
-                    set(next, &path[1..], value)
+                        .ok_or_else(|| format!("{head} is not a table"))?;
+                    set(next, rest, value)
                 }
                 match set(&mut trial, &path, value) {
                     Err(why) => Some(why),
@@ -1342,12 +1343,11 @@ impl Config {
                     }),
                 }
             };
-            match bad {
-                Some(why) => ignored.push((k, why)),
-                None => {
-                    doc = trial;
-                    touched = true;
-                }
+            if let Some(why) = bad {
+                ignored.push((k, why));
+            } else {
+                doc = trial;
+                touched = true;
             }
         }
         // `[placement]` is a host fact set as a GROUP: any WALGIT__PLACEMENT__* override
@@ -1371,10 +1371,10 @@ impl Config {
             self.server.listen.set_port(port);
             // Standalone / `dev server`: public_url is the origin the browser hits. Keep its
             // port in lockstep with PORT. A real public_url is left alone.
-            if let Some(u) = self.server.public_url.as_mut() {
-                if origin_is_loopback(u) {
-                    *u = rewrite_origin_port(u, port);
-                }
+            if let Some(u) = self.server.public_url.as_mut()
+                && origin_is_loopback(u)
+            {
+                *u = rewrite_origin_port(u, port);
             }
         }
         Ok(ignored)
@@ -1555,7 +1555,7 @@ impl Config {
                         names.contains(b.as_str()),
                         "bundle strategy {} base {b} does not exist",
                         s.name
-                    )
+                    );
                 }
                 (BundleKind::Full, Some(_)) => {
                     anyhow::bail!("bundle strategy {} is full but has a base", s.name)
@@ -1622,7 +1622,7 @@ impl Config {
         }
         let mut v: Vec<String> = ["localhost", "*.localhost", "127.0.0.1", "::1"]
             .iter()
-            .map(|s| s.to_string())
+            .map(ToString::to_string)
             .collect();
         if let Some(u) = &self.server.public_url {
             let host = u
@@ -1634,8 +1634,7 @@ impl Config {
                 .trim_start_matches('[');
             let host = host
                 .rsplit_once(']')
-                .map(|(h, _)| h)
-                .unwrap_or_else(|| host.split(':').next().unwrap_or(host));
+                .map_or_else(|| host.split(':').next().unwrap_or(host), |(h, _)| h);
             if !host.is_empty() && !v.iter().any(|h| h == host) {
                 v.push(host.to_string());
             }
@@ -1655,10 +1654,9 @@ fn origin_host(origin: &str) -> &str {
     let rest = origin
         .trim_end_matches('/')
         .split_once("://")
-        .map(|(_, r)| r)
-        .unwrap_or(origin);
+        .map_or(origin, |(_, r)| r);
     if let Some(inside) = rest.strip_prefix('[') {
-        return inside.split_once(']').map(|(h, _)| h).unwrap_or(inside);
+        return inside.split_once(']').map_or(inside, |(h, _)| h);
     }
     rest.split([':', '/']).next().unwrap_or(rest)
 }
@@ -1675,8 +1673,7 @@ fn rewrite_origin_port(origin: &str, port: u16) -> String {
     };
     let host = if rest.starts_with('[') {
         rest.split_once(']')
-            .map(|(h, _)| format!("{h}]"))
-            .unwrap_or_else(|| rest.to_string())
+            .map_or_else(|| rest.to_string(), |(h, _)| format!("{h}]"))
     } else {
         rest.split([':', '/']).next().unwrap_or(rest).to_string()
     };
@@ -1754,7 +1751,7 @@ mod tests {
 
     /// `[placement]` is set as a group: one PLACEMENT env key replaces the whole
     /// section (unset keys = defaults), never merges with the file's values.
-    /// The SSD host 2026-08-21 07:00Z: the baked toml's serve_exclude = ["acme/monorepo"]
+    /// The SSD host 2026-08-21 07:00Z: the baked toml's `serve_exclude` = `["acme/monorepo"]`
     /// leaked under an env that set only MAINTAIN* → the host refused its own repo.
     #[test]
     fn env_placement_override_replaces_the_whole_section() {
@@ -1868,13 +1865,13 @@ mod tests {
         base.store.bucket = "b".into();
         let eff = base
             .with_settings(
-                r#"
+                r"
 [bundles]
 min_commits = 3
 main_only = false
 [maintenance]
 checkpoints = false
-"#,
+",
             )
             .unwrap();
         assert_eq!(eff.bundles.min_commits, 3);
@@ -1945,10 +1942,7 @@ audiences = ["walgit-cli", "https://git.example.com"]
         assert!(err.to_string().contains("session_secret"), "{err}");
         let ok = Config::parse("[store]\nbucket = \"b\"\n[server.auth]\nmode = \"oidc\"\nissuer = \"https://login.example.com\"\nanonymous_read = false\nallowed_domains = [\"example.com\"]\noauth_client_id = \"x\"\noauth_client_secret = \"y\"\nsession_secret = \"0123456789abcdef0123456789abcdef\"\n").unwrap();
         assert_eq!(ok.server.auth.issuer, "https://login.example.com");
-        assert_eq!(
-            ok.server.auth.access_token_ttl,
-            Duration::from_secs(90 * 86400)
-        );
+        assert_eq!(ok.server.auth.access_token_ttl, Duration::from_hours(2160));
         let err = Config::parse(
             "[store]\nbucket = \"b\"\n[server]\nlisten = \"0.0.0.0:8080\"\n[server.auth]\nmode = \"none\"\n",
         )
@@ -1967,7 +1961,7 @@ webhook_secret = "s"
 "#,
         )
         .unwrap();
-        assert_eq!(c.events.sweep_interval, Duration::from_secs(60));
+        assert_eq!(c.events.sweep_interval, Duration::from_mins(1));
         assert_eq!(c.events.webhook_secret.as_deref(), Some("s"));
         let err = Config::parse("[events]\nwebhook_url = \"ftp://x\"\n").unwrap_err();
         assert!(err.to_string().contains("webhook_url"), "{err}");

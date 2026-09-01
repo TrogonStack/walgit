@@ -7,6 +7,17 @@
 //!   the upstream and persists them into the store (second GET served locally).
 //! - upstream lacks it: 404 on download, upload action on upload.
 
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing,
+    clippy::many_single_char_names
+)]
+// clippy.toml exempts #[test] functions from the panic-path lints, but not the plain
+// helper functions beside them in the same file. A panic in a fixture builder is how
+// that fixture reports it could not be built, exactly as in the tests it serves.
+
 mod harness;
 
 use std::sync::Arc;
@@ -80,7 +91,7 @@ async fn start_mock(body: Vec<u8>) -> Result<(Arc<Mock>, String)> {
         body,
         batches: AtomicUsize::new(0),
         downloads: AtomicUsize::new(0),
-        base: Default::default(),
+        base: std::sync::Mutex::default(),
     });
     let app = Router::new()
         .route("/lfs/objects/batch", post(mock_batch))
@@ -88,7 +99,7 @@ async fn start_mock(body: Vec<u8>) -> Result<(Arc<Mock>, String)> {
         .with_state(mock.clone());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
     let base = format!("http://{}", listener.local_addr()?);
-    *mock.base.lock().unwrap() = base.clone();
+    (*mock.base.lock().unwrap()).clone_from(&base);
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
     Ok((mock, base))
 }

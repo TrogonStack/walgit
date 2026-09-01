@@ -1,3 +1,14 @@
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing,
+    clippy::many_single_char_names
+)]
+// clippy.toml exempts #[test] functions from the panic-path lints, but not the plain
+// helper functions beside them in the same file. A panic in a fixture builder is how
+// that fixture reports it could not be built, exactly as in the tests it serves.
+
 mod common;
 
 use walgit_git::{GitError, IngestOptions, LocalRepo, ObjectFormat, RepoId, gix_hash};

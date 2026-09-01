@@ -1,9 +1,10 @@
 //! Render the bundle list in git's bundle-list config format and protocol v2
 //! key=value lines.
 //!
-//! See: https://git-scm.com/docs/bundle-uri and
-//!      https://git-scm.com/docs/gitprotocol-v2 (bundle-uri command).
+//! See: <https://git-scm.com/docs/bundle-uri> and
+//!      <https://git-scm.com/docs/gitprotocol-v2> (bundle-uri command).
 
+use std::fmt::Write as _;
 use std::time::Duration;
 
 use walgit_config::{BundleServe, BundlesConfig};
@@ -21,7 +22,7 @@ fn filename_of(key: &str) -> &str {
 /// Build the URI for a single bundle entry.
 ///
 /// * **Proxy**: `{base_url}/{owner}/{repo}/bundles/{strategy}/{filename}`
-/// * **SignedUrl**: `store.signed_get_url(key, ttl)`, falling back to Proxy
+/// * **`SignedUrl`**: `store.signed_get_url(key, ttl)`, falling back to Proxy
 ///   if the store doesn't support signed URLs.
 pub async fn bundle_uri(
     entry: &BundleEntry,
@@ -53,7 +54,10 @@ static SIGNING_WARNED: std::sync::LazyLock<std::sync::Mutex<std::collections::Ha
 
 fn warn_signing_once(owner: &str, repo: &str, e: &dyn std::fmt::Display) {
     let key = format!("{owner}/{repo}");
-    if SIGNING_WARNED.lock().unwrap().insert(key.clone()) {
+    let mut seen = SIGNING_WARNED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if seen.insert(key.clone()) {
         tracing::warn!(repo = %key, error = %e, "signed bundle URL failed; serving proxy URIs instead (check the store signing permissions)");
     }
 }
@@ -77,6 +81,10 @@ fn proxy_uri(entry: &BundleEntry, owner: &str, repo: &str, base_url: &str) -> St
     )
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one parameter per input the render needs; a wrapper struct would only be built and destructured at the call sites"
+)]
 /// Render the bundle list as git config text (bundle-list format).
 ///
 /// ```ini
@@ -131,12 +139,12 @@ pub async fn render_list_text(
             cfg.signed_url_ttl,
         )
         .await?;
-        out.push_str("\n");
-        out.push_str(&format!("[bundle \"{}\"]\n", entry.id));
-        out.push_str(&format!("    uri = {uri}\n"));
-        out.push_str(&format!("    creationToken = {}\n", entry.creation_token));
+        out.push('\n');
+        let _ = writeln!(out, "[bundle \"{}\"]", entry.id);
+        let _ = writeln!(out, "    uri = {uri}");
+        let _ = writeln!(out, "    creationToken = {}", entry.creation_token);
         if !entry.filter.is_empty() {
-            out.push_str(&format!("    filter = {}\n", entry.filter));
+            let _ = writeln!(out, "    filter = {}", entry.filter);
         }
     }
 
@@ -203,6 +211,15 @@ pub async fn protocol_v2_lines(
     }
 
     Ok(lines)
+}
+
+/// `serve_via` for one repository (`bundles.signed_url_for` overrides).
+fn serve_via_for(cfg: &walgit_config::BundlesConfig, owner: &str, repo: &str) -> BundleServe {
+    if walgit_config::repo_listed(&cfg.signed_url_for, owner, repo) {
+        BundleServe::SignedUrl
+    } else {
+        cfg.serve_via
+    }
 }
 
 #[cfg(test)]
@@ -301,14 +318,5 @@ mod tests {
     fn filename_extraction() {
         assert_eq!(filename_of("bundles/weekly/abc.bundle"), "abc.bundle");
         assert_eq!(filename_of("abc.bundle"), "abc.bundle");
-    }
-}
-
-/// `serve_via` for one repository (`bundles.signed_url_for` overrides).
-fn serve_via_for(cfg: &walgit_config::BundlesConfig, owner: &str, repo: &str) -> BundleServe {
-    if walgit_config::repo_listed(&cfg.signed_url_for, owner, repo) {
-        BundleServe::SignedUrl
-    } else {
-        cfg.serve_via
     }
 }

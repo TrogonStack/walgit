@@ -105,6 +105,10 @@ impl TaskState {
     pub fn record(&self) -> TaskRecord {
         self.record.lock().clone()
     }
+    #[allow(
+        clippy::type_complexity,
+        reason = "returns the snapshot and its subscription together; both halves are used at the single call site"
+    )]
     /// Subscribe + snapshot of everything so far (no gap, no duplicates).
     pub fn attach(
         &self,
@@ -157,7 +161,8 @@ impl TaskState {
                 Progress::Progress { .. } => rec.progress = Some(p.clone()),
                 Progress::Task { .. } => {}
             }
-            rec.elapsed_ms = self.started_at.elapsed().as_millis() as u64;
+            rec.elapsed_ms =
+                u64::try_from(self.started_at.elapsed().as_millis()).unwrap_or(u64::MAX);
         }
         {
             let mut replay = self.replay.lock();
@@ -389,15 +394,16 @@ impl Tasks {
         let record = {
             let mut rec = state.record.lock();
             rec.finished = Some(now_rfc3339());
-            rec.elapsed_ms = state.started_at.elapsed().as_millis() as u64;
+            rec.elapsed_ms =
+                u64::try_from(state.started_at.elapsed().as_millis()).unwrap_or(u64::MAX);
             match &outcome {
                 Ok((summary, _)) => {
                     rec.ok = Some(true);
-                    rec.summary = summary.clone();
+                    rec.summary.clone_from(summary);
                 }
                 Err((_, msg)) => {
                     rec.ok = Some(false);
-                    rec.summary = msg.clone();
+                    rec.summary.clone_from(msg);
                 }
             }
             rec.clone()
@@ -431,7 +437,7 @@ impl Tasks {
             pick_from
                 .as_ref()
                 .and_then(|v| v.get(k))
-                .and_then(|v| v.as_u64())
+                .and_then(serde_json::Value::as_u64)
         };
         let (bytes, objects) = (pick("bytes").or_else(|| pick("size")), pick("objects"));
         let ok = record.ok.unwrap_or(false);

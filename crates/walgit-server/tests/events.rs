@@ -1,6 +1,17 @@
 //! Events (docs/EVENTS.md): the bridge publishes exactly what the WAL
 //! committed, from a durable cursor; the GCS-notification wake-up; the sweep;
 //! a sink failure keeps the cursor.
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing,
+    clippy::many_single_char_names
+)]
+// clippy.toml exempts #[test] functions from the panic-path lints, but not the plain
+// helper functions beside them in the same file. A panic in a fixture builder is how
+// that fixture reports it could not be built, exactly as in the tests it serves.
+
 mod harness;
 
 const ZERO_OID: &str = "0000000000000000000000000000000000000000";
@@ -14,7 +25,7 @@ type Captured = std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>>;
 /// The webhook sink's target: records every event it receives (the bus as
 /// the test sees it).
 async fn webhook() -> (String, Captured) {
-    let captured: Captured = Default::default();
+    let captured: Captured = std::sync::Arc::default();
     let app = axum::Router::new().route(
         "/events",
         axum::routing::post({

@@ -17,8 +17,13 @@ fn main() {
     println!("cargo:rerun-if-changed={}", dist.display());
     let index = dist.join("index.html");
     if !index.exists() {
-        fs::create_dir_all(&dist).expect("create web/dist");
-        fs::write(&index, PLACEHOLDER).expect("write placeholder web/dist/index.html");
+        // A build script has no error channel: if the placeholder cannot be written,
+        // rust-embed fails later with a worse message. Aborting here is the contract.
+        #[allow(clippy::expect_used)]
+        {
+            fs::create_dir_all(&dist).expect("create web/dist");
+            fs::write(&index, PLACEHOLDER).expect("write placeholder web/dist/index.html");
+        }
         println!(
             "cargo:warning=web/dist was missing; wrote a placeholder index.html (run `just web-build` for the real UI)"
         );

@@ -40,7 +40,7 @@ impl BlockCache {
             cache: moka::future::Cache::builder()
                 .max_capacity(max_bytes.max(BLOCK_SIZE * 4))
                 .weigher(|_k: &(Arc<str>, u64), v: &Bytes| {
-                    v.len().clamp(1, u32::MAX as usize) as u32
+                    u32::try_from(v.len().clamp(1, u32::MAX as usize)).unwrap_or(u32::MAX)
                 })
                 .build(),
             range_reads: AtomicU64::new(0),
@@ -90,7 +90,7 @@ impl BlockCache {
                         return Err(WalError::Corrupt(format!("unexpected 304 for {key}")));
                     }
                 };
-                let b = walgit_store::util::collect(body, (end - start) as usize).await?;
+                let b = walgit_store::util::collect(body, usize::try_from(end - start).unwrap_or(usize::MAX)).await?;
                 if b.len() as u64 != end - start {
                     return Err(WalError::Corrupt(format!(
                         "short range read for {key}: {start}..{end} got {}",
@@ -175,10 +175,10 @@ impl RemotePacks {
         if let Ok(mut rd) = tokio::fs::read_dir(&dir).await {
             while let Ok(Some(e)) = rd.next_entry().await {
                 let name = e.file_name().to_string_lossy().to_string();
-                if let Some(stem) = name.strip_suffix(".idx") {
-                    if !live.contains(stem) {
-                        let _ = tokio::fs::remove_file(e.path()).await;
-                    }
+                if let Some(stem) = name.strip_suffix(".idx")
+                    && !live.contains(stem)
+                {
+                    let _ = tokio::fs::remove_file(e.path()).await;
                 }
             }
         }
@@ -194,10 +194,8 @@ impl RemotePacks {
                 .join("objects")
                 .join("pack")
                 .join(format!("pack-{}.idx", p.checksum));
-            if installed.is_file() {
-                if std::fs::hard_link(&installed, &dest).is_err() {
-                    let _ = std::fs::copy(&installed, &dest);
-                }
+            if installed.is_file() && std::fs::hard_link(&installed, &dest).is_err() {
+                let _ = std::fs::copy(&installed, &dest);
             }
         }
         let done = Arc::new(AtomicU64::new(0));
@@ -228,7 +226,7 @@ impl RemotePacks {
                 let reporter = reporter.clone();
                 let throttle = throttle.clone();
                 tasks.push(tokio::spawn(async move {
-                    let _permit = sem.acquire().await.unwrap();
+                    let _permit = sem.acquire().await.ok();
                     let tmp = dir.join(format!("{}.idx.tmp", p.checksum));
                     let dest = dir.join(format!("{}.idx", p.checksum));
                     let cb = |delta: u64, _t: u64| {
@@ -273,7 +271,7 @@ impl RemotePacks {
             let size = if p.pack_size > 0 {
                 p.pack_size
             } else {
-                store.head(&key).await?.map(|m| m.size).unwrap_or(0)
+                store.head(&key).await?.map_or(0, |m| m.size)
             };
             packs.push(RemotePack {
                 checksum: p.checksum.clone(),
@@ -296,7 +294,8 @@ impl RemotePacks {
             objects: moka::sync::Cache::builder()
                 .max_capacity(object_cache_bytes.max(8 * 1024 * 1024))
                 .weigher(|_k: &(usize, u64), v: &Arc<Obj>| {
-                    (v.data.len() + 64).clamp(1, u32::MAX as usize) as u32
+                    u32::try_from((v.data.len() + 64).clamp(1, u32::MAX as usize))
+                        .unwrap_or(u32::MAX)
                 })
                 .build(),
             hash,
@@ -315,7 +314,10 @@ impl RemotePacks {
         self.packs.iter().map(|p| p.checksum.as_str()).collect()
     }
     pub fn total_objects(&self) -> u64 {
-        self.packs.iter().map(|p| p.idx.num_objects() as u64).sum()
+        self.packs
+            .iter()
+            .map(|p| u64::from(p.idx.num_objects()))
+            .sum()
     }
 
     /// Locate an object: (pack index, pack offset).
@@ -375,7 +377,9 @@ impl RemotePacks {
             let (entry, _) = self.read_entry_header(cur.0, cur.1).await?;
             match entry.header {
                 Header::Blob | Header::Tree | Header::Commit | Header::Tag => {
-                    let kind = entry.header.as_kind().expect("base kind");
+                    let kind = entry.header.as_kind().ok_or_else(|| {
+                        WalError::Corrupt("pack base entry has no object kind".into())
+                    })?;
                     return Ok(Some((kind, size.unwrap_or(entry.decompressed_size))));
                 }
                 Header::OfsDelta { base_distance } => {
@@ -411,7 +415,12 @@ impl RemotePacks {
         if let Some(o) = self.objects.get(&(pi, off)) {
             return Ok(o);
         }
-        let span = tracing::debug_span!("remote.decode", repo = %self.repo, pack = %self.packs[pi].checksum, offset = off, oid_kind = tracing::field::Empty, chain = tracing::field::Empty);
+        let checksum = self
+            .packs
+            .get(pi)
+            .map(|p| p.checksum.as_str())
+            .unwrap_or_default();
+        let span = tracing::debug_span!("remote.decode", repo = %self.repo, pack = %checksum, offset = off, oid_kind = tracing::field::Empty, chain = tracing::field::Empty);
         let r = self.decode_inner(pi, off).instrument(span.clone()).await;
         if let Ok((o, chain)) = &r {
             span.record("oid_kind", format!("{:?}", o.kind).to_lowercase());
@@ -436,7 +445,9 @@ impl RemotePacks {
             match entry.header {
                 Header::Blob | Header::Tree | Header::Commit | Header::Tag => {
                     let o = Arc::new(Obj {
-                        kind: entry.header.as_kind().expect("base kind"),
+                        kind: entry.header.as_kind().ok_or_else(|| {
+                            WalError::Corrupt("pack base entry has no object kind".into())
+                        })?,
                         data: Bytes::from(data),
                     });
                     self.objects.insert(cur, o.clone());
@@ -474,7 +485,10 @@ impl RemotePacks {
     /// Bytes `[off, off+len)` of pack `pi`, assembled from cached blocks
     /// (missing blocks fetched concurrently).
     async fn read_at(&self, pi: usize, off: u64, len: u64) -> Result<Bytes, WalError> {
-        let p = &self.packs[pi];
+        let p = self
+            .packs
+            .get(pi)
+            .ok_or_else(|| WalError::Corrupt(format!("pack index {pi} out of range")))?;
         let end = (off + len).min(p.size);
         if off >= end {
             return Ok(Bytes::new());
@@ -486,18 +500,17 @@ impl RemotePacks {
                 .block(&self.store, &self.repo, &p.cache_key, &p.key, n, p.size)
         });
         let blocks = futures::future::try_join_all(futs).await?;
-        if blocks.len() == 1 {
-            let b = &blocks[0];
-            let s = (off - first * BLOCK_SIZE) as usize;
-            let e = (end - first * BLOCK_SIZE) as usize;
+        if let [b] = blocks.as_slice() {
+            let s = usize::try_from(off - first * BLOCK_SIZE).unwrap_or(usize::MAX);
+            let e = usize::try_from(end - first * BLOCK_SIZE).unwrap_or(usize::MAX);
             return Ok(b.slice(s..e));
         }
-        let mut out = Vec::with_capacity((end - off) as usize);
+        let mut out = Vec::with_capacity(usize::try_from(end - off).unwrap_or(usize::MAX));
         for (i, b) in blocks.iter().enumerate() {
             let bstart = (first + i as u64) * BLOCK_SIZE;
-            let s = off.saturating_sub(bstart) as usize;
-            let e = (end - bstart).min(b.len() as u64) as usize;
-            out.extend_from_slice(&b[s..e]);
+            let s = usize::try_from(off.saturating_sub(bstart)).unwrap_or(usize::MAX);
+            let e = usize::try_from((end - bstart).min(b.len() as u64)).unwrap_or(usize::MAX);
+            out.extend_from_slice(b.get(s..e).unwrap_or_default());
         }
         Ok(Bytes::from(out))
     }
@@ -531,10 +544,13 @@ impl RemotePacks {
         head: Bytes,
     ) -> Result<Vec<u8>, WalError> {
         use flate2::{Decompress, FlushDecompress, Status};
-        let p = &self.packs[pi];
-        let size = entry.decompressed_size as usize;
+        let p = self
+            .packs
+            .get(pi)
+            .ok_or_else(|| WalError::Corrupt(format!("pack index {pi} out of range")))?;
+        let size = usize::try_from(entry.decompressed_size).unwrap_or(usize::MAX);
         let data_off = entry.data_offset;
-        let header_len = (data_off - entry.pack_offset()) as usize;
+        let header_len = usize::try_from(data_off - entry.pack_offset()).unwrap_or(usize::MAX);
         // Prefetch: blocks from data_off through data_off + size (+ slack), bounded.
         {
             let guess_end =
@@ -581,7 +597,7 @@ impl RemotePacks {
                         entry.pack_offset()
                     ))
                 })?;
-            let consumed = (z.total_in() - before_in) as usize;
+            let consumed = usize::try_from(z.total_in() - before_in).unwrap_or(usize::MAX);
             pos += consumed as u64;
             chunk = chunk.slice(consumed..);
             if out.len() >= size || status == Status::StreamEnd {
@@ -614,7 +630,7 @@ fn varint(d: &[u8], mut i: usize) -> Result<(u64, usize), &'static str> {
     loop {
         let b = *d.get(i).ok_or("delta header truncated")?;
         i += 1;
-        v |= ((b & 0x7f) as u64) << shift;
+        v |= u64::from(b & 0x7f) << shift;
         shift += 7;
         if b & 0x80 == 0 {
             return Ok((v, i));
@@ -634,13 +650,12 @@ fn delta_result_size(delta: &[u8]) -> Result<u64, WalError> {
 /// Apply a git delta (`base` + `delta` instructions → result).
 pub fn apply_delta(base: &[u8], delta: &[u8]) -> Result<Vec<u8>, &'static str> {
     let (base_size, i) = varint(delta, 0)?;
-    if base_size as usize != base.len() {
+    if usize::try_from(base_size).unwrap_or(usize::MAX) != base.len() {
         return Err("delta base size mismatch");
     }
     let (res_size, mut i) = varint(delta, i)?;
-    let mut out = Vec::with_capacity(res_size as usize);
-    while i < delta.len() {
-        let cmd = delta[i];
+    let mut out = Vec::with_capacity(usize::try_from(res_size).unwrap_or(usize::MAX));
+    while let Some(&cmd) = delta.get(i) {
         i += 1;
         if cmd & 0x80 != 0 {
             let mut ofs: u64 = 0;
@@ -648,7 +663,7 @@ pub fn apply_delta(base: &[u8], delta: &[u8]) -> Result<Vec<u8>, &'static str> {
             let mut nb = |shift: u32| -> Result<u64, &'static str> {
                 let b = *delta.get(i).ok_or("delta copy truncated")?;
                 i += 1;
-                Ok((b as u64) << shift)
+                Ok(u64::from(b) << shift)
             };
             if cmd & 0x01 != 0 {
                 ofs |= nb(0)?;
@@ -675,10 +690,12 @@ pub fn apply_delta(base: &[u8], delta: &[u8]) -> Result<Vec<u8>, &'static str> {
                 size = 0x10000;
             }
             let end = ofs.checked_add(size).ok_or("delta copy overflow")?;
-            if end as usize > base.len() {
+            if usize::try_from(end).unwrap_or(usize::MAX) > base.len() {
                 return Err("delta copy out of base bounds");
             }
-            out.extend_from_slice(&base[ofs as usize..end as usize]);
+            let from = usize::try_from(ofs).unwrap_or(usize::MAX);
+            let to = usize::try_from(end).unwrap_or(usize::MAX);
+            out.extend_from_slice(base.get(from..to).ok_or("delta copy out of base bounds")?);
         } else if cmd != 0 {
             let n = cmd as usize;
             let src = delta.get(i..i + n).ok_or("delta insert truncated")?;
@@ -705,24 +722,7 @@ pub fn human_bytes(n: u64) -> String {
     if i == 0 {
         format!("{n} B")
     } else {
-        format!("{v:.1} {}", U[i])
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn delta_roundtrip_insert_and_copy() {
-        let base = b"hello world, this is the base object";
-        // header: base size, result size; then copy 0..5 from base, insert "!!", copy 5..12
-        let mut d = vec![base.len() as u8, 5 + 2 + 7];
-        d.extend([0x90, 5]); // copy ofs=0 (no ofs bytes), size=5 (0x10 flag)
-        d.extend([2, b'!', b'!']);
-        d.extend([0x91, 5, 7]); // copy ofs=5 size=7
-        let out = apply_delta(base, &d).unwrap();
-        assert_eq!(out, b"hello!! world,");
+        format!("{v:.1} {}", U.get(i).copied().unwrap_or("B"))
     }
 }
 
@@ -772,8 +772,8 @@ impl walgit_git::ObjectFaulter for Faulter {
         );
         Box::pin(
             async move {
-                self.rounds.fetch_add(1, Ordering::Relaxed);
                 const PAR: usize = 32;
+                self.rounds.fetch_add(1, Ordering::Relaxed);
                 let mut n = 0usize;
                 for chunk in oids.chunks(PAR) {
                     let results =
@@ -801,5 +801,22 @@ impl walgit_git::ObjectFaulter for Faulter {
             }
             .instrument(span),
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn delta_roundtrip_insert_and_copy() {
+        let base = b"hello world, this is the base object";
+        // header: base size, result size; then copy 0..5 from base, insert "!!", copy 5..12
+        let mut d = vec![u8::try_from(base.len()).unwrap_or(u8::MAX), 5 + 2 + 7];
+        d.extend([0x90, 5]); // copy ofs=0 (no ofs bytes), size=5 (0x10 flag)
+        d.extend([2, b'!', b'!']);
+        d.extend([0x91, 5, 7]); // copy ofs=5 size=7
+        let out = apply_delta(base, &d).unwrap();
+        assert_eq!(out, b"hello!! world,");
     }
 }

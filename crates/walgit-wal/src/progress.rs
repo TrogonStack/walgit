@@ -140,7 +140,10 @@ impl Throttle {
     }
     /// True when an update should be emitted now.
     pub fn tick(&self, force: bool) -> bool {
-        let mut last = self.last.lock().unwrap();
+        let mut last = self
+            .last
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let now = std::time::Instant::now();
         if force
             || last

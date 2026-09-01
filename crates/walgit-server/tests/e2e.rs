@@ -3,6 +3,17 @@
 //! ref delete, tags, partial clone + lazy fetch, ls-remote, and the two-instance
 //! consistency test (push on A, immediate clone on B). LFS is exercised when
 //! `git lfs` is present.
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing,
+    clippy::many_single_char_names
+)]
+// clippy.toml exempts #[test] functions from the panic-path lints, but not the plain
+// helper functions beside them in the same file. A panic in a fixture builder is how
+// that fixture reports it could not be built, exactly as in the tests it serves.
+
 mod harness;
 
 type TestResult = anyhow::Result<()>;
@@ -712,7 +723,7 @@ async fn many_refs_impl(n: usize) -> TestResult {
     let push_start = Instant::now();
     git_in(&src, &["push", "--mirror", "origin"])?;
     println!("{n}-ref mirror push took {:?}", push_start.elapsed());
-    assert!(push_start.elapsed() < std::time::Duration::from_secs(240));
+    assert!(push_start.elapsed() < std::time::Duration::from_mins(4));
     let start = Instant::now();
     let output = Command::new("git")
         .args(["ls-remote", &server.repo_url("t", "many-refs")])
@@ -981,8 +992,7 @@ fn git_lfs_present() -> bool {
     Command::new("git")
         .args(["lfs", "version"])
         .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
+        .is_ok_and(|o| o.status.success())
 }
 
 fn git_supports_sha256() -> bool {
@@ -997,8 +1007,7 @@ fn git_supports_sha256() -> bool {
             dir.path().to_str().unwrap(),
         ])
         .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
+        .is_ok_and(|o| o.status.success())
 }
 
 /// A front whose `cache.max_bytes` cannot hold a repository's pack set must
@@ -1814,6 +1823,7 @@ async fn partial_clone_tree_zero_and_depth_with_filter() -> TestResult {
 /// unrelated refs request answers in < 1 s meanwhile (prod: every request on
 /// the instance stalled for minutes, timers included).
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+#[allow(unsafe_code)]
 async fn history_pack_install_does_not_stall_the_runtime() -> TestResult {
     // git shim: slow only for multi-pack-index.
     let shim = tempfile::tempdir()?;
@@ -1883,7 +1893,7 @@ async fn history_pack_install_does_not_stall_the_runtime() -> TestResult {
     let small = big
         .start_sibling_with(|c| {
             c.cache.prewarm = vec!["t/hist".into()];
-            c.cache.prewarm_ready_timeout = std::time::Duration::from_secs(600);
+            c.cache.prewarm_ready_timeout = std::time::Duration::from_mins(10);
         })
         .await?;
     walgit_server::prewarm::spawn(small.state.clone());
@@ -1963,15 +1973,17 @@ async fn history_pack_install_does_not_stall_the_runtime() -> TestResult {
         took.as_secs_f64() >= 3.0,
         "the shim should have slowed the install: {took:?}"
     );
+    // SAFETY: see above; restores the PATH this test replaced.
     unsafe { std::env::set_var("PATH", old_path) };
     Ok(())
 }
 
 /// Materialization runs on its own runtime: even an unknown *blocking* call
 /// inside the install path (simulated by `WALGIT_TEST_BLOCK_INSTALL_MS`, a
-/// synchronous sleep in reconcile_packs) must not stall request workers —
+/// synchronous sleep in `reconcile_packs`) must not stall request workers —
 /// refs answer in milliseconds on a single-worker server meanwhile.
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+#[allow(unsafe_code)]
 async fn blocking_work_in_the_install_path_does_not_stall_requests() -> TestResult {
     // SAFETY: test process; read by the sibling's sync below.
     unsafe { std::env::set_var("WALGIT_TEST_BLOCK_INSTALL_MS", "2500") };
@@ -2015,6 +2027,7 @@ async fn blocking_work_in_the_install_path_does_not_stall_requests() -> TestResu
         worst = worst.max(t.elapsed().as_millis());
         probes += 1;
     }
+    // SAFETY: see above; clears the var this test set.
     unsafe { std::env::remove_var("WALGIT_TEST_BLOCK_INSTALL_MS") };
     let took = install.await?;
     assert!(took.as_millis() >= 2500, "{took:?}");
@@ -2905,6 +2918,7 @@ async fn stale_cached_credential_is_erased_by_the_401_and_replaced_on_the_next_c
 /// new version before applying the refs locally let a reader cache the OLD refs under the NEW
 /// version (reproduced roughly once in six rounds). 12 rounds × 6 pushers.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+#[allow(unsafe_code)]
 async fn reads_after_an_acknowledged_push_never_show_the_previous_tip() -> TestResult {
     // Widen the gap between the publish's two local-commit steps (refs applied; version advertised)
     // to 150 ms so the reader reliably lands in it: harmless in the right order, the poison window
