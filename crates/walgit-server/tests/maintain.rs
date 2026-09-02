@@ -880,9 +880,20 @@ async fn one_pass_settles_all_closed_empty_slots() -> anyhow::Result<()> {
         wrong_host_reason: None,
     };
     let rows = server.state.bundles.plan(&id, now, ctx).await?;
+    // Missing or Pending: `plan` emits a row only for the newest INCREMENTALS_KEPT slots, so the
+    // row count is the window width, which is what this asserts. Whether the newest slot reads
+    // Missing or Pending depends on where `now` falls inside the hour (`slot_closed` wants
+    // SLOT_CLOSE_GRACE past the fire time), and that is not a property of the window.
     let missing_before = rows
         .iter()
-        .filter(|r| r.strategy == "hourly" && r.status == walgit_bundle::slots::SlotStatus::Missing)
+        .filter(|r| {
+            r.strategy == "hourly"
+                && matches!(
+                    r.status,
+                    walgit_bundle::slots::SlotStatus::Missing
+                        | walgit_bundle::slots::SlotStatus::Pending
+                )
+        })
         .count();
     assert_eq!(
         missing_before,
@@ -916,17 +927,18 @@ async fn one_pass_settles_all_closed_empty_slots() -> anyhow::Result<()> {
         .find(|s| s.name == "hourly")
         .unwrap()
         .clone();
-    let rows = server
-        .state
-        .bundles
-        .plan(&id, std::time::SystemTime::now(), ctx)
-        .await?;
+    // Re-plan as of the same `now` the first plan used, not a fresh clock read. `slot_closed` is
+    // monotonic in time and the pass ran after `now`, so every slot closed at `now` was already
+    // closed while the pass planned: anything still missing here is a real settling failure. A
+    // fresh read would instead pick up an hour that fired *during* the pass, which no pass could
+    // have settled.
+    let rows = server.state.bundles.plan(&id, now, ctx).await?;
     let still_missing_closed: Vec<u64> = rows
         .iter()
         .filter(|r| {
             r.strategy == "hourly"
                 && r.status == walgit_bundle::slots::SlotStatus::Missing
-                && walgit_bundle::slots::slot_closed(&hourly, r.slot, std::time::SystemTime::now())
+                && walgit_bundle::slots::slot_closed(&hourly, r.slot, now)
         })
         .map(|r| r.slot)
         .collect();
