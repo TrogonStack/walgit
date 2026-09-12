@@ -1,3 +1,4 @@
+#![allow(clippy::unused_self, clippy::doc_lazy_continuation)]
 //! bundle-uri: scheduled full/incremental bundle strategies, bundle list.
 //! See AGENTS.md Phase 5 and docs/CONTRACT.md `walgit-bundle`.
 //!
@@ -6,9 +7,9 @@
 //! The [`Bundler`] is the public entry point. It depends on a [`BundleSource`]
 //! trait that provides repo-scoped access (local git repo + [`Prefixed`] store
 //! + `head_seq`). When `walgit_wal::Registry` lands it will implement
-//!   `BundleSource` (impl lives in this crate) and the `new` signature will
-//!   accept `Arc<Registry>` directly. Until then, [`Bundler::new_with_source`]
-//!   accepts any `BundleSource` impl (used by tests).
+//! `BundleSource` (impl lives in this crate) and the `new` signature will
+//! accept `Arc<Registry>` directly. Until then, [`Bundler::new_with_source`]
+//! accepts any `BundleSource` impl (used by tests).
 //!
 //! The core operations in [`ops`] take a [`walgit_git::LocalRepo`] + [`Prefixed`]
 //! store so they are unit-testable with upstream `git` + [`MemoryStore`] without
@@ -190,6 +191,7 @@ impl Bundler {
     }
 
     fn find_strategy<'a>(
+        &self,
         cfg: &'a Config,
         name: &str,
     ) -> Result<&'a walgit_config::BundleStrategy, BundleError> {
@@ -234,7 +236,7 @@ impl Bundler {
         cut: &ops::Cut,
     ) -> Result<BundleEntry, BundleError> {
         let cfg = self.cfg_for(handle);
-        let strat = Self::find_strategy(cfg, strategy_name)?;
+        let strat = self.find_strategy(cfg, strategy_name)?;
         let store = &handle.store;
         let refs = slots::default_refs(&cfg.bundles, strat);
 
@@ -299,7 +301,7 @@ impl Bundler {
                     .map(|t| t.oid.clone())
                     .collect();
                 let commits = ops::count_commits(&handle.local, &tip_oids, &prerequisites).await?;
-                metrics::histogram!("walgit_bundle_commits", "strategy" => strategy_name.to_string()).record(commits as f64);
+                metrics::histogram!("walgit_bundle_commits", "strategy" => strategy_name.to_string()).record(metric_u64(commits));
                 tracing::info!(
                     strategy = strategy_name,
                     slot = cut.slot,
@@ -636,7 +638,7 @@ impl Bundler {
     ) -> Result<Option<BundleEntry>, BundleError> {
         let mut handle = self.source.open_repo(id).await?;
         let cfg = self.cfg_for(&handle).clone();
-        let strat = Self::find_strategy(&cfg, strategy)?.clone();
+        let strat = self.find_strategy(&cfg, strategy)?.clone();
         let strat = &strat;
         let store = handle.store.clone();
         let Some(lease) = ops::try_acquire_lease(&store, &strat.name, self.lease_ttl).await? else {
@@ -822,6 +824,13 @@ impl Bundler {
         }
         Ok(())
     }
+}
+
+/// Metrics use `f64`; values beyond its exact integer range are still useful as
+/// approximate counters.
+#[allow(clippy::cast_precision_loss)]
+fn metric_u64(value: u64) -> f64 {
+    value as f64
 }
 
 // ---------------------------------------------------------------------------

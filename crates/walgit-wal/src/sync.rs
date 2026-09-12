@@ -76,17 +76,13 @@ impl PackPlan {
     }
 }
 
-#[allow(
-    clippy::large_enum_variant,
-    reason = "the large variant is the common one; boxing it would allocate on every successful sync"
-)]
 /// Result of a sync operation, holding either a read guard (common case) or
 /// indicating the repo was not found.
 pub(crate) enum SyncOutcome {
     Unchanged,
     Changed {
         meta_version: Version,
-        manifest: Manifest,
+        manifest: std::sync::Arc<Manifest>,
     },
 }
 
@@ -100,14 +96,14 @@ pub(crate) async fn freshness_check(
             None => Ok(SyncOutcome::Unchanged),
             Some((meta, manifest)) => Ok(SyncOutcome::Changed {
                 meta_version: meta.version,
-                manifest,
+                manifest: std::sync::Arc::new(manifest),
             }),
         },
         None => match get_message::<Manifest>(store, keys::MANIFEST).await? {
             None => Err(WalError::NotFound),
             Some((meta, manifest)) => Ok(SyncOutcome::Changed {
                 meta_version: meta.version,
-                manifest,
+                manifest: std::sync::Arc::new(manifest),
             }),
         },
     }
@@ -385,7 +381,7 @@ pub(crate) async fn download_object(
     file.set_len(size)?;
     let file = std::sync::Arc::new(file);
     let starts: Vec<u64> = (0..size)
-        .step_by(usize::try_from(CHUNK).unwrap_or(usize::MAX))
+        .step_by(usize::try_from(CHUNK).map_err(|e| WalError::Corrupt(e.to_string()))?)
         .collect();
     let report = &report;
     futures::stream::iter(starts)
@@ -410,7 +406,7 @@ pub(crate) async fn download_object(
                 };
                 let bytes = walgit_store::util::collect(
                     body,
-                    usize::try_from(end - start).unwrap_or(usize::MAX),
+                    usize::try_from(end - start).map_err(|e| WalError::Corrupt(e.to_string()))?,
                 )
                 .await?;
                 if bytes.len() as u64 != end - start {
@@ -575,8 +571,10 @@ pub(crate) async fn reconcile_packs_inner(
         let mut st = handle.state.lock();
         st.remote_served.clone_from(&remote_served);
     }
-    let remote_set: std::collections::HashSet<&str> =
-        remote_served.iter().map(String::as_str).collect();
+    let remote_set: std::collections::HashSet<&str> = remote_served
+        .iter()
+        .map(std::string::String::as_str)
+        .collect();
 
     // History packs (D18) are an accelerator, not a requirement: a fetch can
     // be served from the linked/remote base right away. They are installed by
@@ -694,7 +692,10 @@ pub(crate) async fn reconcile_packs_inner(
         let link_to = link_target(&p);
         tasks.push(tokio::spawn(
             async move {
-                let _permit = sem.acquire().await.ok();
+                let _permit = sem
+                    .acquire()
+                    .await
+                    .map_err(|e| WalError::Corrupt(e.to_string()))?;
                 // Per-object progress arrives as absolute (done,total); turn it
                 // into deltas for the shared counter.
                 let cb = |delta: u64, _t: u64| {
@@ -877,7 +878,8 @@ pub(crate) async fn replay_log(
                         GetResult::Object { meta, body } => Some(
                             walgit_store::util::collect(
                                 body,
-                                usize::try_from(meta.size).unwrap_or(usize::MAX),
+                                usize::try_from(meta.size)
+                                    .map_err(|e| WalError::Corrupt(e.to_string()))?,
                             )
                             .await?,
                         ),
@@ -1011,21 +1013,20 @@ pub(crate) async fn materialize_from_scratch(
 /// 2.6–43 s repeatedly for the whole duration of one repo's 7.5 GB + another's
 /// 12 GB materializations; the watchdog caught it, the cause hid among a dozen
 /// candidates; isolation makes the question moot).
-static BULK_RUNTIME: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::OnceLock::new();
+static BULK_RUNTIME: std::sync::OnceLock<std::io::Result<tokio::runtime::Runtime>> =
+    std::sync::OnceLock::new();
 
-#[allow(
-    clippy::expect_used,
-    reason = "the bulk runtime is built once at startup and there is no caller to hand a failure to"
-)]
-fn bulk_runtime() -> &'static tokio::runtime::Runtime {
-    BULK_RUNTIME.get_or_init(|| {
-        tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(4)
-            .thread_name("walgit-bulk")
-            .enable_all()
-            .build()
-            .expect("bulk runtime")
-    })
+fn bulk_runtime() -> Result<&'static tokio::runtime::Runtime, WalError> {
+    BULK_RUNTIME
+        .get_or_init(|| {
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(4)
+                .thread_name("walgit-bulk")
+                .enable_all()
+                .build()
+        })
+        .as_ref()
+        .map_err(|e| std::io::Error::new(e.kind(), format!("bulk runtime: {e}")).into())
 }
 
 /// Run `fut` on the bulk runtime and await its result from the caller's
@@ -1035,7 +1036,7 @@ pub(crate) async fn on_bulk_runtime<T: Send + 'static>(
 ) -> Result<T, WalError> {
     let span = tracing::Span::current();
     let (tx, rx) = tokio::sync::oneshot::channel();
-    bulk_runtime().spawn(async move {
+    bulk_runtime()?.spawn(async move {
         let r = fut.instrument(span).await;
         let _ = tx.send(r);
     });
@@ -1058,7 +1059,7 @@ mod download_tests {
             x ^= x << 13;
             x ^= x >> 7;
             x ^= x << 17;
-            *b = u8::try_from(x & 0xFF).unwrap_or(0);
+            *b = x.to_le_bytes()[0];
         }
         let store = MemoryStore::shared();
         store

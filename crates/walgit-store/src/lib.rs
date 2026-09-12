@@ -91,8 +91,8 @@ impl GetResult {
         match self {
             GetResult::NotModified { .. } => Ok(None),
             GetResult::Object { meta, body } => {
-                let b =
-                    util::collect(body, usize::try_from(meta.size).unwrap_or(usize::MAX)).await?;
+                let b = util::collect(body, usize::try_from(meta.size).map_err(StoreError::other)?)
+                    .await?;
                 Ok(Some((meta, b)))
             }
         }
@@ -559,6 +559,7 @@ impl ObjectStore for Prefixed {
         start_after: Option<&str>,
     ) -> BoxStream<'static, Result<ObjectMeta>> {
         use futures::StreamExt;
+
         let full_prefix = self.full(prefix);
         let _span = (!self.inner.is_prefixed()).then(|| {
             tracing::debug_span!(
@@ -568,6 +569,7 @@ impl ObjectStore for Prefixed {
             )
             .entered()
         });
+
         let this = self.clone();
         let start_after = start_after.map(|s| self.full(s));
         Box::pin(

@@ -1,3 +1,12 @@
+// Test fixtures use panics to fail the test, including shared helper functions.
+#![allow(
+    clippy::panic,
+    clippy::string_slice,
+    clippy::unwrap_used,
+    clippy::field_reassign_with_default,
+    clippy::cast_sign_loss
+)]
+
 //! Integration tests for walgit-bundle: real upstream `git` + `MemoryStore`.
 //!
 //! These tests create bare repos via `LocalRepo::init`, push commits from a
@@ -9,17 +18,6 @@
 //!   - Pruning keeps the chain valid
 //!   - `--bundle-uri` clone works from a file:// bundle list
 
-#![allow(
-    clippy::unwrap_used,
-    clippy::expect_used,
-    clippy::panic,
-    clippy::indexing_slicing,
-    clippy::many_single_char_names
-)]
-// clippy.toml exempts #[test] functions from the panic-path lints, but not the plain
-// helper functions beside them in the same file. A panic in a fixture builder is how
-// that fixture reports it could not be built, exactly as in the tests it serves.
-
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -29,8 +27,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tempfile::TempDir;
 use tokio::process::Command;
 
-use walgit_bundle::{BundleError, BundleRepoHandle, BundleSource, Bundler, RepoId, ops};
-use walgit_config::{BundleKind, BundleServe, BundleStrategy, BundlesConfig, Config};
+use walgit_bundle::{
+    BundleEngine, BundleError, BundleRepoHandle, BundleSource, Bundler, RepoId, ops,
+};
+use walgit_config::{BundleKind, BundleServe, BundleStrategy, BundlesConfig, ByteSize, Config};
 use walgit_git::{LocalRepo, ObjectFormat as GitObjectFormat};
 use walgit_store::{DynStore, ObjectStore, ObjectStoreExt, Prefixed, memory::MemoryStore};
 
@@ -138,7 +138,7 @@ impl BundleSource for TestSource {
             local: local.clone(),
             store: store.clone(),
             head_seq: head_seq.load(Ordering::Relaxed),
-            engine: walgit_bundle::BundleEngine::default(),
+            engine: BundleEngine::default(),
             cfg: None,
         })
     }
@@ -167,7 +167,8 @@ async fn run_git(cwd: &Path, args: &[&str]) -> String {
 
 /// Config with a single full strategy "weekly".
 fn cfg_full_only(keep: usize) -> Config {
-    let bundles = BundlesConfig {
+    let mut cfg = Config::default();
+    cfg.bundles = BundlesConfig {
         enabled: true,
         strategy: vec![BundleStrategy {
             name: "weekly".into(),
@@ -182,7 +183,7 @@ fn cfg_full_only(keep: usize) -> Config {
             chain: false,
         }],
         min_commits: 0,
-        min_bytes: walgit_config::ByteSize::default(),
+        min_bytes: ByteSize::default(),
         serve_via: BundleServe::Proxy,
         signed_url_ttl: Duration::from_hours(1),
         advertise: true,
@@ -192,15 +193,13 @@ fn cfg_full_only(keep: usize) -> Config {
         main_only: false,
         extra_refs: Vec::new(),
     };
-    Config {
-        bundles,
-        ..Default::default()
-    }
+    cfg
 }
 
 /// Config with weekly (full) + daily (incremental based on weekly).
 fn cfg_weekly_daily(keep_full: usize, keep_inc: usize) -> Config {
-    let bundles = BundlesConfig {
+    let mut cfg = Config::default();
+    cfg.bundles = BundlesConfig {
         enabled: true,
         strategy: vec![
             BundleStrategy {
@@ -229,7 +228,7 @@ fn cfg_weekly_daily(keep_full: usize, keep_inc: usize) -> Config {
             },
         ],
         min_commits: 0,
-        min_bytes: walgit_config::ByteSize::default(),
+        min_bytes: ByteSize::default(),
         serve_via: BundleServe::Proxy,
         signed_url_ttl: Duration::from_hours(1),
         advertise: true,
@@ -239,10 +238,7 @@ fn cfg_weekly_daily(keep_full: usize, keep_inc: usize) -> Config {
         main_only: false,
         extra_refs: Vec::new(),
     };
-    Config {
-        bundles,
-        ..Default::default()
-    }
+    cfg
 }
 
 /// Download a bundle from the store to a tempdir at the path matching a
@@ -278,7 +274,7 @@ async fn get_refs(repo_path: &Path) -> Vec<String> {
         .await
         .unwrap();
     let s = String::from_utf8_lossy(&output.stdout);
-    let mut refs: Vec<String> = s.lines().map(ToString::to_string).collect();
+    let mut refs: Vec<String> = s.lines().map(std::string::ToString::to_string).collect();
     refs.sort();
     refs
 }
@@ -394,23 +390,22 @@ async fn incremental_has_prerequisites() {
         String::from_utf8_lossy(&output.stderr)
     );
 
-    // Check that the bundle header has prerequisites (lines starting with -).
+    // Bundle header ends at the first blank line; the pack is binary after that.
     let header = String::from_utf8_lossy(&data);
-    let header_lines: Vec<&str> = header.lines().take(20).collect();
-    let has_prereq = header_lines.iter().any(|l| l.starts_with('-'));
+    let header_lines: Vec<&str> = header.lines().take_while(|l| !l.is_empty()).collect();
+    let prereqs: Vec<&str> = header_lines
+        .iter()
+        .filter_map(|l| l.strip_prefix('-'))
+        .filter_map(|rest| rest.split_whitespace().next())
+        .collect();
     assert!(
-        has_prereq,
+        !prereqs.is_empty(),
         "incremental bundle should have prerequisites in header"
     );
 
     // The prerequisites should match the base bundle's tips.
     let base_tips: Vec<&str> = base_entry.tips.iter().map(|t| t.oid.as_str()).collect();
-    for prereq_line in header_lines.iter().filter(|l| l.starts_with('-')) {
-        // Format: "-<oid> <comment>"
-        let oid = prereq_line
-            .strip_prefix('-')
-            .and_then(|l| l.split_whitespace().next())
-            .unwrap_or("");
+    for oid in prereqs {
         assert!(
             base_tips.contains(&oid),
             "prerequisite {oid} should be in base tips {base_tips:?}"
@@ -605,7 +600,7 @@ async fn pruning_keeps_chain_valid() {
             tr.push().await;
             tr.advance_seq();
         }
-        let future = now + Duration::from_secs((u64::try_from(i).unwrap_or(0)) * 8 * 24 * 3600);
+        let future = now + Duration::from_secs((i as u64) * 8 * 24 * 3600);
         bundler.run_due(&id, future).await.unwrap();
     }
 

@@ -10,7 +10,7 @@ t15 := `if command -v timeout >/dev/null 2>&1; then echo "timeout 900"; elif com
 
 # The fast tier's package selections, shared by the build and the run of each line.
 fast_pkgs := "-p walgit-store -p walgit-git -p walgit-wal -p walgit-bundle"
-server_fast := "-p walgit-server --test web_api --test web_ui --test api_v1 --test static_http --test maintain --test routing_prefix --test lfs_upstream --test drain"
+server_fast := "-p walgit-server --test web_api --test web_ui --test api_v1 --test static_http --test maintain --test routing_prefix --test lfs_upstream --test drain --test events --test follow --test policy"
 
 # Default: show available targets.
 default:
@@ -22,7 +22,7 @@ web-build:
 
 # Local dev = standalone: the server with every role (serve, maintain, events) at
 # https://walgit.localhost:$PORT (default 8080) against local rustfs. Self-contained: starts rustfs (+ bucket) if
-# it is not answering on :9000 and builds the SPA if web/dist is missing, then runs the server.
+# it is not answering on :9000 and builds the SPA if web/dist holds no Vite output, then runs the server.
 # `config` defaults to walgit.standalone.toml; point it at a real bucket by editing [store] there. The rustfs
 # keys come from the environment (AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY; compose.yaml fixes them).
 # Optional: export WALGIT__SERVER__AUTH__* (OIDC client, session secret) to try browser sign-in locally.
@@ -34,8 +34,10 @@ dev-local config="walgit.standalone.toml":
         echo "rustfs not running on :9000 — starting it (just dev-store)"
         just dev-store
     fi
-    if [ ! -f web/dist/index.html ]; then
-        echo "web/dist missing — building the SPA (just web-build)"
+    # crates/walgit-server/build.rs:19 writes a placeholder index.html on any cargo build, so only
+    # repos.js proves a real Vite build (the same file Containerfile:23 checks).
+    if [ ! -f web/dist/repos.js ]; then
+        echo "web/dist SPA is unbuilt; building it (just web-build)"
         just web-build
     fi
     cargo build --release --bin walgit-server
@@ -45,22 +47,31 @@ dev-local config="walgit.standalone.toml":
 
 # Start rustfs (S3-compatible) for local dev via podman compose (rootless, no daemon group needed;
 # `podman compose` drives compose.yaml through the docker-compose binary dev.yml installs).
-# `podman compose` talks to the podman API socket; rootless nix podman has no systemd unit for it, so
-# `podman system service` is started (detached, idle-timeout 0) when the socket is missing.
+# `podman compose` talks to the podman API socket; on Linux rootless nix podman has no systemd unit
+# for it, so `podman system service` is started (detached, idle-timeout 0) when the socket is missing.
+# Elsewhere (macOS, the BSDs) the socket belongs to the podman machine VM: the recipe only checks that
+# podman answers and tells you to start it if it does not.
 dev-store:
     #!/usr/bin/env bash
     set -euo pipefail
-    # nix podman ships no /etc/containers: give the user a signature policy + registry search list once.
-    cdir="${XDG_CONFIG_HOME:-$HOME/.config}/containers"; mkdir -p "$cdir"
-    [ -f "$cdir/policy.json" ] || printf '{"default":[{"type":"insecureAcceptAnything"}]}\n' > "$cdir/policy.json"
-    [ -f "$cdir/registries.conf" ] || printf 'unqualified-search-registries = ["docker.io"]\n' > "$cdir/registries.conf"
-    sock="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/podman/podman.sock"
-    if [ ! -S "$sock" ]; then
-        echo "starting rootless podman API socket at $sock"
-        mkdir -p "$(dirname "$sock")"
-        setsid nohup podman system service --time=0 "unix://$sock" >/tmp/walgit-podman-service.log 2>&1 < /dev/null &
-        for _ in $(seq 1 50); do [ -S "$sock" ] && break; sleep 0.2; done
-        [ -S "$sock" ] || { echo "podman API socket did not appear; see /tmp/walgit-podman-service.log"; exit 1; }
+    # The rootless socket bootstrap is Linux-only: XDG_RUNTIME_DIR and /run/user do not exist on
+    # macOS or the BSDs, and setsid is util-linux. There the socket lives in the podman machine VM.
+    if [ "$(uname -s)" = Linux ]; then
+        # nix podman ships no /etc/containers: give the user a signature policy + registry search list once.
+        cdir="${XDG_CONFIG_HOME:-$HOME/.config}/containers"; mkdir -p "$cdir"
+        [ -f "$cdir/policy.json" ] || printf '{"default":[{"type":"insecureAcceptAnything"}]}\n' > "$cdir/policy.json"
+        [ -f "$cdir/registries.conf" ] || printf 'unqualified-search-registries = ["docker.io"]\n' > "$cdir/registries.conf"
+        sock="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/podman/podman.sock"
+        if [ ! -S "$sock" ]; then
+            echo "starting rootless podman API socket at $sock"
+            mkdir -p "$(dirname "$sock")"
+            nohup podman system service --time=0 "unix://$sock" >/tmp/walgit-podman-service.log 2>&1 < /dev/null &
+            for _ in $(seq 1 50); do [ -S "$sock" ] && break; sleep 0.2; done
+            [ -S "$sock" ] || { echo "podman API socket did not appear; see /tmp/walgit-podman-service.log"; exit 1; }
+        fi
+    elif ! podman info >/dev/null 2>&1; then
+        echo "podman is not answering: start the container runtime first (macOS: podman machine start)"
+        exit 1
     fi
     podman compose up -d rustfs
     echo "Waiting for rustfs to be healthy..."
@@ -91,9 +102,9 @@ test:
     cargo test --workspace --lib --bins --no-run
     {{t5}} cargo test --workspace --lib --bins
     cargo test {{fast_pkgs}} --tests --no-run
-    {{t5}} cargo test {{fast_pkgs}} --tests
+    {{t10}} cargo test {{fast_pkgs}} --tests
     cargo test {{server_fast}} --no-run
-    {{t5}} cargo test {{server_fast}}
+    {{t10}} cargo test {{server_fast}}
 
 # Smart-HTTP end-to-end against real git (≈ 20 s) — run when touching smart.rs/receive/upload-pack/wal.
 e2e *ARGS:
@@ -112,8 +123,13 @@ warnings:
         printf '%s\n' "$out"
         echo; echo "cargo build failed — fix the errors above"; exit 1
     fi
-    if printf '%s\n' "$out" | grep -qE '^warning: (unused|function|variable|field|method|struct|enum|never|dead|irrefutable|unreachable|value assigned|deprecated|trait|type|constant|static|associated)'; then
-        printf '%s\n' "$out" | grep -E '^warning' -A4 | grep -vE '^warning: `walgit-[a-z]+`'
+    # CI sets CARGO_TERM_COLOR=always, which prefixes every diagnostic with ANSI
+    # escapes — an anchored `^warning:` then never matches and this gate passes on
+    # a warning-bearing tree (issue #29). Strip the escapes before matching; the
+    # ESC is embedded as a bash $'…' literal so BSD and GNU sed both take it.
+    plain="$(printf '%s\n' "$out" | sed $'s/\x1b\\[[0-9;]*m//g')"
+    if printf '%s\n' "$plain" | grep -qE '^warning: (unused|function|variable|field|method|struct|enum|never|dead|irrefutable|unreachable|value assigned|deprecated|trait|type|constant|static|associated)'; then
+        printf '%s\n' "$plain" | grep -E '^warning' -A4 | grep -vE '^warning: `walgit-[a-z]+`'
         echo; echo "rustc warnings present — fix them (just warnings is part of just ci and the deploy preflight)"; exit 1
     fi
     echo "no rustc warnings"

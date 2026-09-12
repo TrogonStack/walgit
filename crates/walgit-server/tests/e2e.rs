@@ -1,19 +1,12 @@
+// Test fixtures use panics to fail the test, including shared helper functions.
+#![allow(clippy::unwrap_used)]
+#![allow(clippy::many_single_char_names, unsafe_code)]
+
 //! End-to-end tests: real upstream `git` against a live walgit-server backed
 //! by the in-memory store. Covers clone/push/fetch (v2 and v0), non-ff reject,
 //! ref delete, tags, partial clone + lazy fetch, ls-remote, and the two-instance
 //! consistency test (push on A, immediate clone on B). LFS is exercised when
 //! `git lfs` is present.
-#![allow(
-    clippy::unwrap_used,
-    clippy::expect_used,
-    clippy::panic,
-    clippy::indexing_slicing,
-    clippy::many_single_char_names
-)]
-// clippy.toml exempts #[test] functions from the panic-path lints, but not the plain
-// helper functions beside them in the same file. A panic in a fixture builder is how
-// that fixture reports it could not be built, exactly as in the tests it serves.
-
 mod harness;
 
 type TestResult = anyhow::Result<()>;
@@ -1823,31 +1816,43 @@ async fn partial_clone_tree_zero_and_depth_with_filter() -> TestResult {
 /// unrelated refs request answers in < 1 s meanwhile (prod: every request on
 /// the instance stalled for minutes, timers included).
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
-#[allow(unsafe_code)]
 async fn history_pack_install_does_not_stall_the_runtime() -> TestResult {
-    // git shim: slow only for multi-pack-index.
-    let shim = tempfile::tempdir()?;
-    let real_git = String::from_utf8(
-        std::process::Command::new("sh")
-            .args(["-c", "command -v git"])
-            .output()?
-            .stdout,
-    )?
-    .trim()
-    .to_string();
-    std::fs::write(
-        shim.path().join("git"),
-        format!(
-            "#!/bin/sh\nif [ \"$1\" = multi-pack-index ]; then sleep 3; fi\nexec {real_git} \"$@\"\n"
-        ),
-    )?;
-    std::fs::set_permissions(
-        shim.path().join("git"),
-        std::os::unix::fs::PermissionsExt::from_mode(0o755),
-    )?;
-    let old_path = std::env::var("PATH").unwrap_or_default();
-    // SAFETY: test process, single-threaded runtime, set before any git spawn below.
-    unsafe { std::env::set_var("PATH", format!("{}:{old_path}", shim.path().display())) };
+    const CHILD: &str = "WALGIT_TEST_HISTORY_INSTALL_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        // git shim: slow only for multi-pack-index.
+        let shim = tempfile::tempdir()?;
+        let real_git = String::from_utf8(
+            std::process::Command::new("sh")
+                .args(["-c", "command -v git"])
+                .output()?
+                .stdout,
+        )?
+        .trim()
+        .to_string();
+        std::fs::write(
+            shim.path().join("git"),
+            format!(
+                "#!/bin/sh\nif [ \"$1\" = multi-pack-index ]; then sleep 3; fi\nexec {real_git} \"$@\"\n"
+            ),
+        )?;
+        std::fs::set_permissions(
+            shim.path().join("git"),
+            std::os::unix::fs::PermissionsExt::from_mode(0o755),
+        )?;
+        let old_path = std::env::var("PATH").unwrap_or_default();
+        let status = tokio::process::Command::new(std::env::current_exe()?)
+            .args([
+                "--exact",
+                "history_pack_install_does_not_stall_the_runtime",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .env("PATH", format!("{}:{old_path}", shim.path().display()))
+            .status()
+            .await?;
+        assert!(status.success(), "isolated history install test failed");
+        return Ok(());
+    }
 
     let big = Server::start().await?;
     big.put_repo("t", "hist").await?;
@@ -1973,8 +1978,6 @@ async fn history_pack_install_does_not_stall_the_runtime() -> TestResult {
         took.as_secs_f64() >= 3.0,
         "the shim should have slowed the install: {took:?}"
     );
-    // SAFETY: see above; restores the PATH this test replaced.
-    unsafe { std::env::set_var("PATH", old_path) };
     Ok(())
 }
 
@@ -1983,10 +1986,22 @@ async fn history_pack_install_does_not_stall_the_runtime() -> TestResult {
 /// synchronous sleep in `reconcile_packs`) must not stall request workers —
 /// refs answer in milliseconds on a single-worker server meanwhile.
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
-#[allow(unsafe_code)]
 async fn blocking_work_in_the_install_path_does_not_stall_requests() -> TestResult {
-    // SAFETY: test process; read by the sibling's sync below.
-    unsafe { std::env::set_var("WALGIT_TEST_BLOCK_INSTALL_MS", "2500") };
+    const CHILD: &str = "WALGIT_TEST_BLOCK_INSTALL_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let status = tokio::process::Command::new(std::env::current_exe()?)
+            .args([
+                "--exact",
+                "blocking_work_in_the_install_path_does_not_stall_requests",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .env("WALGIT_TEST_BLOCK_INSTALL_MS", "2500")
+            .status()
+            .await?;
+        assert!(status.success(), "isolated blocking install test failed");
+        return Ok(());
+    }
     let big = Server::start().await?;
     big.put_repo("t", "blk").await?;
     big.put_repo("t", "other2").await?;
@@ -2027,8 +2042,6 @@ async fn blocking_work_in_the_install_path_does_not_stall_requests() -> TestResu
         worst = worst.max(t.elapsed().as_millis());
         probes += 1;
     }
-    // SAFETY: see above; clears the var this test set.
-    unsafe { std::env::remove_var("WALGIT_TEST_BLOCK_INSTALL_MS") };
     let took = install.await?;
     assert!(took.as_millis() >= 2500, "{took:?}");
     assert!(probes >= 5, "runtime stalled: {probes} probes in {took:?}");
@@ -2918,7 +2931,6 @@ async fn stale_cached_credential_is_erased_by_the_401_and_replaced_on_the_next_c
 /// new version before applying the refs locally let a reader cache the OLD refs under the NEW
 /// version (reproduced roughly once in six rounds). 12 rounds × 6 pushers.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
-#[allow(unsafe_code)]
 async fn reads_after_an_acknowledged_push_never_show_the_previous_tip() -> TestResult {
     // Widen the gap between the publish's two local-commit steps (refs applied; version advertised)
     // to 150 ms so the reader reliably lands in it: harmless in the right order, the poison window
@@ -3044,5 +3056,69 @@ async fn reads_after_an_acknowledged_push_never_show_the_previous_tip() -> TestR
     // SAFETY: see above.
     unsafe { std::env::remove_var("WALGIT_TEST_PUBLISH_GAP_MS") };
     assert!(stale.is_empty(), "stale reads:\n{}", stale.join("\n"));
+    Ok(())
+}
+
+/// #37: a ref-only push carries a 32-byte zero-object pack, and receive-pack used to skip the
+/// connectivity check for it, so `refs/heads/ghost` could be published pointing at an object
+/// nobody has, after which every clone walking it died with `missing object`. The tip is now
+/// checked like any other, and a ref-only push to an object the server does have still lands.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn empty_pack_push_to_a_missing_object_is_refused() -> TestResult {
+    for check_connectivity in [true, false] {
+        empty_pack_push_is_refused_with(check_connectivity).await?;
+    }
+    Ok(())
+}
+
+/// Both tip checks refuse it: the full walk, and the bare lookup a host with
+/// `wal.check_connectivity = false` falls back to.
+async fn empty_pack_push_is_refused_with(check_connectivity: bool) -> TestResult {
+    let server =
+        Server::start_with_tweak(|c| c.wal.check_connectivity = check_connectivity).await?;
+    server.put_repo("t", "ghost").await?;
+    let src = TestRepo::synthetic(2, 2)?;
+    git_in(&src, &["branch", "-M", "main"])?;
+    git_in(
+        &src,
+        &["remote", "add", "origin", &server.repo_url("t", "ghost")],
+    )?;
+    git_in(&src, &["push", "-q", "origin", "main"])?;
+
+    // One command line, a flush, then the empty pack: header, zero objects, its checksum.
+    let cmd = format!(
+        "{} {} refs/heads/ghost\0report-status\n",
+        "0".repeat(40),
+        "b".repeat(40)
+    );
+    let mut body = format!("{:04x}{cmd}0000", cmd.len() + 4).into_bytes();
+    body.extend_from_slice(b"PACK\x00\x00\x00\x02\x00\x00\x00\x00");
+    body.extend_from_slice(&[
+        0x02, 0x9d, 0x08, 0x82, 0x3b, 0xd8, 0xa8, 0xea, 0xb5, 0x10, 0xad, 0x6a, 0xc7, 0x5c, 0x82,
+        0x3c, 0xfd, 0x3e, 0xd3, 0x1e,
+    ]);
+    let resp = reqwest::Client::new()
+        .post(format!("{}/t/ghost.git/git-receive-pack", server.base_url))
+        .header("Content-Type", "application/x-git-receive-pack-request")
+        .body(body)
+        .send()
+        .await?;
+    assert_eq!(resp.status(), 200);
+    let report = resp.text().await?;
+    assert!(
+        report.contains("ng refs/heads/ghost"),
+        "check_connectivity={check_connectivity}: {report}"
+    );
+    assert!(!report.contains("ok refs/heads/ghost"), "{report}");
+    let refs = git_in(&src, &["ls-remote", "origin"])?;
+    assert!(!refs.contains("refs/heads/ghost"), "{refs}");
+
+    // The legitimate shape of the same wire bytes: a new branch at an object the server has.
+    git_in(&src, &["push", "-q", "origin", "main:refs/heads/copy"])?;
+    let refs = git_in(&src, &["ls-remote", "origin"])?;
+    assert!(
+        refs.contains("refs/heads/copy"),
+        "check_connectivity={check_connectivity}: {refs}"
+    );
     Ok(())
 }

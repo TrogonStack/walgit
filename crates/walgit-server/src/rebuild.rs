@@ -93,9 +93,7 @@ fn read_marker(path: &Path) -> Option<Marker> {
 }
 
 fn write_marker(path: &Path, m: &Marker) -> anyhow::Result<()> {
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir)?;
-    }
+    std::fs::create_dir_all(path.parent().unwrap())?;
     let tmp = path.with_extension("json.tmp");
     std::fs::write(&tmp, serde_json::to_vec_pretty(m)?)?;
     std::fs::rename(&tmp, path)?;
@@ -127,25 +125,23 @@ fn copy_tree(src: &Path, dst: &Path) -> std::io::Result<u64> {
     Ok(bytes)
 }
 
-/// statvfs field widths differ per platform, so widen through a generic bound rather
-/// than a conversion that is redundant on one target and required on another.
-fn widen<T: Into<u64>>(v: T) -> u64 {
-    v.into()
-}
-
-#[allow(unsafe_code)]
+// statvfs's block fields are u32 on macOS and u64 on Linux, so `as u64` is the one spelling
+// that is lossless on both; `From` would be a useless conversion on Linux.
+#[allow(clippy::cast_lossless)]
 fn disk_avail(path: &Path) -> Option<u64> {
     use std::ffi::CString;
     use std::os::unix::ffi::OsStrExt;
     let c = CString::new(path.as_os_str().as_bytes()).ok()?;
-    // SAFETY: statvfs is a plain C struct of integers, so all-zero is a valid value.
+    // SAFETY: statvfs is a C integer struct; all-zero is a valid initialized value.
+    #[allow(unsafe_code)]
     let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
-    // SAFETY: `c` is a live NUL-terminated CString and `st` is a live, correctly
-    // typed statvfs that the call only writes into.
-    if unsafe { libc::statvfs(c.as_ptr(), &raw mut st) } != 0 {
+    // SAFETY: c is NUL-terminated and live; st is aligned writable storage for statvfs.
+    #[allow(unsafe_code)]
+    let result = unsafe { libc::statvfs(c.as_ptr(), &raw mut st) };
+    if result != 0 {
         return None;
     }
-    Some(widen(st.f_bavail) * widen(st.f_frsize))
+    Some(st.f_bavail as u64 * st.f_frsize as u64)
 }
 
 /// Hard-link (or copy) every side-file of `pack` from `from` into `into`'s pack dir; existing
@@ -157,9 +153,7 @@ fn install_pack(
 ) -> anyhow::Result<()> {
     let src = from.pack_path(pack);
     let dst = into.pack_path(pack);
-    if let Some(dir) = dst.parent() {
-        std::fs::create_dir_all(dir)?;
-    }
+    std::fs::create_dir_all(dst.parent().unwrap())?;
     for ext in ["pack", "idx", "rev", "bitmap", "commit-graph", "history"] {
         let s = src.with_extension(ext);
         if !s.exists() {

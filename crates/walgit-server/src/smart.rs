@@ -64,7 +64,7 @@ pub async fn info_refs(
                 &auth_help_message(st, headers, &e),
             ));
         }
-        return Err(ApiError::from(e));
+        return Err(auth_err(e));
     }
     if is_receive && let Some(msg) = push_url_must_be_git(st, route, headers) {
         return Ok(git_err_response("git-receive-pack", &msg));
@@ -78,7 +78,7 @@ pub async fn info_refs(
 
     let handle = open_repo(st, &route.id, is_receive).await?;
     // Advertisements need refs only: never wait for (or require) the pack set.
-    let _guard = handle.sync_refs().await.map_err(ApiError::from)?;
+    let _guard = handle.sync_refs().await.map_err(wal_err)?;
 
     let protocol = walgit_git::pkt::Protocol::from_git_protocol_header(
         headers.get("git-protocol").and_then(|v| v.to_str().ok()),
@@ -107,8 +107,8 @@ pub async fn info_refs(
             handle
                 .local()
                 .advertise_refs_v0(service, &mut buf)
-                .map_err(ApiError::from)?;
-            let advert_bytes = buf.get(start..).unwrap_or_default().to_vec();
+                .map_err(git_err)?;
+            let advert_bytes = buf[start..].to_vec();
             st.caches
                 .ref_advert
                 .insert_v0(&repo_key, ver.as_ref(), service, advert_bytes);
@@ -173,10 +173,7 @@ pub async fn upload_pack(
     headers: &HeaderMap,
     body: Body,
 ) -> Result<Response, ApiError> {
-    st.auth
-        .require_read(headers)
-        .await
-        .map_err(ApiError::from)?;
+    st.auth.require_read(headers).await.map_err(auth_err)?;
 
     let handle = open_repo(st, &route.id, false).await?;
 
@@ -206,14 +203,14 @@ async fn upload_pack_v2(
 ) -> Result<Response, ApiError> {
     let (cmd, reader) = walgit_git::pkt::read_command(reader)
         .await
-        .map_err(ApiError::from)?;
+        .map_err(git_err)?;
     match cmd.name.as_str() {
         "ls-refs" => {
-            let _guard = handle.sync_refs().await.map_err(ApiError::from)?;
+            let _guard = handle.sync_refs().await.map_err(wal_err)?;
             let req = walgit_git::pkt::parse_ls_refs(&cmd);
             let req = walgit_git::pkt::read_ls_refs_args(reader, req)
                 .await
-                .map_err(ApiError::from)?;
+                .map_err(git_err)?;
             let args = walgit_git::LsRefsArgs {
                 ref_prefixes: req.prefixes,
                 symrefs: req.symrefs,
@@ -229,7 +226,7 @@ async fn upload_pack_v2(
             {
                 lines
             } else {
-                let lines = handle.local().ls_refs(&args).map_err(ApiError::from)?;
+                let lines = handle.local().ls_refs(&args).map_err(git_err)?;
                 st.caches.ref_advert.insert_v2_ls_refs(
                     &repo_key,
                     version.as_ref(),
@@ -336,7 +333,7 @@ async fn upload_pack_v2(
                         "git-upload-pack",
                         &too_large_message(st, headers, route, &e),
                     ),
-                    e => return Err(ApiError::from(e)),
+                    e => return Err(wal_err(e)),
                 });
             }
             let (writer, body) = write_body_pipe(256 * 1024);
@@ -366,7 +363,7 @@ async fn upload_pack_v2(
             ))
         }
         "object-info" => {
-            let _guard = handle.sync().await.map_err(ApiError::from)?;
+            let _guard = handle.sync().await.map_err(wal_err)?;
             let req = walgit_git::pkt::parse_object_info(&cmd);
             let mut sizes_buf = Vec::with_capacity(256);
             let repo = handle.local().gix();
@@ -374,7 +371,7 @@ async fn upload_pack_v2(
                 let size = gix_hash::ObjectId::from_hex(hex.as_bytes())
                     .ok()
                     .and_then(|oid| repo.find_object(oid).ok())
-                    .map_or(-1, |o| i64::try_from(o.data.len()).unwrap_or(i64::MAX));
+                    .map_or(-1, |o| o.data.len() as i64);
                 pktline::encode_text(&mut sizes_buf, &format!("size {size}\n"));
             }
             pktline::encode_flush(&mut sizes_buf);
@@ -385,14 +382,14 @@ async fn upload_pack_v2(
             ))
         }
         "bundle-uri" => {
-            let _guard = handle.sync_refs().await.map_err(ApiError::from)?;
+            let _guard = handle.sync_refs().await.map_err(wal_err)?;
             let () = walgit_git::pkt::parse_bundle_uri(&cmd);
             let base = request_base_url(st, headers);
             let lines = st
                 .bundles
                 .protocol_v2_lines(&route.id, &base)
                 .await
-                .map_err(ApiError::from)?;
+                .map_err(bundle_err)?;
             let mut buf = Vec::with_capacity(256);
             for l in lines {
                 pktline::encode_text(&mut buf, &l);
@@ -471,7 +468,7 @@ fn bundle_narration(
     } else {
         let bytes: u64 = applied.iter().map(|b| b.size).sum();
         let newest = applied.last().map_or(0, |b| b.creation_token);
-        let when = chrono::DateTime::from_timestamp(i64::try_from(newest).unwrap_or(i64::MAX), 0)
+        let when = chrono::DateTime::from_timestamp(newest as i64, 0)
             .map(|d| d.format("%Y-%m-%d %H:%MZ").to_string())
             .unwrap_or_default();
         let names: Vec<String> = applied.iter().map(|b| b.strategy.clone()).collect();
@@ -577,7 +574,7 @@ async fn sync_narrated<'h, W: tokio::io::AsyncWrite + Unpin>(
     tokio::pin!(sync);
     let mut last_bar = std::time::Instant::now()
         .checked_sub(std::time::Duration::from_secs(1))
-        .unwrap_or_else(std::time::Instant::now);
+        .unwrap();
     loop {
         tokio::select! {
             biased;
@@ -783,7 +780,7 @@ async fn upload_pack_v0(
             if n == 0 {
                 break;
             }
-            buf.extend_from_slice(chunk.get(..n).unwrap_or_default());
+            buf.extend_from_slice(&chunk[..n]);
             if buf.len() > MAX {
                 return Err(ApiError::BadRequest("upload-pack request too large".into()));
             }
@@ -792,8 +789,9 @@ async fn upload_pack_v0(
         // `filter`) — capability words on the first want line also say
         // "deepen-since", so look at line starts, not substrings.
         let (mut has_have, mut bounded, mut pos) = (false, false, 0usize);
-        while let Some(hdr) = buf.get(pos..pos + 4) {
-            let Ok(len) = usize::from_str_radix(std::str::from_utf8(hdr).unwrap_or("zz"), 16)
+        while pos + 4 <= buf.len() {
+            let Ok(len) =
+                usize::from_str_radix(std::str::from_utf8(&buf[pos..pos + 4]).unwrap_or("zz"), 16)
             else {
                 break;
             };
@@ -801,9 +799,7 @@ async fn upload_pack_v0(
                 pos += 4; // flush / delim
                 continue;
             }
-            let line = buf
-                .get((pos + 4).min(buf.len())..(pos + len).min(buf.len()))
-                .unwrap_or_default();
+            let line = &buf[(pos + 4).min(buf.len())..(pos + len).min(buf.len())];
             if line.starts_with(b"have ") {
                 has_have = true;
             }
@@ -829,7 +825,7 @@ async fn upload_pack_v0(
                 "git-upload-pack",
                 &too_large_message(st, headers, route, &e),
             ),
-            e => return Err(ApiError::from(e)),
+            e => return Err(wal_err(e)),
         });
     }
     if !handle.remote_served().is_empty() {
@@ -887,11 +883,7 @@ pub async fn receive_pack(
     headers: &HeaderMap,
     mut body: Body,
 ) -> Result<Response, ApiError> {
-    let principal = st
-        .auth
-        .require_write(headers)
-        .await
-        .map_err(ApiError::from)?;
+    let principal = st.auth.require_write(headers).await.map_err(auth_err)?;
     if let Some(msg) = push_url_must_be_git(st, route, headers) {
         return refuse_push(body, headers, msg).await;
     }
@@ -1029,9 +1021,7 @@ pub async fn receive_pack(
     // Parse commands + capabilities first (they need no objects); pack bytes
     // follow in `pack_reader`. Knowing the capabilities before the sync lets
     // us narrate the sync on band 2 when the client speaks side-band-64k.
-    let (txn, caps, pack_reader) = walgit_git::receive::parse(reader)
-        .await
-        .map_err(ApiError::from)?;
+    let (txn, caps, pack_reader) = walgit_git::receive::parse(reader).await.map_err(git_err)?;
     let pack_reader: Box<dyn tokio::io::AsyncRead + Unpin + Send> = Box::new(pack_reader);
     // Wal's verify_txn treats empty string as the zero oid (create/delete).
     // receive::parse emits the 40-zero hex; normalize to empty for both ends.
@@ -1070,11 +1060,11 @@ pub async fn receive_pack(
         .get("x-request-id")
         .and_then(|v| v.to_str().ok())
         .filter(|v| !v.is_empty())
-        .map(ToString::to_string);
+        .map(std::string::ToString::to_string);
 
     if !caps.side_band_64k {
         // No sideband: the response is the report alone, after the work.
-        let guard = handle.sync().await.map_err(ApiError::from)?;
+        let guard = handle.sync().await.map_err(wal_err)?;
         let report = receive_pack_process(
             st,
             &handle,
@@ -1158,20 +1148,12 @@ pub async fn receive_pack(
     ))
 }
 
-#[allow(
-    clippy::type_complexity,
-    reason = "the publish result destructured once, right here"
-)]
-#[allow(
-    clippy::too_many_arguments,
-    reason = "one parameter per piece of already-parsed request state; a wrapper struct would only be built and destructured at the single call site"
-)]
 /// Everything after the sync: unpack, connectivity, policy, publish → the
 /// report-status bytes (already sideband-framed when the client asked).
 async fn receive_pack_process(
     st: &AppState,
     handle: &Arc<walgit_wal::RepoHandle>,
-    guard: walgit_wal::ReadGuard<'_>,
+    _guard: walgit_wal::ReadGuard<'_>,
     txn: walgit_proto::v1::RefTransaction,
     caps: walgit_git::receive::ReceiveCaps,
     pack_reader: Box<dyn tokio::io::AsyncRead + Unpin + Send>,
@@ -1196,31 +1178,48 @@ async fn receive_pack_process(
         Err(e) => Some(format!("unpack failed: {e}")),
     };
 
-    // Connectivity check for pushed tips (before we publish anything).
-    if unpack_err.is_none()
-        && st.cfg.wal.check_connectivity
-        && let Ok(Some(_)) = &ingest
-    {
+    // Every pushed tip must exist before anything is published, pack or no
+    // pack: a ref-only push carries a zero-object pack (`ingest` is `Ok(None)`)
+    // and this block used to be skipped for it, so a ref could be published
+    // pointing at an object nobody has (#37). With `wal.check_connectivity`
+    // the walk covers the tips and everything new under them; without it the
+    // tips themselves are still looked up.
+    if unpack_err.is_none() {
         let tips: Vec<gix_hash::ObjectId> = txn
             .updates
             .iter()
             .filter(|u| !u.new_oid.is_empty() && !is_zero_oid(&u.new_oid))
             .filter_map(|u| gix_hash::ObjectId::from_hex(u.new_oid.as_bytes()).ok())
             .collect();
-        if !tips.is_empty()
-            && let Err(e) = local
-                .check_connectivity_async(&tips, true)
-                .instrument(tracing::info_span!(
-                    "receive.connectivity",
-                    tips = tips.len()
-                ))
+        if !tips.is_empty() {
+            let verdict: Result<(), String> = if st.cfg.wal.check_connectivity {
+                local
+                    .check_connectivity_async(&tips, true)
+                    .instrument(tracing::info_span!(
+                        "receive.connectivity",
+                        tips = tips.len()
+                    ))
+                    .await
+                    .map_err(|e| format!("connectivity: {e}"))
+            } else {
+                let repo = local.clone();
+                let tips = tips.clone();
+                tokio::task::spawn_blocking(move || {
+                    tips.iter()
+                        .find(|t| !repo.has_object(t))
+                        .map_or(Ok(()), |t| Err(format!("missing object {t}")))
+                })
                 .await
-        {
-            // Every refusal names the reason on each ref: `unpack ng`
-            // alone makes git print "remote failed to report status".
-            tracing::warn!(repo = %route_id, error = %e, "receive-pack: connectivity check failed");
-            metrics::counter!("walgit_push_refused_total", "reason" => "connectivity").increment(1);
-            return Ok(refusal_report(&caps, &txn, &format!("connectivity: {e}")).await);
+                .map_err(|e| ApiError::Internal(format!("tip check: {e}")))?
+            };
+            if let Err(msg) = verdict {
+                // Every refusal names the reason on each ref: `unpack ng`
+                // alone makes git print "remote failed to report status".
+                tracing::warn!(repo = %route_id, error = %msg, "receive-pack: tip check failed");
+                metrics::counter!("walgit_push_refused_total", "reason" => "connectivity")
+                    .increment(1);
+                return Ok(refusal_report(&caps, &txn, &msg).await);
+            }
         }
     }
 
@@ -1260,11 +1259,11 @@ async fn receive_pack_process(
     // Release the sync read guard before publishing. `publish_push_synced`
     // reuses this request's freshness check while still syncing after CAS
     // conflicts.
-    drop(guard);
+    drop(_guard);
 
     // Writer-side peel: replicas advertise annotated tags without objects.
     local.fill_peeled(&mut txn);
-    let meta = push_meta(&caps, principal, &txn, request_id.as_ref());
+    let meta = push_meta(&caps, principal, &txn, &request_id);
     let pack_ref = match ingest {
         Ok(Some(p)) => Some(p),
         _ => None,
@@ -1339,9 +1338,7 @@ async fn refuse_push(body: Body, headers: &HeaderMap, msg: String) -> Result<Res
         .get(axum::http::header::CONTENT_ENCODING)
         .and_then(|v| v.to_str().ok());
     let reader = maybe_gunzip(enc, body_to_async_read(body));
-    let (txn, caps, _pack) = walgit_git::receive::parse(reader)
-        .await
-        .map_err(ApiError::from)?;
+    let (txn, caps, _pack) = walgit_git::receive::parse(reader).await.map_err(git_err)?;
     Ok(receive_response(refusal_report(&caps, &txn, &msg).await))
 }
 
@@ -1371,7 +1368,7 @@ fn receive_response(report: Vec<u8>) -> Response {
     let mut resp = (StatusCode::OK, report).into_response();
     resp.headers_mut().insert(
         axum::http::header::CONTENT_TYPE,
-        axum::http::HeaderValue::from_static("application/x-git-receive-pack-result"),
+        "application/x-git-receive-pack-result".parse().unwrap(),
     );
     resp
 }
@@ -1380,7 +1377,7 @@ fn push_meta(
     caps: &walgit_git::receive::ReceiveCaps,
     principal: &crate::auth::Principal,
     txn: &walgit_proto::v1::RefTransaction,
-    request_id: Option<&String>,
+    request_id: &Option<String>,
 ) -> HashMap<String, String> {
     let mut m = HashMap::new();
     m.insert("agent".to_string(), caps.agent.clone().unwrap_or_default());
@@ -1422,14 +1419,11 @@ async fn parse_fetch_request(
     loop {
         let line = walgit_git::pkt::read_pkt_line(&mut reader)
             .await
-            .map_err(ApiError::from)?;
+            .map_err(git_err)?;
         match line {
             None
-            | Some(
-                walgit_git::pkt::PktLine::Flush
-                | walgit_git::pkt::PktLine::Delim
-                | walgit_git::pkt::PktLine::ResponseEnd,
-            ) => break,
+            | Some(walgit_git::pkt::PktLine::Flush | walgit_git::pkt::PktLine::Delim)
+            | Some(walgit_git::pkt::PktLine::ResponseEnd) => break,
             Some(walgit_git::pkt::PktLine::Data(b)) => {
                 let s = String::from_utf8_lossy(&b);
                 let s = s.trim_end_matches('\n');
@@ -1491,12 +1485,12 @@ pub(crate) async fn open_repo(
             .registry
             .open_or_create(id, format)
             .await
-            .map_err(ApiError::from)?)
+            .map_err(wal_err)?)
     } else {
         match st.registry.open(id).await {
             Ok(h) => Ok(h),
             Err(walgit_wal::WalError::NotFound) => Err(ApiError::NotFound(id.to_string())),
-            Err(e) => Err(ApiError::from(e)),
+            Err(e) => Err(wal_err(e)),
         }
     }
 }
@@ -1525,11 +1519,9 @@ pub(crate) fn build_response<B: axum::response::IntoResponse>(
 ) -> Response {
     let mut resp = (status, body).into_response();
     let h = resp.headers_mut();
-    if let Ok(v) = axum::http::HeaderValue::from_str(ct) {
-        h.insert(axum::http::header::CONTENT_TYPE, v);
-    }
+    h.insert(axum::http::header::CONTENT_TYPE, ct.parse().unwrap());
     for (k, v) in extra {
-        h.insert(k, axum::http::HeaderValue::from_static(v));
+        h.insert(k, v.parse().unwrap());
     }
     resp
 }
@@ -1763,4 +1755,34 @@ fn git_err_response(service: &str, msg: &str) -> Response {
         no_cache_headers(),
         buf,
     )
+}
+
+fn auth_err(e: crate::auth::AuthError) -> ApiError {
+    match e {
+        crate::auth::AuthError::Invalid | crate::auth::AuthError::Unauthorized => {
+            ApiError::Unauthorized
+        }
+        crate::auth::AuthError::Forbidden => ApiError::Forbidden,
+        crate::auth::AuthError::Unavailable => {
+            ApiError::ServiceUnavailable("auth provider unavailable".into())
+        }
+    }
+}
+fn git_err(e: walgit_git::GitError) -> ApiError {
+    ApiError::Internal(format!("git: {e}"))
+}
+pub(crate) fn wal_err(e: walgit_wal::WalError) -> ApiError {
+    match &e {
+        walgit_wal::WalError::NotFound => ApiError::NotFound(e.to_string()),
+        walgit_wal::WalError::TooLarge { .. } => ApiError::ServiceUnavailable(e.to_string()),
+        // A store call that timed out / was throttled: fail fast, let the
+        // client retry (never hang the request on the bucket).
+        walgit_wal::WalError::Store(se) if se.is_retryable() => {
+            ApiError::ServiceUnavailable(format!("object store: {se}"))
+        }
+        _ => ApiError::Internal(format!("wal: {e}")),
+    }
+}
+fn bundle_err(e: walgit_bundle::BundleError) -> ApiError {
+    ApiError::Internal(format!("bundle: {e}"))
 }

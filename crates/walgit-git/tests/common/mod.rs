@@ -1,16 +1,14 @@
+// Test fixtures use panics to fail the test, including shared helper functions.
+#![allow(
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::panic,
+    clippy::unwrap_used
+)]
+
 //! Shared helpers for walgit-git integration tests: build synthetic repos with
 //! upstream `git` and produce packs via `git pack-objects`. Each test binary
 //! uses a subset, so unused-item warnings are expected here.
-#![allow(
-    clippy::unwrap_used,
-    clippy::expect_used,
-    clippy::panic,
-    clippy::indexing_slicing,
-    clippy::many_single_char_names
-)]
-// clippy.toml exempts #[test] functions from the panic-path lints, but not the plain
-// helper functions beside them in the same file. A panic in a fixture builder is how
-// that fixture reports it could not be built, exactly as in the tests it serves.
 #![allow(dead_code)]
 
 use std::path::PathBuf;

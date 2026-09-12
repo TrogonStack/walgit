@@ -5,13 +5,12 @@ pub mod trailers;
 pub mod ui;
 pub mod v1;
 
-use std::fmt::Write as _;
 use std::sync::Arc;
 
 use axum::{
     body::Body,
     extract::{Request, State},
-    http::{HeaderValue, StatusCode, header},
+    http::{StatusCode, header},
     middleware::Next,
     response::{IntoResponse, Redirect, Response},
 };
@@ -148,7 +147,7 @@ pub async fn require_auth(
             if status == StatusCode::UNAUTHORIZED {
                 resp.headers_mut().insert(
                     header::WWW_AUTHENTICATE,
-                    HeaderValue::from_static("Bearer realm=\"walgit\""),
+                    "Bearer realm=\"walgit\"".parse().unwrap(),
                 );
             }
             resp
@@ -164,7 +163,7 @@ pub(crate) fn url_encode(s: &str) -> String {
                 out.push(b as char);
             }
             _ => {
-                let _ = write!(out, "%{b:02X}");
+                let _ = std::fmt::Write::write_fmt(&mut out, format_args!("%{b:02X}"));
             }
         }
     }

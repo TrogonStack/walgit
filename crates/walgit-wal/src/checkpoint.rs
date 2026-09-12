@@ -1,4 +1,5 @@
 //! Checkpoint writing and store GC.
+#![allow(clippy::needless_continue)]
 
 use std::sync::Arc;
 
@@ -270,6 +271,7 @@ async fn write_checkpoint_inner(handle: &RepoHandle) -> Result<CheckpointRef, Wa
                 }
                 // Re-sync (refs) and retry
                 handle.sync_impl_level(crate::sync::SyncLevel::Refs).await?;
+                continue;
             }
             Err(e) => return Err(WalError::Store(e)),
         }

@@ -20,7 +20,7 @@ pub(crate) async fn read_log_impl(
     let known = handle.manifest_version.lock().clone();
     let manifest = match crate::sync::freshness_check(&handle.store, known.as_ref()).await? {
         crate::sync::SyncOutcome::Unchanged => handle.manifest.read().clone(),
-        crate::sync::SyncOutcome::Changed { manifest, .. } => std::sync::Arc::new(manifest),
+        crate::sync::SyncOutcome::Changed { manifest, .. } => manifest,
     };
     let head_seq = manifest.head_seq;
     let to = to_seq.unwrap_or(head_seq).min(head_seq);
@@ -41,8 +41,11 @@ pub(crate) async fn read_log_impl(
         let res = handle.store.get(&seg.key, GetOptions::default()).await?;
         let bytes = match res {
             GetResult::Object { meta, body } => {
-                walgit_store::util::collect(body, usize::try_from(meta.size).unwrap_or(usize::MAX))
-                    .await?
+                walgit_store::util::collect(
+                    body,
+                    usize::try_from(meta.size).map_err(|e| WalError::Corrupt(e.to_string()))?,
+                )
+                .await?
             }
             GetResult::NotModified { .. } => continue,
         };

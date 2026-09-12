@@ -1,17 +1,7 @@
+#![allow(clippy::many_single_char_names)]
 //! `/api/v1` (D20): the versioned programmatic surface, its browser-lane alias
 //! (`/api-browser`), CORS for foreign origins, discovery, `me`, repo summary and
 //! admin, and the SDK artefact route.
-
-#![allow(
-    clippy::unwrap_used,
-    clippy::expect_used,
-    clippy::panic,
-    clippy::indexing_slicing,
-    clippy::many_single_char_names
-)]
-// clippy.toml exempts #[test] functions from the panic-path lints, but not the plain
-// helper functions beside them in the same file. A panic in a fixture builder is how
-// that fixture reports it could not be built, exactly as in the tests it serves.
 
 mod harness;
 
@@ -38,6 +28,24 @@ async fn req(
     let status = resp.status();
     let headers = resp.headers().clone();
     Ok((status, resp.text().await?, headers))
+}
+async fn req_body(
+    server: &Server,
+    method: reqwest::Method,
+    path: &str,
+    extra: &[(&str, &str)],
+    body: &'static str,
+) -> anyhow::Result<(reqwest::StatusCode, String)> {
+    let mut r = reqwest::Client::new()
+        .request(method, format!("{}{path}", server.base_url))
+        .header("Accept", "application/json")
+        .body(body);
+    for (k, v) in extra {
+        r = r.header(*k, *v);
+    }
+    let resp = r.send().await?;
+    let status = resp.status();
+    Ok((status, resp.text().await?))
 }
 fn hdr(h: &reqwest::header::HeaderMap, k: &str) -> String {
     h.get(k)
@@ -110,6 +118,14 @@ async fn v1_surface_and_browser_lane() -> TestResult {
             .as_str()
             .unwrap()
             .ends_with("/api-browser/v1/authenticate")
+    );
+    // `docs` is this host's API page, derived from the same base as every
+    // other URL in the document (AGENTS.md §5: no hardcoded hostnames).
+    let base = d["base"].as_str().unwrap();
+    assert_eq!(
+        d["docs"],
+        format!("{}/api", base.trim_end_matches("/api/v1")),
+        "{d}"
     );
 
     // me (auth mode none in tests → anonymous principal)
@@ -541,5 +557,77 @@ async fn repository_delete_requires_admin() -> TestResult {
             .0,
         404
     );
+    Ok(())
+}
+
+/// D24 and API.md §5: on the JSON surface a write token creates repositories,
+/// but the policy and settings documents move only with admin.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn policy_and_settings_writes_require_admin() -> TestResult {
+    const POLICY: &str = r#"{"version":1,"groups":[],"rules":[]}"#;
+    const SETTINGS: &str = "[bundles]\nmin_commits = 3\n";
+    let server = Server::start_with_tweak(|c| {
+        c.server.auth.mode = walgit_config::AuthMode::Token;
+        c.server.auth.anonymous_read = false;
+        c.server.auth.tokens = vec![
+            walgit_config::StaticToken {
+                principal: "writer".into(),
+                token: "writer-token".into(),
+                token_env: None,
+                write: true,
+                admin: false,
+            },
+            walgit_config::StaticToken {
+                principal: "admin".into(),
+                token: "admin-token".into(),
+                token_env: None,
+                write: true,
+                admin: true,
+            },
+        ];
+    })
+    .await?;
+    let writer = [("Authorization", "Bearer writer-token")];
+    let admin = [("Authorization", "Bearer admin-token")];
+    assert_eq!(
+        req(&server, reqwest::Method::PUT, "/gates/repo/api", &writer)
+            .await?
+            .0,
+        201,
+        "write permission creates the repository"
+    );
+
+    for (path, body) in [
+        ("/gates/repo/api/policy", POLICY),
+        ("/gates/repo/api/settings", SETTINGS),
+    ] {
+        let (st, text) = req_body(&server, reqwest::Method::PUT, path, &writer, body).await?;
+        assert_eq!(st, 403, "a write token must not PUT {path}: {text}");
+        assert_eq!(
+            req(&server, reqwest::Method::DELETE, path, &writer)
+                .await?
+                .0,
+            403,
+            "a write token must not DELETE {path}"
+        );
+    }
+    let (st, text) = req_body(
+        &server,
+        reqwest::Method::PUT,
+        "/gates/repo/api/policy",
+        &admin,
+        POLICY,
+    )
+    .await?;
+    assert_eq!(st, 204, "{text}");
+    let (st, text) = req_body(
+        &server,
+        reqwest::Method::PUT,
+        "/gates/repo/api/settings",
+        &admin,
+        SETTINGS,
+    )
+    .await?;
+    assert_eq!(st, 200, "{text}");
     Ok(())
 }

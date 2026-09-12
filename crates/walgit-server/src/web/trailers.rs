@@ -34,7 +34,7 @@ pub fn split_trailers(body: &str) -> (String, Vec<Trailer>) {
             start = i + 1;
         }
     }
-    let block = lines.get(start..).unwrap_or_default();
+    let block = &lines[start..];
     if block.is_empty() {
         return (body.to_string(), Vec::new());
     }
@@ -48,10 +48,9 @@ pub fn split_trailers(body: &str) -> (String, Vec<Trailer>) {
             if i == 0 {
                 first_is_trailer = true;
             }
-        } else if line.starts_with([' ', '\t'])
-            && let Some(last) = trailers.last_mut()
-        {
+        } else if line.starts_with([' ', '\t']) && !trailers.is_empty() {
             // Continuation (RFC 822 folding) of the previous trailer's value.
+            let last = trailers.last_mut().unwrap();
             if !last.value.is_empty() {
                 last.value.push(' ');
             }
@@ -67,7 +66,7 @@ pub fn split_trailers(body: &str) -> (String, Vec<Trailer>) {
     if !ok {
         return (body.to_string(), Vec::new());
     }
-    let rest = lines.get(..start).unwrap_or_default().join("\n");
+    let rest = lines[..start].join("\n");
     (rest.trim_end().to_string(), trailers)
 }
 

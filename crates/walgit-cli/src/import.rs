@@ -58,9 +58,11 @@ pub fn glob_match(pattern: &str, s: &str) -> bool {
             }
             pos = part.len();
         } else if i == parts.len() - 1 {
-            return s.get(pos..).is_some_and(|tail| tail.ends_with(part));
-        } else if !part.is_empty() {
-            match s.get(pos..).and_then(|tail| tail.find(part)) {
+            return s.len() >= pos && s[pos..].ends_with(part);
+        } else if part.is_empty() {
+            continue;
+        } else {
+            match s[pos..].find(part) {
                 Some(at) => pos += at + part.len(),
                 None => return false,
             }

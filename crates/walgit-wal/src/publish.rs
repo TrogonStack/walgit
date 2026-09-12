@@ -1,4 +1,5 @@
 //! Publish path: linearizable CAS with batching.
+#![allow(clippy::needless_continue)]
 //!
 //! Design:
 //!   Each `RepoHandle` has a single-flight publisher task. `publish_push` and
@@ -209,7 +210,7 @@ const ORPHAN_GRACE_PROBES: u32 = 3;
 const ORPHAN_GRACE_STEP: std::time::Duration = std::time::Duration::from_millis(100);
 /// Never burn more than this many seqs in one claim (a pile of orphans means
 /// something else is wrong).
-const MAX_BURN: u32 = 8;
+const MAX_BURN: usize = 8;
 
 /// Unconditional fresh read of the manifest (not the handle's cached view).
 pub(crate) async fn read_manifest_fresh(store: &Prefixed) -> Result<Option<Manifest>, WalError> {
@@ -273,7 +274,7 @@ pub(crate) async fn claim_log_slot(
             }
         };
         match orphan_version {
-            None => {} // retry the Create at the same seq
+            None => continue, // retry the Create at the same seq
             Some(v) => {
                 tracing::warn!(
                     key,
@@ -281,7 +282,7 @@ pub(crate) async fn claim_log_slot(
                     "orphaned log segment at the head (writer crashed between log PUT and manifest CAS); burning the seq"
                 );
                 burned.push((key, v));
-                if u32::try_from(burned.len()).unwrap_or(u32::MAX) >= MAX_BURN {
+                if burned.len() >= MAX_BURN {
                     return Err(WalError::Corrupt(format!(
                         "{MAX_BURN} consecutive orphaned log segments from seq {}",
                         head_seq + 1
@@ -568,11 +569,13 @@ async fn process_batch(handle: &RepoHandle, batch: Vec<PublishRequest>) -> Resul
         let build = |first_seq: u64| -> (Vec<LogEntry>, Vec<PackRef>) {
             let mut entries = Vec::with_capacity(valid_indices.len());
             let mut new_packs = Vec::new();
-            for (offset, &idx) in valid_indices.iter().enumerate() {
+            for (offset, (req, _)) in batch
+                .iter()
+                .zip(&verified)
+                .filter(|(_, v)| v.valid)
+                .enumerate()
+            {
                 let seq = first_seq + offset as u64;
-                let Some(req) = batch.get(idx) else {
-                    continue;
-                };
                 let pack_ref = req.pack.as_ref().map(|p| pack_ref_from_ingested(p, seq));
                 if let Some(pr) = &pack_ref {
                     new_packs.push(pr.clone());
@@ -636,7 +639,13 @@ async fn process_batch(handle: &RepoHandle, batch: Vec<PublishRequest>) -> Resul
         };
         let first_seq = slot.first_seq;
         let (entries, new_packs) = build(first_seq);
-        let last_seq = entries.last().map_or(first_seq, |e| e.seq);
+        let Some(last_seq) = entries.last().map(|e| e.seq) else {
+            return finish_with_error(
+                batch,
+                &valid_indices,
+                WalError::Corrupt("empty publish log batch".into()),
+            );
+        };
 
         // 6. Build updated manifest
         let mut updated: Manifest = (*manifest).clone();
@@ -739,10 +748,7 @@ async fn process_batch(handle: &RepoHandle, batch: Vec<PublishRequest>) -> Resul
                     handle.sync_mutex.lock(),
                 )
                 .await;
-                for &idx in &valid_indices {
-                    let Some(req) = batch.get(idx) else {
-                        continue;
-                    };
+                for (req, _) in batch.iter().zip(&verified).filter(|(_, v)| v.valid) {
                     if let Err(e) = handle.local.apply_ref_txn(&req.txn, false) {
                         tracing::warn!(repo = %handle.id, seq = last_seq, error = %e, "published (CAS ok), but applying the ref txn to the local copy failed; the next sync replays it");
                         metrics::counter!("walgit_publish_local_apply_failed_total").increment(1);
@@ -809,19 +815,21 @@ async fn process_batch(handle: &RepoHandle, batch: Vec<PublishRequest>) -> Resul
 
             // Build all responses (success for valid, rejection for invalid)
             let mut responses: Vec<PublishResult> = Vec::with_capacity(batch.len());
-            for (i, v) in verified.iter().enumerate() {
-                let seq = if v.valid {
-                    valid_indices
-                        .iter()
-                        .position(|&vi| vi == i)
-                        .map_or(0, |offset| first_seq + offset as u64)
+            let mut valid_offset = 0u64;
+            for v in &verified {
+                if v.valid {
+                    let seq = first_seq + valid_offset;
+                    valid_offset += 1;
+                    responses.push(PublishResult {
+                        seq,
+                        per_ref: v.per_ref.clone(),
+                    });
                 } else {
-                    0
-                };
-                responses.push(PublishResult {
-                    seq,
-                    per_ref: v.per_ref.clone(),
-                });
+                    responses.push(PublishResult {
+                        seq: 0,
+                        per_ref: v.per_ref.clone(),
+                    });
+                }
             }
 
             // Consume batch and send responses
@@ -845,6 +853,7 @@ async fn process_batch(handle: &RepoHandle, batch: Vec<PublishRequest>) -> Resul
             span.record("cas_retries", attempts);
             return finish_with_error(batch, &valid_indices, WalError::Retry { attempts });
         }
+        continue;
     }
 }
 
@@ -974,7 +983,10 @@ pub(crate) async fn publish_compact_impl(
     }
 
     let pack_ref = pack_ref_from_info(&new_pack, 0, tier); // seq set below
-    let supersedes_hex: Vec<String> = supersedes.iter().map(ToString::to_string).collect();
+    let supersedes_hex: Vec<String> = supersedes
+        .iter()
+        .map(std::string::ToString::to_string)
+        .collect();
 
     let mut attempts = 0u32;
 
@@ -1024,8 +1036,10 @@ pub(crate) async fn publish_compact_impl(
         // Build updated manifest
         let mut updated: Manifest = (*manifest).clone();
         updated.head_seq = seq;
-        let sup_set: std::collections::HashSet<&str> =
-            supersedes_hex.iter().map(String::as_str).collect();
+        let sup_set: std::collections::HashSet<&str> = supersedes_hex
+            .iter()
+            .map(std::string::String::as_str)
+            .collect();
         updated
             .packs
             .retain(|p| !sup_set.contains(p.checksum.as_str()) && p.checksum != pack_ref.checksum);
@@ -1112,6 +1126,7 @@ pub(crate) async fn publish_compact_impl(
         if attempts >= max_retries {
             return Err(WalError::Retry { attempts });
         }
+        continue;
     }
 }
 
@@ -1247,9 +1262,10 @@ pub(crate) async fn add_pack_impl(
     let checksum = gix_hash::ObjectId::from_hex(hex.as_bytes())
         .map_err(|e| WalError::Corrupt(format!("bad pack name {name}: {e}")))?;
     let dest = handle.local.pack_path(&checksum);
-    if let Some(dir) = dest.parent() {
-        std::fs::create_dir_all(dir)?;
-    }
+    std::fs::create_dir_all(
+        dest.parent()
+            .ok_or_else(|| WalError::Corrupt("destination has no parent".into()))?,
+    )?;
     for (src, dst) in [(pack, dest.clone()), (idx, dest.with_extension("idx"))] {
         if !dst.exists() && std::fs::hard_link(src, &dst).is_err() {
             std::fs::copy(src, &dst)?;
@@ -1377,6 +1393,7 @@ pub(crate) async fn publish_settings_impl(
                 if attempts >= max_retries {
                     return Err(WalError::Retry { attempts });
                 }
+                continue;
             }
             Err(e) => return Err(WalError::Store(e)),
         }

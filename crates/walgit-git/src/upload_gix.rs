@@ -28,7 +28,6 @@
 //! (`PackCopyAndBaseObjects`); loose (faulted) objects are compressed fresh.
 
 use std::collections::{HashMap, HashSet};
-use std::fmt::Write as _;
 
 use futures::future::BoxFuture;
 use gix_object::{Find, FindHeader, Kind as ObjKind};
@@ -208,10 +207,17 @@ impl LocalRepo {
     ) -> Result<UploadPackStats, GitError> {
         let mut header = String::from("# v2 git bundle\n");
         for p in prerequisites {
-            let _ = writeln!(header, "-{} ", p.to_hex());
+            {
+                let _ = std::fmt::Write::write_fmt(&mut header, format_args!("-{} \n", p.to_hex()));
+            };
         }
         for (name, oid) in refs {
-            let _ = writeln!(header, "{} {name}", oid.to_hex());
+            {
+                let _ = std::fmt::Write::write_fmt(
+                    &mut header,
+                    format_args!("{} {name}\n", oid.to_hex()),
+                );
+            };
         }
         header.push('\n');
         out.write_all(header.as_bytes())
@@ -274,8 +280,11 @@ impl LocalRepo {
                     return Err(GitError::MissingObject {
                         oid: missing
                             .first()
-                            .map(|o| o.to_hex().to_string())
-                            .unwrap_or_default(),
+                            .ok_or_else(|| {
+                                GitError::InvalidInput("empty missing-object set".into())
+                            })?
+                            .to_hex()
+                            .to_string(),
                     });
                 }
                 self.refresh_async().await?;
@@ -305,8 +314,11 @@ impl LocalRepo {
                         return Err(GitError::MissingObject {
                             oid: missing
                                 .first()
-                                .map(|o| o.to_hex().to_string())
-                                .unwrap_or_default(),
+                                .ok_or_else(|| {
+                                    GitError::InvalidInput("empty missing-object set".into())
+                                })?
+                                .to_hex()
+                                .to_string(),
                         });
                     };
                     if rounds > MAX_FAULT_ROUNDS {
@@ -325,8 +337,11 @@ impl LocalRepo {
                         return Err(GitError::MissingObject {
                             oid: missing
                                 .first()
-                                .map(|o| o.to_hex().to_string())
-                                .unwrap_or_default(),
+                                .ok_or_else(|| {
+                                    GitError::InvalidInput("empty missing-object set".into())
+                                })?
+                                .to_hex()
+                                .to_string(),
                         });
                     }
                     self.refresh_async().await?;
@@ -362,8 +377,11 @@ impl LocalRepo {
                     return Err(GitError::MissingObject {
                         oid: missing
                             .first()
-                            .map(|o| o.to_hex().to_string())
-                            .unwrap_or_default(),
+                            .ok_or_else(|| {
+                                GitError::InvalidInput("empty missing-object set".into())
+                            })?
+                            .to_hex()
+                            .to_string(),
                     });
                 };
                 sink.progress(&format!(
@@ -376,8 +394,11 @@ impl LocalRepo {
                     return Err(GitError::MissingObject {
                         oid: missing
                             .first()
-                            .map(|o| o.to_hex().to_string())
-                            .unwrap_or_default(),
+                            .ok_or_else(|| {
+                                GitError::InvalidInput("empty missing-object set".into())
+                            })?
+                            .to_hex()
+                            .to_string(),
                     });
                 }
                 self.refresh_async().await?;
@@ -601,12 +622,13 @@ fn generate_pack_streaming(
     if counts.is_empty() {
         let header = gix_pack::data::header::encode(PackVersion::V2, 0);
         let mut buf = header.to_vec();
-        let trailer = crate::compute_pack_trailer(&buf, object_hash);
+        let trailer = crate::compute_pack_trailer(&buf, object_hash)?;
         buf.extend_from_slice(trailer.as_slice());
         out.write_all(&buf).map_err(GitError::Io)?;
         return Ok(0);
     }
-    let num_entries = u32::try_from(counts.len()).unwrap_or(u32::MAX);
+    let num_entries = u32::try_from(counts.len())
+        .map_err(|_| GitError::InvalidInput("pack exceeds u32 object count".into()))?;
     let progress: Box<dyn gix_features::progress::DynNestedProgress + 'static> =
         Box::new(gix_features::progress::Discard);
     let entries = entry::iter_from_counts(
@@ -1031,9 +1053,11 @@ mod frozen_source_tests {
         let mut blobs = Vec::new();
         for (i, words) in ["one pack", "two pack"].iter().enumerate() {
             use std::io::Write;
+
             let content = format!("{words} {}\n", "x".repeat(300 + i * 50));
             let oid = {
                 use std::io::Write;
+
                 let mut c = std::process::Command::new("git")
                     .arg("-C")
                     .arg(dir)
@@ -1042,6 +1066,7 @@ mod frozen_source_tests {
                     .stdout(std::process::Stdio::piped())
                     .spawn()
                     .unwrap();
+
                 c.stdin
                     .take()
                     .unwrap()
@@ -1061,6 +1086,7 @@ mod frozen_source_tests {
                 .stdout(std::process::Stdio::piped())
                 .spawn()
                 .unwrap();
+
             c.stdin
                 .take()
                 .unwrap()
@@ -1120,9 +1146,11 @@ mod frozen_source_tests {
         let mut shifted = false;
         for i in 0..24 {
             use std::io::Write;
+
             let content = format!("later pack {i} {}\n", "y".repeat(200 + i));
             let oid = {
                 use std::io::Write;
+
                 let mut c = std::process::Command::new("git")
                     .arg("-C")
                     .arg(dir)
@@ -1131,6 +1159,7 @@ mod frozen_source_tests {
                     .stdout(std::process::Stdio::piped())
                     .spawn()
                     .unwrap();
+
                 c.stdin
                     .take()
                     .unwrap()
@@ -1149,6 +1178,7 @@ mod frozen_source_tests {
                 .stdout(std::process::Stdio::piped())
                 .spawn()
                 .unwrap();
+
             c.stdin
                 .take()
                 .unwrap()

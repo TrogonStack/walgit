@@ -1,4 +1,5 @@
 //! Registry: process-wide map of `RepoId` -> Arc<RepoHandle>.
+#![allow(clippy::unnecessary_wraps)]
 
 use std::str::FromStr;
 use std::sync::Arc;
@@ -341,7 +342,20 @@ impl Registry {
     }
 
     /// Disk cache maintenance: evict idle repos beyond `cache.max_bytes` / `evict_idle_after`.
-    pub fn evict_idle(&self) -> Result<EvictReport, WalError> {
+    pub async fn evict_idle(self: &Arc<Self>) -> Result<EvictReport, WalError> {
+        let registry = Arc::clone(self);
+        tokio::task::spawn_blocking(move || registry.evict_idle_blocking())
+            .await
+            .map_err(|e| WalError::Corrupt(format!("cache eviction task: {e}")))?
+    }
+
+    #[expect(
+        clippy::cast_precision_loss,
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "Disk watermarks are approximate nonnegative fractions, with truncation to whole bytes"
+    )]
+    fn evict_idle_blocking(&self) -> Result<EvictReport, WalError> {
         let evict_after = self.cfg.cache.evict_idle_after;
         // D25: budget mode evicts past `cache.max_bytes`; disk mode only under
         // disk pressure (filesystem of `cache.dir` above `disk_high_watermark`)
@@ -354,11 +368,6 @@ impl Registry {
                     if frac <= self.cfg.cache.disk_high_watermark {
                         return Ok(EvictReport::default());
                     }
-                    #[allow(
-                        clippy::cast_possible_truncation,
-                        clippy::cast_sign_loss,
-                        reason = "the saturating float-to-int cast is the intended rounding"
-                    )]
                     let low = ((self.cfg.cache.disk_high_watermark - 0.10).max(0.0) * total as f64)
                         as u64;
                     // Other data on the filesystem counts against us: target =
@@ -468,26 +477,24 @@ fn dir_size(path: &std::path::Path) -> u64 {
     walk(path, &mut std::collections::HashSet::new())
 }
 
-/// statvfs field widths differ per platform, so widen through a generic bound rather
-/// than a conversion that is redundant on one target and required on another.
-fn widen<T: Into<u64>>(v: T) -> u64 {
-    v.into()
-}
-
 /// (used, total) bytes of the filesystem holding `path` (statvfs).
-#[allow(unsafe_code)]
+// statvfs's block fields are u32 on macOS and u64 on Linux, so `as u64` is the one spelling
+// that is lossless on both; `From` would be a useless conversion on Linux.
+#[allow(clippy::cast_lossless)]
 fn disk_usage(path: &std::path::Path) -> Option<(u64, u64)> {
     use std::ffi::CString;
     use std::os::unix::ffi::OsStrExt;
     let c = CString::new(path.as_os_str().as_bytes()).ok()?;
-    // SAFETY: statvfs is a plain C struct of integers, so all-zero is a valid value.
+    // SAFETY: statvfs is a C integer struct; all-zero is a valid initialized value.
+    #[allow(unsafe_code)]
     let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
-    // SAFETY: `c` is a live NUL-terminated CString and `st` is a live, correctly
-    // typed statvfs that the call only writes into.
-    if unsafe { libc::statvfs(c.as_ptr(), &raw mut st) } != 0 {
+    // SAFETY: c is NUL-terminated and live; st is aligned writable storage for statvfs.
+    #[allow(unsafe_code)]
+    let result = unsafe { libc::statvfs(c.as_ptr(), &raw mut st) };
+    if result != 0 {
         return None;
     }
-    let total = widen(st.f_blocks) * widen(st.f_frsize);
-    let avail = widen(st.f_bavail) * widen(st.f_frsize);
+    let total = st.f_blocks as u64 * st.f_frsize as u64;
+    let avail = st.f_bavail as u64 * st.f_frsize as u64;
     Some((total.saturating_sub(avail), total))
 }

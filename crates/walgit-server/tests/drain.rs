@@ -6,20 +6,10 @@
 //! and fetches are refused with 503 + Retry-After before any work, in-flight
 //! requests get `server.drain_timeout`.
 
-#![allow(
-    clippy::unwrap_used,
-    clippy::expect_used,
-    clippy::panic,
-    clippy::indexing_slicing,
-    clippy::many_single_char_names
-)]
-// clippy.toml exempts #[test] functions from the panic-path lints, but not the plain
-// helper functions beside them in the same file. A panic in a fixture builder is how
-// that fixture reports it could not be built, exactly as in the tests it serves.
-
 mod harness;
 
 use harness::{Server, git, git_in};
+use std::collections::HashMap;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn after_sigterm_new_object_work_is_refused_and_no_unit_starts() -> anyhow::Result<()> {
@@ -57,7 +47,7 @@ async fn after_sigterm_new_object_work_is_refused_and_no_unit_starts() -> anyhow
         .registry
         .open(&walgit_git::RepoId::new("o", "r")?)
         .await?;
-    let unit = match h0.begin_task("compact", std::collections::HashMap::default()) {
+    let unit = match h0.begin_task("compact", HashMap::default()) {
         walgit_wal::Begin::Started(t) => t,
         walgit_wal::Begin::AlreadyRunning(_) => anyhow::bail!("compact already running"),
     };

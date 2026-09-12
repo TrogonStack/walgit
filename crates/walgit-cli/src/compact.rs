@@ -2,7 +2,6 @@
 //! Shares the decision/lease/repack/publish logic with the serve loop and the
 //! web UI (`walgit_server::ops::compact_repo`).
 
-use std::fmt::Write as _;
 use std::sync::Arc;
 
 use anyhow::{Result, bail};
@@ -83,7 +82,12 @@ async fn compact_one(
         // The weekly bundle is composed from this base with the refs at its
         // seq: write the checkpoint now so `walgit bundle compose` finds them.
         let cp = handle.write_checkpoint().await?;
-        let _ = write!(summary, "; checkpoint at seq {}", cp.seq);
+        {
+            let _ = std::fmt::Write::write_fmt(
+                &mut summary,
+                format_args!("; checkpoint at seq {}", cp.seq),
+            );
+        };
     }
     Ok(summary)
 }

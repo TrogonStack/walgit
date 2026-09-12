@@ -352,7 +352,7 @@ impl ServerCaches {
             api_immutable: Cache::builder()
                 .max_capacity(64 * 1024 * 1024)
                 .weigher(|k: &String, v: &bytes::Bytes| {
-                    u32::try_from((k.len() + v.len()).min(u32::MAX as usize)).unwrap_or(u32::MAX)
+                    (k.len() + v.len()).min(u32::MAX as usize) as u32
                 })
                 .build(),
             bundle_attempts: Cache::builder()
@@ -374,7 +374,10 @@ mod tests {
 
     fn make_args(prefixes: &[&str]) -> walgit_git::LsRefsArgs {
         walgit_git::LsRefsArgs {
-            ref_prefixes: prefixes.iter().map(ToString::to_string).collect(),
+            ref_prefixes: prefixes
+                .iter()
+                .map(std::string::ToString::to_string)
+                .collect(),
             symrefs: false,
             peel: true,
             unborn: false,

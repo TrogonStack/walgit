@@ -15,6 +15,7 @@
 mod harness;
 
 use harness::{Server, git, git_in};
+use std::collections::HashMap;
 
 /// Every await is bounded so a hang names the step instead of stalling CI.
 macro_rules! step {
@@ -28,6 +29,7 @@ macro_rules! step {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn pass_checkpoints_due_repos_refs_level_and_reports_tasks() -> anyhow::Result<()> {
     use walgit_server::maintain::{Unit, next_unit, run_pass};
+
     // Writer front: count trigger off, so nothing auto-checkpoints on push.
     let front = step!("start front", Server::start())?;
     step!("put repo", front.put_repo("o", "r"))?;
@@ -368,7 +370,7 @@ async fn fsck_unit_records_missing_objects_and_repair_unit_fetches_them_from_ups
     };
     step!(
         "move main",
-        h.publish_push_synced(None, txn, std::collections::HashMap::default())
+        h.publish_push_synced(None, txn, HashMap::default())
     )?;
 
     // Pass 1: the audit (never audited) → fsck.pb lists the blob; the unit succeeds (a finding, not a failure).
@@ -533,7 +535,7 @@ async fn connectivity_failure_is_reported_per_ref_not_as_remote_failure() -> any
     };
     step!(
         "advertise x",
-        h.publish_push_synced(None, txn, std::collections::HashMap::default())
+        h.publish_push_synced(None, txn, HashMap::default())
     )?;
     // A new commit on top whose tree still references the missing blob (b.txt
     // unchanged): git sends commit 3 + its root tree, the server walks into b.txt.
@@ -1039,7 +1041,7 @@ async fn weekly_slot_rebuilds_the_base_then_composes_it_on_an_ssd_maintainer() -
     };
     step!(
         "import refs",
-        h.publish_push_synced(None, txn, std::collections::HashMap::default())
+        h.publish_push_synced(None, txn, HashMap::default())
     )?;
     step!("sync after base", h.sync())?;
     std::fs::write(src.path().join("g.txt"), "two\n")?;
@@ -1455,7 +1457,7 @@ async fn identical_incremental_slots_are_skipped_as_unchanged() -> anyhow::Resul
         h.publish_push_at(
             Some(p1),
             txn("refs/heads/main", "", &c1),
-            std::collections::HashMap::default(),
+            HashMap::default(),
             now - 240 * hour
         )
     )?;
@@ -1465,7 +1467,7 @@ async fn identical_incremental_slots_are_skipped_as_unchanged() -> anyhow::Resul
         h.publish_push_at(
             Some(p2),
             txn("refs/heads/main", &c1, &c2),
-            std::collections::HashMap::default(),
+            HashMap::default(),
             now - 6 * hour
         )
     )?;
@@ -1698,7 +1700,7 @@ async fn blobless_bundle_family_is_composed_from_the_history_pack_and_served_on_
     };
     step!(
         "import refs",
-        h.publish_push_synced(None, txn, std::collections::HashMap::default())
+        h.publish_push_synced(None, txn, HashMap::default())
     )?;
     std::fs::write(src.path().join("f2.txt"), "one and a half\n")?;
     git_in(src.path(), &["add", "."])?;

@@ -39,7 +39,6 @@ pub async fn run_loop(state: Arc<AppState>) {
     let mut passes = 0u64;
     let mut last_unit = String::new();
     loop {
-        tokio::time::sleep(interval).await;
         if walgit_wal::tasks::draining() {
             info!("maintenance loop: draining, no new pass");
             return;
@@ -97,6 +96,7 @@ pub async fn run_loop(state: Arc<AppState>) {
         if let Err(e) = heartbeat(&state, &host, started, passes, &last_unit).await {
             warn!(error = %e, "maintenance heartbeat failed");
         }
+        tokio::time::sleep(interval).await;
     }
 }
 
@@ -508,11 +508,6 @@ pub async fn upcoming(
             walgit_config::BundleKind::Full => match &base {
                 Some(b) if many || base_predates_window(handle, strat, slot, b.seq).await => {
                     let gib = b.pack_size as f64 / (1u64 << 30) as f64;
-                    #[allow(
-                        clippy::cast_possible_truncation,
-                        clippy::cast_sign_loss,
-                        reason = "the saturating float-to-int cast is the intended rounding"
-                    )]
                     let mins = (gib * 1.0).max(1.0).round() as u64;
                     match &ssd {
                         Some(h) => (format!("base rebuild (repack {gib:.1} GiB, ~{mins} min on {h}) + compose"), Some(h.clone())),
@@ -522,7 +517,7 @@ pub async fn upcoming(
                 Some(b) => (
                     format!(
                         "compose header ∘ base pack-{} (no push since it)",
-                        b.checksum.get(..12).unwrap_or(&b.checksum)
+                        &b.checksum[..12]
                     ),
                     any.clone(),
                 ),

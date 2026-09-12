@@ -9,7 +9,6 @@
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures::StreamExt;
-use std::fmt::Write as _;
 
 use google_cloud_auth::credentials::Builder as AuthBuilder;
 use google_cloud_gax::error::rpc::Code;
@@ -238,12 +237,12 @@ impl GcsStore {
         })
     }
 
-    #[allow(
-        clippy::case_sensitive_file_extension_comparisons,
-        reason = "the key space is ours; these suffixes are written by this crate, always lowercase"
-    )]
     /// Bulk keys: pack data and side-files, bundles, LFS (everything that is
     /// large or read by range); the rest is control plane.
+    #[expect(
+        clippy::case_sensitive_file_extension_comparisons,
+        reason = "Object store control keys use exact case-sensitive suffixes"
+    )]
     fn is_bulk_key(key: &str) -> bool {
         // Pack data + side-files, bundle *files* (not `bundles/list.pb`), LFS
         // objects. Everything else — manifest, log, checkpoints, leases,
@@ -277,6 +276,14 @@ impl GcsStore {
     }
 
     /// The data client for `key` (+ a bulk permit when it is bulk traffic).
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "In-flight permit count is an approximate metric"
+    )]
+    #[expect(
+        clippy::indexing_slicing,
+        reason = "Construction guarantees a nonempty client pool; the index is modulo its length"
+    )]
     async fn data_client(
         &self,
         key: &str,
@@ -315,7 +322,7 @@ impl GcsStore {
             }
             metrics::gauge!("walgit_store_bulk_inflight")
                 .set((self.bulk_permits_total - self.bulk_permits.available_permits()) as f64);
-            (self.bulk.get(i).unwrap_or(&self.storage), permit)
+            (&self.bulk[i], permit)
         } else {
             (&self.storage, None)
         }
@@ -324,7 +331,7 @@ impl GcsStore {
     fn meta_from_object(obj: &google_cloud_storage::model::Object) -> ObjectMeta {
         ObjectMeta {
             key: obj.name.clone(),
-            size: u64::try_from(obj.size).unwrap_or(0),
+            size: obj.size.max(0).cast_unsigned(),
             version: gen_version(obj.generation),
         }
     }
@@ -379,11 +386,13 @@ impl BulkHttp {
             pos: u64,
             attempts: u32,
         }
+
         let (size, generation, first) = self.open(key, range.clone(), if_generation_match).await?;
         let end = range.as_ref().map_or(size, |r| r.end);
         let start = range.as_ref().map_or(0, |r| r.start);
         let this = self.clone();
         let key_owned = key.to_owned();
+
         let st = St {
             inner: first,
             pos: start,
@@ -499,11 +508,12 @@ impl BulkHttp {
                 .map(|g| format!("&ifGenerationMatch={g}"))
                 .unwrap_or_default()
         );
-        let client = self
+        let mut req = self
             .clients
             .get(i)
-            .ok_or_else(|| StoreError::other(anyhow::anyhow!("no bulk http client")))?;
-        let mut req = client.get(&url).headers(headers);
+            .ok_or_else(|| StoreError::other(anyhow::anyhow!("empty bulk HTTP client pool")))?
+            .get(&url)
+            .headers(headers);
         if let Some(r) = &range {
             req = req.header(
                 reqwest::header::RANGE,
@@ -635,7 +645,7 @@ impl GcsStore {
             }
             PutBody::Stream { len, stream } if len <= SINGLE_SHOT_PUT_LIMIT => {
                 let bytes =
-                    crate::util::collect(stream, usize::try_from(len).unwrap_or(usize::MAX))
+                    crate::util::collect(stream, usize::try_from(len).map_err(StoreError::other)?)
                         .await?;
                 let (client, _permit) = self.data_client(key, false).await;
                 let mut builder =
@@ -759,7 +769,7 @@ impl ObjectStore for GcsStore {
         let obj = resp.object();
         let meta = ObjectMeta {
             key: key.to_owned(),
-            size: u64::try_from(obj.size).unwrap_or(0),
+            size: obj.size.max(0).cast_unsigned(),
             version: gen_version(obj.generation),
         };
 
@@ -911,7 +921,7 @@ impl ObjectStore for GcsStore {
         let control = self.control.clone();
         let bucket_resource = self.bucket_resource.clone();
         let prefix = prefix.to_owned();
-        let start_after = start_after.map(ToOwned::to_owned);
+        let start_after = start_after.map(std::borrow::ToOwned::to_owned);
 
         tokio::spawn(async move {
             let mut page_token = String::new();
@@ -1012,7 +1022,7 @@ impl ObjectStore for GcsStore {
         let authorization = headers
             .get(http::header::AUTHORIZATION)
             .and_then(|v| v.to_str().ok())
-            .map(ToString::to_string);
+            .map(std::string::ToString::to_string);
         Some(crate::AccelTarget {
             url: format!(
                 "https://storage.googleapis.com/{}/{}",
@@ -1465,7 +1475,7 @@ fn urlencode(s: &str) -> String {
                 out.push(b as char);
             }
             _ => {
-                let _ = write!(out, "%{b:02X}");
+                let _ = std::fmt::Write::write_fmt(&mut out, format_args!("%{b:02X}"));
             }
         }
     }

@@ -20,7 +20,7 @@ use std::convert::Infallible;
 use std::future::Future;
 
 use axum::body::Body;
-use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
+use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use bytes::Bytes;
 use futures::StreamExt;
@@ -80,12 +80,12 @@ pub fn sse_response(
     *resp.status_mut() = StatusCode::OK;
     resp.headers_mut().insert(
         header::CONTENT_TYPE,
-        HeaderValue::from_static("text/event-stream; charset=utf-8"),
+        "text/event-stream; charset=utf-8".parse().unwrap(),
     );
     resp.headers_mut()
-        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+        .insert(header::CACHE_CONTROL, "no-store".parse().unwrap());
     resp.headers_mut()
-        .insert("X-Accel-Buffering", HeaderValue::from_static("no"));
+        .insert("X-Accel-Buffering", "no".parse().unwrap());
     resp
 }
 
@@ -115,31 +115,19 @@ impl Rendered {
                 .is_some_and(|v| v.split(',').any(|t| t.trim() == etag || t.trim() == "*"));
             if hit {
                 let mut r = StatusCode::NOT_MODIFIED.into_response();
-                if let Ok(v) = HeaderValue::from_str(etag) {
-                    r.headers_mut().insert(header::ETAG, v);
-                }
-                r.headers_mut().insert(
-                    header::CACHE_CONTROL,
-                    HeaderValue::from_static(self.cache_control),
-                );
+                r.headers_mut().insert(header::ETAG, etag.parse().unwrap());
+                r.headers_mut()
+                    .insert(header::CACHE_CONTROL, self.cache_control.parse().unwrap());
                 return r;
             }
         }
         let mut r = (StatusCode::OK, Body::from(self.body)).into_response();
-        r.headers_mut().insert(
-            header::CONTENT_TYPE,
-            HeaderValue::from_static(self.content_type),
-        );
-        r.headers_mut().insert(
-            header::CACHE_CONTROL,
-            HeaderValue::from_static(self.cache_control),
-        );
-        if let Some(v) = self
-            .etag
-            .as_deref()
-            .and_then(|e| HeaderValue::from_str(e).ok())
-        {
-            r.headers_mut().insert(header::ETAG, v);
+        r.headers_mut()
+            .insert(header::CONTENT_TYPE, self.content_type.parse().unwrap());
+        r.headers_mut()
+            .insert(header::CACHE_CONTROL, self.cache_control.parse().unwrap());
+        if let Some(e) = &self.etag {
+            r.headers_mut().insert(header::ETAG, e.parse().unwrap());
         }
         r
     }
@@ -166,7 +154,7 @@ where
                             break;
                         }
                     }
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
                     Err(_) => break,
                 }
             }
@@ -240,7 +228,7 @@ pub fn task_stream(state: std::sync::Arc<walgit_wal::tasks::TaskState>) -> Respo
             tokio::select! {
                 r = live.recv() => match r {
                     Ok(p) => { if tx.send(progress_packet(&p)).await.is_err() { return; } }
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
                     Err(_) => break,
                 },
                 _ = done.changed() => {

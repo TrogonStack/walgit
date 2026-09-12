@@ -7,7 +7,7 @@ use anyhow::Result;
 use crate::ConfigAction;
 use walgit_config::Config;
 
-pub fn run(action: ConfigAction, cfg: &Arc<Config>) -> Result<()> {
+pub async fn run(action: ConfigAction, cfg: &Arc<Config>) -> Result<()> {
     match action {
         ConfigAction::Check { env_files, strict } => {
             let mut cfg: Config = (**cfg).clone();

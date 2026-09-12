@@ -3,12 +3,9 @@
 //! Schema lives in `proto/walgit/v1/wal.proto`; it is the contract between
 //! every walgit instance and must only evolve backward-compatibly.
 
+// Documentation in this module is emitted by prost, including enum helper prose.
+#[allow(clippy::doc_markdown)]
 pub mod v1 {
-    // prost renders the .proto comments verbatim into doc comments, so bare identifiers
-    // there trip doc_markdown in code no one can edit. Fixing it would mean backticking
-    // the schema's own prose to satisfy a lint about generated output.
-    #![allow(clippy::doc_markdown)]
-
     include!(concat!(env!("OUT_DIR"), "/walgit.v1.rs"));
 }
 
@@ -100,7 +97,7 @@ pub mod keys {
 /// Appendable objects grow by appending frames; readers stop at the first
 /// incomplete trailing frame.
 pub mod frame {
-    use bytes::{Buf, Bytes, BytesMut};
+    use bytes::{Bytes, BytesMut};
     use prost::Message;
 
     use crate::v1::LogEntry;
@@ -109,10 +106,8 @@ pub mod frame {
         let len = e.encoded_len();
         prost::encoding::encode_varint(len as u64, out);
         out.reserve(len);
-        // Infallible: prost only fails to encode when the buffer is short, and the
-        // reserve above is for exactly the length prost just reported.
-        #[allow(clippy::expect_used)]
-        e.encode(out).expect("BytesMut was reserved to encoded_len");
+        // BytesMut grows as needed; encode_raw has no fallible capacity check.
+        e.encode_raw(out);
     }
 
     pub fn encode_entries<'a>(entries: impl IntoIterator<Item = &'a LogEntry>) -> Bytes {
@@ -132,14 +127,9 @@ pub mod frame {
             let Ok(len) = prost::encoding::decode_varint(&mut probe) else {
                 break;
             };
-            // A frame header from the store may claim any length; on a 32-bit target a
-            // u64 that does not fit usize is a truncated frame, not a shorter one.
             let Ok(len) = usize::try_from(len) else {
                 break;
             };
-            if probe.remaining() < len {
-                break;
-            }
             let Some(frame) = probe.get(..len) else {
                 break;
             };
@@ -160,8 +150,8 @@ pub mod time {
     pub fn from_system(t: SystemTime) -> prost_types::Timestamp {
         let d = t.duration_since(UNIX_EPOCH).unwrap_or_default();
         prost_types::Timestamp {
-            seconds: d.as_secs().cast_signed(),
-            nanos: d.subsec_nanos().cast_signed(),
+            seconds: i64::try_from(d.as_secs()).unwrap_or(i64::MAX),
+            nanos: i32::try_from(d.subsec_nanos()).unwrap_or(999_999_999),
         }
     }
     pub fn to_system(t: &prost_types::Timestamp) -> SystemTime {

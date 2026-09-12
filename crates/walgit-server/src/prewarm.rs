@@ -5,6 +5,7 @@
 //! (discoverable at `…/tasks`); `/readyz` can be gated on completion
 //! (`cache.prewarm_ready_timeout`).
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Instant;
@@ -86,7 +87,7 @@ async fn warm(st: &Arc<AppState>, repo: &str) -> Result<String, String> {
         .parse()
         .map_err(|e: walgit_git::GitError| e.to_string())?;
     let handle = st.registry.open(&id).await.map_err(|e| e.to_string())?;
-    let task = match handle.begin_task("prewarm", std::collections::HashMap::default()) {
+    let task = match handle.begin_task("prewarm", HashMap::default()) {
         walgit_wal::Begin::Started(t) => t,
         walgit_wal::Begin::AlreadyRunning(_) => return Ok("already warming".into()),
     };
@@ -146,7 +147,7 @@ async fn warm(st: &Arc<AppState>, repo: &str) -> Result<String, String> {
         {
             reporter.notice(format!(
                 "Reading the root tree of {} from the pack set",
-                sha.get(..12).unwrap_or(sha)
+                &sha[..12]
             ));
             let remote = crate::web::objects::Remote::new(
                 packs.clone(),

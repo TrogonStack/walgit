@@ -123,10 +123,6 @@ struct SpanData {
     fields: Map<String, Value>,
 }
 
-#[allow(
-    clippy::type_complexity,
-    reason = "a shared test sink; naming the alias would not make the nesting clearer"
-)]
 /// A custom `tracing` layer that emits Cloud Logging structured JSON.
 ///
 /// * **Events** produce a JSON line immediately with `severity` = event level.
@@ -192,7 +188,7 @@ impl CloudLoggingLayer {
     }
 
     /// Build the base JSON record with standard Cloud Logging fields.
-    fn base_record(severity: &str, message: &str) -> Map<String, Value> {
+    fn base_record(&self, severity: &str, message: &str) -> Map<String, Value> {
         let mut map = Map::new();
         map.insert("severity".into(), json!(severity));
         map.insert("message".into(), json!(message));
@@ -250,7 +246,7 @@ where
             .values
             .get("trace_id")
             .and_then(|v| v.as_str())
-            .map(ToString::to_string);
+            .map(std::string::ToString::to_string);
         let parent_trace = ctx
             .span(id)
             .and_then(|s| s.parent())
@@ -293,7 +289,7 @@ where
 
     fn on_event(&self, event: &Event<'_>, ctx: Context<'_, S>) {
         let metadata = event.metadata();
-        let severity = level_to_severity(*metadata.level());
+        let severity = level_to_severity(metadata.level());
 
         let mut visitor = FieldCollector::default();
         event.record(&mut visitor);
@@ -302,9 +298,12 @@ where
             .values
             .get("message")
             .and_then(|v| v.as_str())
-            .map_or_else(|| metadata.name().to_string(), ToString::to_string);
+            .map_or_else(
+                || metadata.name().to_string(),
+                std::string::ToString::to_string,
+            );
 
-        let mut record = Self::base_record(severity, &message);
+        let mut record = self.base_record(severity, &message);
         record.insert("target".into(), json!(metadata.target()));
 
         // Ancestor span fields (root→leaf), then event fields (override).
@@ -352,7 +351,7 @@ where
             let end = data.last_exit.unwrap_or_else(Instant::now);
             let elapsed_ms =
                 u64::try_from(end.duration_since(data.start).as_millis()).unwrap_or(u64::MAX);
-            record = Self::base_record(level_to_severity(data.level), data.name);
+            record = self.base_record(level_to_severity(&data.level), data.name);
             record.insert("elapsed_ms".into(), json!(elapsed_ms));
             // Close deferred well past the last poll (a lingering child): say so
             // separately instead of inflating the work's duration.
@@ -384,8 +383,8 @@ where
 // Helpers
 // ---------------------------------------------------------------------------
 
-fn level_to_severity(level: Level) -> &'static str {
-    match level {
+fn level_to_severity(level: &Level) -> &'static str {
+    match *level {
         Level::ERROR => "ERROR",
         Level::WARN => "WARNING",
         Level::INFO => "INFO",
@@ -465,8 +464,8 @@ pub fn parse_x_cloud_trace_context(header: &str) -> Option<String> {
 /// Returns the `trace_id` (32-char hex).
 pub fn parse_traceparent(header: &str) -> Option<String> {
     let parts: Vec<&str> = header.split('-').collect();
-    if let [_, trace_id, _, _, ..] = parts.as_slice() {
-        let trace_id = trace_id.trim();
+    if parts.len() >= 4 {
+        let trace_id = parts[1].trim();
         if trace_id.len() == 32 && trace_id.chars().all(|c| c.is_ascii_hexdigit()) {
             return Some(trace_id.to_lowercase());
         }

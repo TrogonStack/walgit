@@ -3,7 +3,7 @@
 # Start from walgit.standalone.toml for a first run; come here when you need a key.
 # Normative bundle-slot semantics: docs/BUNDLE_URI_DESIGN.md §4.
 # Every key can also be set from the environment: WALGIT__SECTION__KEY=value (TOML value syntax).
-# Validate with: walgit config check walgit.toml
+# Validate with: walgit --config walgit.toml config check
 
 [server]
 listen = "127.0.0.1:8080"        # default; `mode = none` is refused unless this is loopback. Public bind: 0.0.0.0 with token/oidc.
@@ -50,7 +50,7 @@ anonymous_read = true             # must be false in oidc mode
 # ]
 # admin_emails = []                # oidc: emails that may delete repos or PUT/DELETE settings and policy.json
 # admin_domains = []               # oidc: email domains that may delete repos or PUT/DELETE settings and policy.json
-# issuer = "https://id.example.com"        # oidc: discovery at <issuer>/.well-known/openid-configuration
+# issuer = "https://id.example.com"        # oidc: required, no default. Discovery at <issuer>/.well-known/openid-configuration
 # allowed_domains = ["example.com"]        # oidc: email domains admitted (email_verified required)
 # allowed_emails = []                      # oidc: individual identities admitted
 # write_domains = ["example.com"]          # oidc: omit to let every admitted identity write

@@ -11,7 +11,6 @@ pub mod upload_gix;
 pub use upload_gix::ObjectFaulter;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::fmt::Write as _;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -63,12 +62,12 @@ fn ge<E: std::error::Error + Send + Sync + 'static>(e: E) -> GitError {
     GitError::Gix(Box::new(e))
 }
 
-#[allow(
-    clippy::case_sensitive_file_extension_comparisons,
-    reason = "git reserves the exact lowercase suffix; an insensitive compare would reject names git accepts"
-)]
 /// Reject ref names that would inject `git update-ref --stdin` commands or
 /// poison packed-refs (newlines, NULs, git-illegal bytes).
+#[expect(
+    clippy::case_sensitive_file_extension_comparisons,
+    reason = "Git forbids exactly the case-sensitive .lock suffix"
+)]
 pub fn validate_ref_name(name: &str) -> Result<(), GitError> {
     if name == "HEAD" {
         return Ok(());
@@ -385,10 +384,14 @@ impl LsRefsLine {
         if (args.symrefs || self.oid == "unborn")
             && let Some(t) = &self.symref_target
         {
-            let _ = write!(s, " symref-target:{t}");
+            {
+                let _ = std::fmt::Write::write_fmt(&mut s, format_args!(" symref-target:{t}"));
+            };
         }
         if args.peel && !self.peeled.is_empty() {
-            let _ = write!(s, " peeled:{}", self.peeled);
+            {
+                let _ = std::fmt::Write::write_fmt(&mut s, format_args!(" peeled:{}", self.peeled));
+            };
         }
         s.push('\n');
         s
@@ -421,11 +424,11 @@ impl Service {
     }
 }
 
-#[allow(
-    clippy::struct_excessive_bools,
-    reason = "one field per protocol flag the client sent; the flags are independent"
-)]
 #[derive(Debug, Clone)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "Independent Git protocol capabilities and request flags"
+)]
 pub struct UploadPackRequest {
     pub wants: Vec<gix_hash::ObjectId>,
     pub haves: Vec<gix_hash::ObjectId>,
@@ -818,10 +821,13 @@ impl LocalRepo {
                     "pack exceeds max_bytes {max}"
                 )));
             }
-            tmp.write_all(buf.get(..n).unwrap_or_default())
-                .instrument(span.clone())
-                .await
-                .map_err(GitError::Io)?;
+            tmp.write_all(
+                buf.get(..n)
+                    .ok_or_else(|| std::io::Error::other("read exceeded buffer"))?,
+            )
+            .instrument(span.clone())
+            .await
+            .map_err(GitError::Io)?;
         }
         // tokio's File buffers writes in a background blocking task and does
         // NOT flush on drop: without this the tail of the pack may be missing
@@ -916,15 +922,19 @@ impl LocalRepo {
     ) -> Result<(), GitError> {
         let pack_dir = self.objects_pack_dir();
         std::fs::create_dir_all(&pack_dir).map_err(GitError::Io)?;
-        let named = |p: &Path| -> Result<PathBuf, GitError> {
-            p.file_name().map(|n| pack_dir.join(n)).ok_or_else(|| {
-                GitError::Protocol(format!("pack file has no name: {}", p.display()))
-            })
-        };
-        rename_atomic(pack, &named(pack)?)?;
-        rename_atomic(idx, &named(idx)?)?;
+        let dst_pack = pack_dir.join(pack.file_name().ok_or_else(|| {
+            GitError::InvalidInput(format!("missing filename: {}", pack.display()))
+        })?);
+        let dst_idx = pack_dir.join(idx.file_name().ok_or_else(|| {
+            GitError::InvalidInput(format!("missing filename: {}", idx.display()))
+        })?);
+        rename_atomic(pack, &dst_pack)?;
+        rename_atomic(idx, &dst_idx)?;
         for e in extra {
-            rename_atomic(e, &named(e)?)?;
+            let dst = pack_dir.join(e.file_name().ok_or_else(|| {
+                GitError::InvalidInput(format!("missing filename: {}", e.display()))
+            })?);
+            rename_atomic(e, &dst)?;
         }
         self.refresh_async().await?;
         Ok(())
@@ -986,6 +996,9 @@ impl LocalRepo {
             let ent = ent.map_err(GitError::Io)?;
             let name = ent.file_name();
             let name = name.to_string_lossy();
+            if !name.starts_with("pack-") || !name.ends_with(".pack") {
+                continue;
+            }
             let Some(hex) = name
                 .strip_prefix("pack-")
                 .and_then(|n| n.strip_suffix(".pack"))
@@ -1054,7 +1067,7 @@ impl LocalRepo {
                     // Fold the pushes applied since the last materialization: one copy of the
                     // vector for all of them, no parsing, no object reads.
                     let t = std::time::Instant::now();
-                    let patched = self.patch_snapshot(&c.data, &c.pending);
+                    let patched = self.patch_snapshot(&c.data, &c.pending)?;
                     c.data = Arc::new(patched);
                     c.pending.clear();
                     if c.data.refs.len() >= 10_000 {
@@ -1217,16 +1230,41 @@ impl LocalRepo {
             if new_zero {
                 // delete
                 if check_old && !old_zero {
-                    let _ = writeln!(input, "delete {} {}", u.name, u.old_oid);
+                    {
+                        let _ = std::fmt::Write::write_fmt(
+                            &mut input,
+                            format_args!("delete {} {}\n", u.name, u.old_oid),
+                        );
+                    };
                 } else {
-                    let _ = writeln!(input, "delete {}", u.name);
+                    {
+                        let _ = std::fmt::Write::write_fmt(
+                            &mut input,
+                            format_args!("delete {}\n", u.name),
+                        );
+                    };
                 }
             } else if check_old && old_zero {
-                let _ = writeln!(input, "create {} {}", u.name, u.new_oid);
+                {
+                    let _ = std::fmt::Write::write_fmt(
+                        &mut input,
+                        format_args!("create {} {}\n", u.name, u.new_oid),
+                    );
+                };
             } else if check_old && !old_zero {
-                let _ = writeln!(input, "update {} {} {}", u.name, u.new_oid, u.old_oid);
+                {
+                    let _ = std::fmt::Write::write_fmt(
+                        &mut input,
+                        format_args!("update {} {} {}\n", u.name, u.new_oid, u.old_oid),
+                    );
+                };
             } else {
-                let _ = writeln!(input, "update {} {}", u.name, u.new_oid);
+                {
+                    let _ = std::fmt::Write::write_fmt(
+                        &mut input,
+                        format_args!("update {} {}\n", u.name, u.new_oid),
+                    );
+                };
             }
         }
 
@@ -1245,7 +1283,7 @@ impl LocalRepo {
                         let stdin = c
                             .stdin
                             .as_mut()
-                            .ok_or_else(|| std::io::Error::other("git update-ref stdin"))?;
+                            .ok_or_else(|| std::io::Error::other("git stdin unavailable"))?;
                         stdin.write_all(input.as_bytes())?;
                     }
                     c.wait_with_output()
@@ -1310,7 +1348,7 @@ impl LocalRepo {
         &self,
         base: &RefSnapshotData,
         txns: &[walgit_proto::v1::RefTransaction],
-    ) -> RefSnapshotData {
+    ) -> Result<RefSnapshotData, GitError> {
         let mut refs = base.refs.clone();
         let mut head_target = base.head_target.clone();
         let mut repo: Option<gix::Repository> = None;
@@ -1332,13 +1370,16 @@ impl LocalRepo {
                     let mut peeled = u.new_peeled.clone();
                     if peeled.is_empty() && u.name.starts_with("refs/tags/") {
                         if repo.is_none() {
-                            repo = gix::ThreadSafeRepository::open(&self.inner.path)
-                                .ok()
-                                .map(|r| gix::Repository::from(&r));
+                            repo = Some(gix::Repository::from(
+                                &gix::ThreadSafeRepository::open(&self.inner.path).map_err(ge)?,
+                            ));
                         }
-                        if let Some(r) = repo.as_ref()
-                            && let Ok(oid) = gix_hash::ObjectId::from_hex(u.new_oid.as_bytes())
-                        {
+                        let r = repo.as_ref().ok_or_else(|| {
+                            GitError::InvalidInput(
+                                "repository unavailable while peeling tag".into(),
+                            )
+                        })?;
+                        if let Ok(oid) = gix_hash::ObjectId::from_hex(u.new_oid.as_bytes()) {
                             peeled = peel_tag(r, oid)
                                 .map(|p| p.to_hex().to_string())
                                 .unwrap_or_default();
@@ -1351,16 +1392,16 @@ impl LocalRepo {
                     };
                     match pos {
                         Ok(i) => {
-                            if let Some(slot) = refs.get_mut(i) {
-                                *slot = entry;
-                            }
+                            *refs.get_mut(i).ok_or_else(|| {
+                                GitError::InvalidInput("ref search index out of bounds".into())
+                            })? = entry;
                         }
                         Err(i) => refs.insert(i, entry),
                     }
                 }
             }
         }
-        RefSnapshotData { refs, head_target }
+        Ok(RefSnapshotData { refs, head_target })
     }
 
     /// Replace ALL refs + HEAD by writing `packed-refs` directly and removing
@@ -1374,9 +1415,17 @@ impl LocalRepo {
         let mut refs = snap.refs.clone();
         refs.sort_by(|a, b| a.name.cmp(&b.name));
         for r in &refs {
-            let _ = writeln!(content, "{} {}", r.oid, r.name);
+            {
+                let _ = std::fmt::Write::write_fmt(
+                    &mut content,
+                    format_args!("{} {}\n", r.oid, r.name),
+                );
+            };
             if !r.peeled.is_empty() {
-                let _ = writeln!(content, "^{}", r.peeled);
+                {
+                    let _ =
+                        std::fmt::Write::write_fmt(&mut content, format_args!("^{}\n", r.peeled));
+                };
             }
         }
         // Atomic write.
@@ -1494,10 +1543,18 @@ impl LocalRepo {
     ) -> Result<(), GitError> {
         use gix_object::Write as _;
         let hex = oid.to_hex().to_string();
-        let (shard, rest) = hex
-            .split_at_checked(2)
-            .ok_or_else(|| GitError::Protocol(format!("short object id {hex}")))?;
-        let path = self.inner.path.join("objects").join(shard).join(rest);
+        let path = self
+            .inner
+            .path
+            .join("objects")
+            .join(
+                hex.get(..2)
+                    .ok_or_else(|| GitError::InvalidInput("short object ID".into()))?,
+            )
+            .join(
+                hex.get(2..)
+                    .ok_or_else(|| GitError::InvalidInput("short object ID".into()))?,
+            );
         if path.exists() {
             return Ok(());
         }
@@ -1805,7 +1862,14 @@ impl LocalRepo {
             for (a, b) in ranges {
                 let a = a.max(cursor);
                 if a < b {
-                    out.extend(snap.refs.get(a..b).unwrap_or_default());
+                    out.extend(
+                        snap.refs
+                            .get(a..b)
+                            .ok_or_else(|| {
+                                GitError::InvalidInput("ref prefix range out of bounds".into())
+                            })?
+                            .iter(),
+                    );
                     cursor = b;
                 }
             }
@@ -1973,7 +2037,7 @@ impl LocalRepo {
                 }
             }
         }
-        let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+        let arg_refs: Vec<&str> = args.iter().map(std::string::String::as_str).collect();
         let out = self.git(&arg_refs).await?;
         if !out.status.success() {
             return Err(GitError::Subprocess {
@@ -2049,7 +2113,7 @@ impl LocalRepo {
             let po_stdout: Stdio = po
                 .stdout
                 .take()
-                .ok_or_else(|| GitError::Io(std::io::Error::other("git pack-objects stdout")))?
+                .ok_or_else(|| std::io::Error::other("git stdout unavailable"))?
                 .try_into()
                 .map_err(GitError::Io)?;
             let ip = tokio::process::Command::new("git")
@@ -2074,7 +2138,7 @@ impl LocalRepo {
                 let mut stdin = po
                     .stdin
                     .take()
-                    .ok_or_else(|| GitError::Io(std::io::Error::other("git pack-objects stdin")))?;
+                    .ok_or_else(|| std::io::Error::other("git stdin unavailable"))?;
                 stdin
                     .write_all(revs.as_bytes())
                     .await
@@ -2208,15 +2272,11 @@ impl LocalRepo {
                 }
             }
         }
-        let Some(preferred) = names.first().cloned() else {
-            let _ = std::fs::remove_file(&midx);
-            return Ok(());
-        };
-        let mut input = String::new();
-        for n in &names {
-            input.push_str(n);
-            input.push('\n');
-        }
+        let preferred = names
+            .first()
+            .ok_or_else(|| GitError::InvalidInput("no pack names".into()))?
+            .clone();
+        let input = format!("{}\n", names.join("\n"));
         let out = std::process::Command::new("git")
             .current_dir(&self.inner.path)
             .env("GIT_DIR", &self.inner.path)
@@ -2233,7 +2293,7 @@ impl LocalRepo {
             .and_then(|mut c| {
                 c.stdin
                     .take()
-                    .ok_or_else(|| std::io::Error::other("git multi-pack-index stdin"))?
+                    .ok_or_else(|| std::io::Error::other("git stdin unavailable"))?
                     .write_all(input.as_bytes())?;
                 c.wait_with_output()
             })
@@ -2371,7 +2431,12 @@ impl LocalRepo {
         }
         let mut input = String::new();
         for p in packs {
-            let _ = writeln!(input, "pack-{}.idx", p.to_hex());
+            {
+                let _ = std::fmt::Write::write_fmt(
+                    &mut input,
+                    format_args!("pack-{}.idx\n", p.to_hex()),
+                );
+            };
         }
         let mut args = vec!["write", "--split", "--stdin-packs"];
         if changed_paths {
@@ -2539,7 +2604,7 @@ impl LocalRepo {
         stdin_bytes: &[u8],
     ) -> Result<std::process::Output, GitError> {
         let path = self.inner.path.clone();
-        let args: Vec<String> = args.iter().map(ToString::to_string).collect();
+        let args: Vec<String> = args.iter().map(std::string::ToString::to_string).collect();
         let stdin_bytes: Vec<u8> = stdin_bytes.to_vec();
         let cmd_name = cmd_name.to_string();
         let res = tokio::task::spawn_blocking(move || {
@@ -2558,7 +2623,7 @@ impl LocalRepo {
                 let stdin = child
                     .stdin
                     .as_mut()
-                    .ok_or_else(|| GitError::Io(std::io::Error::other("git stdin")))?;
+                    .ok_or_else(|| std::io::Error::other("git stdin unavailable"))?;
                 stdin.write_all(&stdin_bytes).map_err(GitError::Io)?;
             }
             child.wait_with_output().map_err(GitError::Io)
@@ -2601,11 +2666,11 @@ impl LocalRepo {
         let mut stdin = child
             .stdin
             .take()
-            .ok_or_else(|| GitError::Io(std::io::Error::other("git upload-pack stdin")))?;
+            .ok_or_else(|| std::io::Error::other("git stdin unavailable"))?;
         let mut stdout = child
             .stdout
             .take()
-            .ok_or_else(|| GitError::Io(std::io::Error::other("git upload-pack stdout")))?;
+            .ok_or_else(|| std::io::Error::other("git stdout unavailable"))?;
         // Copy the request body into stdin first, then close stdin so the
         // subprocess sees EOF and can finish + exit. Only then drain stdout:
         // `copy_out` blocks on stdout EOF (subprocess exit), and the subprocess
@@ -2698,11 +2763,9 @@ fn idx_object_count(idx_path: &Path) -> Result<u64, GitError> {
     let mut head = [0u8; 8];
     f.read_exact(&mut head).map_err(GitError::Io)?;
     let is_v2 = &head[..4] == b"\xfftOc";
-    let fanout_off = if is_v2 { 8 + 255 * 4 } else { 255 * 4 };
-    f.seek(std::io::SeekFrom::Start(
-        u64::try_from(fanout_off).unwrap_or(0),
-    ))
-    .map_err(GitError::Io)?;
+    let fanout_off: u64 = if is_v2 { 8 + 255 * 4 } else { 255 * 4 };
+    f.seek(std::io::SeekFrom::Start(fanout_off))
+        .map_err(GitError::Io)?;
     let mut buf = [0u8; 4];
     f.read_exact(&mut buf).map_err(GitError::Io)?;
     Ok(u64::from(u32::from_be_bytes(buf)))
@@ -2843,10 +2906,10 @@ struct Trace2Phases {
     regions: Vec<(String, u64)>,
 }
 
-#[allow(
+#[expect(
     clippy::cast_possible_truncation,
     clippy::cast_sign_loss,
-    reason = "the saturating float-to-int cast is the intended rounding"
+    reason = "Trace display milliseconds intentionally round up and saturate float-to-int conversion"
 )]
 fn secs_to_ms(t: f64) -> u64 {
     let ms = (t * 1000.0).ceil() as u64;
@@ -2955,10 +3018,6 @@ fn find_conflict(stderr: &str) -> Option<String> {
     None
 }
 
-#[allow(
-    clippy::unnecessary_wraps,
-    reason = "reading refs is fallible in principle; the Result is the contract callers already handle"
-)]
 pub(crate) fn read_refs(repo_path: &Path) -> Result<RefSnapshotData, GitError> {
     // HEAD symbolic target.
     let head_target = match std::fs::read_to_string(repo_path.join("HEAD")) {
@@ -2971,7 +3030,8 @@ pub(crate) fn read_refs(repo_path: &Path) -> Result<RefSnapshotData, GitError> {
                 String::new()
             }
         }
-        Err(_) => String::new(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(e.into()),
     };
 
     let mut map: BTreeMap<String, (String, String)> = BTreeMap::new();
@@ -3189,7 +3249,7 @@ fn locate_pack_offset(path: &Path) -> Option<u64> {
         if n == 0 {
             return None;
         }
-        if let Some(i) = find_subsequence(buf.get(..n).unwrap_or_default(), b"PACK") {
+        if let Some(i) = find_subsequence(buf.get(..n)?, b"PACK") {
             return Some(pos + i as u64);
         }
         // Seek back a little to handle boundary splits.
@@ -3541,16 +3601,14 @@ pub(crate) fn compute_shallow(
 }
 
 /// Compute the SHA checksum trailer for a pack header (used for empty packs).
-#[allow(
-    clippy::expect_used,
-    reason = "a wrong trailer is worse than a panic, and the hasher cannot fail here"
-)]
-pub(crate) fn compute_pack_trailer(data: &[u8], kind: gix_hash::Kind) -> gix_hash::ObjectId {
+pub(crate) fn compute_pack_trailer(
+    data: &[u8],
+    kind: gix_hash::Kind,
+) -> Result<gix_hash::ObjectId, GitError> {
     use gix_hash::hasher;
     let mut h = hasher(kind);
     h.update(data);
-    // try_finalize always succeeds when the hasher has been fed data.
-    h.try_finalize().expect("hash finalization must succeed")
+    h.try_finalize().map_err(ge)
 }
 
 /// The hash git names a split commit-graph layer by: the file's trailing
@@ -3571,9 +3629,9 @@ fn commit_graph_layer_hash(path: &Path) -> Result<String, GitError> {
             path.display()
         )));
     }
-    Ok(hex::encode(
-        data.get(data.len() - len..).unwrap_or_default(),
-    ))
+    Ok(hex::encode(data.get(data.len() - len..).ok_or_else(
+        || GitError::InvalidInput("truncated graph checksum".into()),
+    )?))
 }
 
 /// Derive a pack's reverse index (`.rev`, RIDX v1) from its `.idx`: header
@@ -3593,8 +3651,8 @@ pub fn write_rev_from_idx(
     let n = index.num_objects();
     let mut by_offset: Vec<(u64, u32)> = index
         .iter()
-        .enumerate()
-        .map(|(i, e)| (e.pack_offset, u32::try_from(i).unwrap_or(u32::MAX)))
+        .zip(0..n)
+        .map(|(e, i)| (e.pack_offset, i))
         .collect();
     by_offset.sort_unstable();
     let mut out = Vec::with_capacity(12 + 4 * n as usize + 2 * kind.len_in_bytes());
@@ -3688,7 +3746,7 @@ mod index_pack_trace_tests {
                 .unwrap();
             {
                 use std::io::Write;
-                let mut stdin = child.stdin.take().unwrap();
+                let mut stdin = child.stdin.take().expect("piped stdin");
                 stdin.write_all(b"HEAD\n").unwrap();
             }
             let out = child.wait_with_output().unwrap();
