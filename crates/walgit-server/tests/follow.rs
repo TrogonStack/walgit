@@ -3,17 +3,6 @@
 //! same PUSH entry a push produces — fast-forward only. The upstream here is a
 //! second walgit instance (smart HTTP v2 over 127.0.0.1, real `git fetch`).
 
-#![allow(
-    clippy::unwrap_used,
-    clippy::expect_used,
-    clippy::panic,
-    clippy::indexing_slicing,
-    clippy::many_single_char_names
-)]
-// clippy.toml exempts #[test] functions from the panic-path lints, but not the plain
-// helper functions beside them in the same file. A panic in a fixture builder is how
-// that fixture reports it could not be built, exactly as in the tests it serves.
-
 mod harness;
 
 use harness::{Server, git, git_in};

@@ -34,7 +34,7 @@ pub async fn run(cfg: &Arc<Config>) -> Result<()> {
     std::fs::create_dir_all(&cfg.cache.dir).ok();
 
     // AppState::new constructs the registry, bundler, auth, semaphores, metrics.
-    let state = AppState::new(cfg, store)?;
+    let state = AppState::new(cfg.clone(), store).await?;
 
     // Spawn background loops for non-serving roles.
     let mut bg_handles = Vec::new();
@@ -73,22 +73,18 @@ pub async fn run(cfg: &Arc<Config>) -> Result<()> {
     let shutdown = async {
         #[cfg(unix)]
         {
-            if let (Ok(mut sigterm), Ok(mut sigint)) = (
-                signal::unix::signal(signal::unix::SignalKind::terminate()),
-                signal::unix::signal(signal::unix::SignalKind::interrupt()),
-            ) {
-                tokio::select! {
-                    _ = sigterm.recv() => info!("received SIGTERM, shutting down"),
-                    _ = sigint.recv() => info!("received SIGINT, shutting down"),
-                }
-            } else {
-                let _ = signal::ctrl_c().await;
-                info!("received Ctrl-C, shutting down");
+            let mut sigterm = signal::unix::signal(signal::unix::SignalKind::terminate())
+                .expect("install SIGTERM handler");
+            let mut sigint = signal::unix::signal(signal::unix::SignalKind::interrupt())
+                .expect("install SIGINT handler");
+            tokio::select! {
+                _ = sigterm.recv() => info!("received SIGTERM, shutting down"),
+                _ = sigint.recv() => info!("received SIGINT, shutting down"),
             }
         }
         #[cfg(not(unix))]
         {
-            let _ = signal::ctrl_c().await;
+            signal::ctrl_c().await.expect("ctrl_c");
             info!("received Ctrl-C, shutting down");
         }
     };

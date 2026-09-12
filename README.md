@@ -141,7 +141,7 @@ each repository one maintainer (placement globs) and you are done.
 
 | mode | who gets in | how git authenticates |
 |---|---|---|
-| `none` | everyone is `anon` with write — loopback experiments | nothing |
+| `none` | everyone is `anon` with write and admin — loopback experiments | nothing |
 | `token` | static `tokens` in the config (`token_env` reads the secret from the environment) | `Authorization: Bearer <token>`, or the token as an HTTP Basic password |
 | `oidc` | any OpenID Connect issuer (`issuer`, `oauth_client_id/secret`, `allowed_domains`/`allowed_emails`): Google, Entra, Okta, Auth0, Keycloak, Dex, GitLab… | a **walgit access token**: sign in once in the browser, create one at `/_auth/tokens`, paste it into the installer. Stateless (HMAC with `session_secret`, `access_token_ttl`); rotating the secret revokes all. ID tokens from the issuer (`audiences`) and static `tokens` work too. |
 
@@ -156,7 +156,8 @@ and turns on `transfer.bundleURI`. `?repo=owner/name` clones right after.
 just test          # fast hermetic tier (< 1 min): unit + quick integration, in-memory store, real git
 just e2e           # real git against the server (~20 s)
 just warnings      # zero rustc warnings across all targets
-just ci            # all of the above
+just clippy        # the [workspace.lints] set across all targets, warnings are errors
+just ci            # warnings, clippy, test, e2e: everything that must be green before a merge
 cargo test -p walgit-server --test sim     # fault-injection simulation (crashes, partitions, stale reads)
 just test-s3       # store contract against local rustfs
 ```

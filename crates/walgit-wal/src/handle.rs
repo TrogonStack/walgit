@@ -128,9 +128,9 @@ impl ObjectAccess {
 }
 
 impl RepoHandle {
-    #[allow(
+    #[expect(
         clippy::too_many_arguments,
-        reason = "constructor arguments; a builder here would add a layer without removing one"
+        reason = "Repository construction combines the shared services and loaded WAL state"
     )]
     pub(crate) fn new(
         id: RepoId,
@@ -736,7 +736,7 @@ impl RepoHandle {
         }
         let mount = self.mount_dir();
         if mount.is_none()
-            && let Some(store_mount) = self.cfg.cache.store_mount.as_ref()
+            && let Some(store_mount) = &self.cfg.cache.store_mount
         {
             tracing::warn!(repo = %self.id, mount = %store_mount.display(), "store mount configured but the repository directory is not visible in it (gcsfuse not up yet?): base packs served remotely until it is");
         }
@@ -822,7 +822,7 @@ impl RepoHandle {
                 let before = self.state.lock().applied_seq;
                 crate::sync::apply_delta(self, &manifest, &meta_version).await?;
                 span.record("entries_applied", manifest.head_seq.saturating_sub(before));
-                *self.manifest.write() = Arc::new(manifest);
+                *self.manifest.write() = manifest;
                 *self.manifest_version.lock() = Some(meta_version);
                 self.update_freshness();
             }
@@ -983,6 +983,7 @@ impl RepoHandle {
         synced: bool,
         created_at: Option<prost_types::Timestamp>,
     ) -> Result<PublishResult, WalError> {
+        let sender = self.get_or_init_publisher()?;
         self.publish_waiters.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = tokio::sync::oneshot::channel();
         let request = PublishRequest {
@@ -994,7 +995,6 @@ impl RepoHandle {
             response: tx,
         };
 
-        let sender = self.get_or_init_publisher();
         if sender.send(request).is_err() {
             self.publish_waiters.fetch_sub(1, Ordering::Relaxed);
             return Err(WalError::Corrupt("publisher channel closed".into()));
@@ -1220,8 +1220,10 @@ impl RepoHandle {
     /// Read the checkpoint object's times when the manifest ref has none
     /// (one 240-byte GET per checkpoint per process; no-op otherwise).
     pub(crate) async fn learn_checkpoint_times(&self) -> Result<(), WalError> {
-        use prost::Message;
         use walgit_store::ObjectStoreExt;
+
+        use prost::Message;
+
         let m = self.manifest();
         let Some(cp) = m.checkpoint.as_ref() else {
             return Ok(());
@@ -1231,6 +1233,7 @@ impl RepoHandle {
         {
             return Ok(());
         }
+
         if let Some((_, bytes)) = self.store.get_bytes(&cp.key).await? {
             let cpo = walgit_proto::v1::Checkpoint::decode(bytes.as_ref())
                 .map_err(|e| WalError::Corrupt(format!("checkpoint decode: {e}")))?;
@@ -1285,18 +1288,14 @@ impl RepoHandle {
         *self.last_freshness.lock() = Some(Instant::now());
     }
 
-    #[allow(
-        clippy::expect_used,
-        reason = "self_arc is set by RepoHandle::new; a silent no-publisher sender would break every push instead"
-    )]
-    fn get_or_init_publisher(&self) -> mpsc::UnboundedSender<PublishRequest> {
+    fn get_or_init_publisher(&self) -> Result<mpsc::UnboundedSender<PublishRequest>, WalError> {
         let mut guard = self.publish_tx.lock();
         if let Some(tx) = &*guard {
             // A publisher task that died (panic mid-batch) leaves a sender to
             // a dropped receiver; respawn instead of failing every push on
             // this instance forever.
             if !tx.is_closed() {
-                return tx.clone();
+                return Ok(tx.clone());
             }
             tracing::warn!(repo = %self.id, "publisher task is gone; respawning");
         }
@@ -1304,10 +1303,12 @@ impl RepoHandle {
         let arc = self
             .self_arc
             .get()
-            .expect("self_arc must be set before publish")
+            .ok_or_else(|| {
+                WalError::Corrupt("publisher repository reference not initialized".into())
+            })?
             .clone();
         tokio::spawn(crate::publish::publisher_task(arc, rx));
         *guard = Some(tx.clone());
-        tx
+        Ok(tx)
     }
 }

@@ -240,10 +240,6 @@ pub async fn sdk_asset(req: Request<Body>) -> Response {
     }
 }
 
-#[allow(
-    clippy::case_sensitive_file_extension_comparisons,
-    reason = "the build writes these asset names itself, always lowercase"
-)]
 /// `GET|HEAD /_ui/{path}` — embedded build output.
 ///
 /// * `assets/*` carry a content hash in their name → `immutable` for a year.
@@ -291,9 +287,7 @@ fn embedded_response(
     let mut resp = Response::new(Body::empty());
     {
         let h = resp.headers_mut();
-        if let Ok(v) = HeaderValue::from_str(&etag) {
-            h.insert(header::ETAG, v);
-        }
+        h.insert(header::ETAG, HeaderValue::from_str(&etag).unwrap());
         h.insert(header::CACHE_CONTROL, HeaderValue::from_static(cache));
         h.insert(header::VARY, HeaderValue::from_static("Accept-Encoding"));
         h.insert(
@@ -582,11 +576,7 @@ async fn overview(
     AxumPath((owner, repo)): AxumPath<(String, String)>,
     headers: HeaderMap,
 ) -> Result<Response, ApiError> {
-    state
-        .auth
-        .require_read(&headers)
-        .await
-        .map_err(ApiError::from)?;
+    state.auth.require_read(&headers).await.map_err(auth_err)?;
     let id =
         walgit_git::RepoId::new(&owner, &repo).map_err(|e| ApiError::NotFound(e.to_string()))?;
     let handle = state.registry.open(&id).await.map_err(wal_err)?;
@@ -1055,11 +1045,7 @@ async fn ops_list(
     AxumPath((owner, repo)): AxumPath<(String, String)>,
     headers: HeaderMap,
 ) -> Result<Response, ApiError> {
-    state
-        .auth
-        .require_read(&headers)
-        .await
-        .map_err(ApiError::from)?;
+    state.auth.require_read(&headers).await.map_err(auth_err)?;
     let id =
         walgit_git::RepoId::new(&owner, &repo).map_err(|e| ApiError::NotFound(e.to_string()))?;
     let body = OpsInfo {
@@ -1094,11 +1080,7 @@ async fn ops_start(
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
     headers: HeaderMap,
 ) -> Result<Response, ApiError> {
-    let principal = state
-        .auth
-        .require_write(&headers)
-        .await
-        .map_err(ApiError::from)?;
+    let principal = state.auth.require_write(&headers).await.map_err(auth_err)?;
     let id =
         walgit_git::RepoId::new(&owner, &repo).map_err(|e| ApiError::NotFound(e.to_string()))?;
     // Make sure the repo exists before spawning anything.
@@ -1122,11 +1104,7 @@ async fn tasks_list(
     AxumPath((owner, repo)): AxumPath<(String, String)>,
     headers: HeaderMap,
 ) -> Result<Response, ApiError> {
-    state
-        .auth
-        .require_read(&headers)
-        .await
-        .map_err(ApiError::from)?;
+    state.auth.require_read(&headers).await.map_err(auth_err)?;
     let id =
         walgit_git::RepoId::new(&owner, &repo).map_err(|e| ApiError::NotFound(e.to_string()))?;
     let tasks = state.registry.tasks();
@@ -1153,11 +1131,7 @@ async fn task_stream(
     AxumPath((owner, repo, task_id)): AxumPath<(String, String, String)>,
     headers: HeaderMap,
 ) -> Result<Response, ApiError> {
-    state
-        .auth
-        .require_read(&headers)
-        .await
-        .map_err(ApiError::from)?;
+    state.auth.require_read(&headers).await.map_err(auth_err)?;
     let id =
         walgit_git::RepoId::new(&owner, &repo).map_err(|e| ApiError::NotFound(e.to_string()))?;
     let task = state
@@ -1193,10 +1167,9 @@ async fn checkpoint_info(
         .await
     {
         Ok(GetResult::Object { meta, body }) => {
-            let bytes =
-                walgit_store::util::collect(body, usize::try_from(meta.size).unwrap_or(usize::MAX))
-                    .await
-                    .map_err(|e| ApiError::Internal(e.to_string()))?;
+            let bytes = walgit_store::util::collect(body, meta.size as usize)
+                .await
+                .map_err(|e| ApiError::Internal(e.to_string()))?;
             let checkpoint = Checkpoint::decode(bytes.as_ref())
                 .map_err(|e| ApiError::Internal(e.to_string()))?;
             (
@@ -1288,12 +1261,9 @@ async fn bundle_infos(
 }
 
 fn timestamp(value: &prost_types::Timestamp) -> String {
-    chrono::DateTime::<chrono::Utc>::from_timestamp(
-        value.seconds,
-        u32::try_from(value.nanos).unwrap_or(0),
-    )
-    .map(|date| date.to_rfc3339())
-    .unwrap_or_default()
+    chrono::DateTime::<chrono::Utc>::from_timestamp(value.seconds, value.nanos as u32)
+        .map(|date| date.to_rfc3339())
+        .unwrap_or_default()
 }
 
 async fn repo_size(path: &Path) -> u64 {
@@ -1325,5 +1295,17 @@ fn wal_err(error: walgit_wal::WalError) -> ApiError {
     match error {
         walgit_wal::WalError::NotFound => ApiError::NotFound("repository not found".into()),
         other => ApiError::Internal(format!("wal: {other}")),
+    }
+}
+
+fn auth_err(error: crate::auth::AuthError) -> ApiError {
+    match error {
+        crate::auth::AuthError::Invalid | crate::auth::AuthError::Unauthorized => {
+            ApiError::Unauthorized
+        }
+        crate::auth::AuthError::Forbidden => ApiError::Forbidden,
+        crate::auth::AuthError::Unavailable => {
+            ApiError::ServiceUnavailable("auth provider unavailable".into())
+        }
     }
 }

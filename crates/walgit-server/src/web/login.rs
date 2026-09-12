@@ -11,7 +11,6 @@
 //! to paste into the credential helper; `GET` renders the small page that does it.
 //! Tokens are stateless — rotating `session_secret` revokes them all.
 
-use std::fmt::Write as _;
 use std::sync::Arc;
 
 use axum::{
@@ -128,7 +127,7 @@ fn urlencode(s: &str) -> String {
                 out.push(b as char);
             }
             _ => {
-                let _ = write!(out, "%{b:02X}");
+                let _ = std::fmt::Write::write_fmt(&mut out, format_args!("%{b:02X}"));
             }
         }
     }
@@ -156,13 +155,7 @@ async fn login(
         )
             .into_response();
     };
-    let Some((client_id, _)) = st.auth.oauth_client() else {
-        return (
-            StatusCode::NOT_IMPLEMENTED,
-            "OAuth client is not configured",
-        )
-            .into_response();
-    };
+    let (client_id, _) = st.auth.oauth_client().unwrap();
     let next = safe_next(q.next);
     let nonce: u64 = rand::random();
     let payload = format!("{}\n{nonce:x}\n{next}", now() + STATE_TTL_SECS);
@@ -184,7 +177,9 @@ async fn login(
     );
     // Google honours `hd` as a domain hint on its account chooser; other issuers ignore it.
     if let Some(hd) = st.cfg.server.auth.allowed_domains.first() {
-        let _ = write!(url, "&hd={}", urlencode(hd));
+        {
+            let _ = std::fmt::Write::write_fmt(&mut url, format_args!("&hd={}", urlencode(hd)));
+        };
     }
     let mut r = Redirect::to(&url).into_response();
     r.headers_mut()
@@ -192,10 +187,6 @@ async fn login(
     r
 }
 
-#[allow(
-    clippy::expect_used,
-    reason = "the client builds unless the TLS backend is unavailable, and then the process cannot serve at all"
-)]
 async fn exchange_code(
     token_endpoint: &str,
     form: &[(&str, &str); 5],
@@ -205,24 +196,19 @@ async fn exchange_code(
         .timeout(std::time::Duration::from_secs(15))
         .build()
         .expect("reqwest client");
-    let mut attempt = 1u8;
-    loop {
+    let mut last = None;
+    for attempt in 1u8..=2 {
         match client.post(token_endpoint).form(form).send().await {
             Ok(r) => return Ok(r),
             Err(e) if attempt < 2 && (e.is_connect() || e.is_timeout()) => {
                 tracing::warn!(attempt, error = %e, "oauth token exchange retrying");
-                attempt += 1;
+                last = Some(e);
                 tokio::time::sleep(std::time::Duration::from_millis(200)).await;
             }
             Err(e) => return Err(e),
         }
     }
-}
-
-fn set_session_cookie(r: &mut Response, cookie: &str) {
-    if let Ok(v) = HeaderValue::from_str(cookie) {
-        r.headers_mut().insert(header::SET_COOKIE, v);
-    }
+    Err(last.expect("retry left an error"))
 }
 
 #[derive(serde::Deserialize)]
@@ -320,7 +306,8 @@ async fn callback(
     // Public origin: the callback ran there; the cookie is already right — go to `next`.
     if !loopback_origin(&st, &headers) {
         let mut r = Redirect::to(&next).into_response();
-        set_session_cookie(&mut r, &cookie);
+        r.headers_mut()
+            .insert(header::SET_COOKIE, HeaderValue::from_str(&cookie).unwrap());
         r.headers_mut()
             .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
         return r;
@@ -338,7 +325,8 @@ async fn callback(
         None => next.clone(),
     };
     let mut r = Redirect::to(&dest).into_response();
-    set_session_cookie(&mut r, &cookie);
+    r.headers_mut()
+        .insert(header::SET_COOKIE, HeaderValue::from_str(&cookie).unwrap());
     r.headers_mut()
         .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
     r
@@ -371,7 +359,8 @@ async fn claimed(
     }
     let cookie = session_set_cookie(&st, &headers, value);
     let mut r = Redirect::to(&next).into_response();
-    set_session_cookie(&mut r, &cookie);
+    r.headers_mut()
+        .insert(header::SET_COOKIE, HeaderValue::from_str(&cookie).unwrap());
     r.headers_mut()
         .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
     r
@@ -384,7 +373,8 @@ async fn logout(State(st): State<Arc<AppState>>, headers: HeaderMap) -> Response
         cookie_site(&st, secure)
     );
     let mut r = Redirect::to("/").into_response();
-    set_session_cookie(&mut r, &cookie);
+    r.headers_mut()
+        .insert(header::SET_COOKIE, HeaderValue::from_str(&cookie).unwrap());
     r
 }
 

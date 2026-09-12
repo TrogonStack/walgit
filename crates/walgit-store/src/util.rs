@@ -1,6 +1,5 @@
 use bytes::{Bytes, BytesMut};
 use futures::StreamExt;
-use std::fmt::Write as _;
 
 use crate::{ByteStream, Result, StoreError};
 
@@ -10,15 +9,15 @@ pub async fn collect(mut body: ByteStream, size_hint: usize) -> Result<Bytes> {
     let mut buf: Option<BytesMut> = None;
     while let Some(chunk) = body.next().await {
         let chunk = chunk?;
-        if let Some(b) = &mut buf {
-            b.extend_from_slice(&chunk);
-        } else if let Some(f) = first.take() {
-            let mut b = BytesMut::with_capacity(size_hint.max(f.len() + chunk.len()));
-            b.extend_from_slice(&f);
-            b.extend_from_slice(&chunk);
-            buf = Some(b);
-        } else {
-            first = Some(chunk);
+        match (&mut first, &mut buf) {
+            (None, None) => first = Some(chunk),
+            (Some(f), None) => {
+                let mut b = BytesMut::with_capacity(size_hint.max(f.len() + chunk.len()));
+                b.extend_from_slice(f);
+                b.extend_from_slice(&chunk);
+                buf = Some(b);
+            }
+            (_, Some(b)) => b.extend_from_slice(&chunk),
         }
     }
     Ok(match (first, buf) {
@@ -39,6 +38,8 @@ pub fn file_stream(
     range: Option<std::ops::Range<u64>>,
     chunk: usize,
 ) -> ByteStream {
+    use tokio::io::{AsyncReadExt, AsyncSeekExt};
+
     fn async_stream_file(
         path: std::path::PathBuf,
         range: Option<std::ops::Range<u64>>,
@@ -82,7 +83,7 @@ pub fn file_stream(
         if remaining == 0 {
             return None;
         }
-        let want = usize::try_from((chunk as u64).min(remaining)).unwrap_or(usize::MAX);
+        let want = chunk.min(usize::try_from(remaining).unwrap_or(usize::MAX));
         let mut buf = BytesMut::with_capacity(want);
         // read_buf reads at most capacity; loop until we get `want` or EOF.
         while buf.len() < want {
@@ -118,7 +119,6 @@ pub fn file_stream(
         },
         Done,
     }
-    use tokio::io::{AsyncReadExt, AsyncSeekExt};
     async_stream_file(path, range, chunk)
         .map(|r| r.map_err(StoreError::other))
         .boxed()
@@ -166,6 +166,10 @@ where
 /// compose natively (S3 does its own multipart PUT) or the file is small. Part objects live under `<key>.part/NNNN`
 /// and are deleted afterwards (best effort). `opts.mode` applies to the final
 /// object only; a `Create` precondition failure surfaces as such.
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "Transfer throughput is approximate telemetry"
+)]
 pub async fn put_file_parallel(
     store: &dyn crate::ObjectStore,
     key: &str,
@@ -270,7 +274,7 @@ pub fn encode_path(key: &str) -> String {
                 out.push(b as char);
             }
             _ => {
-                let _ = write!(out, "%{b:02X}");
+                let _ = std::fmt::Write::write_fmt(&mut out, format_args!("%{b:02X}"));
             }
         }
     }

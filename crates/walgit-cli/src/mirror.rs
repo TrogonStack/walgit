@@ -343,7 +343,7 @@ impl Mirror {
             };
             results.insert(name.to_string(), outcome);
         }
-        if !out.status.success() && results.values().all(Result::is_ok) {
+        if !out.status.success() && results.values().all(std::result::Result::is_ok) {
             // Failed before any ref status (auth, connection, pack-objects): git said why on stderr.
             self.token.invalidate();
             bail!(
@@ -505,10 +505,11 @@ async fn gce_identity_token(audience: &str) -> Result<String> {
 
 /// `https://git.example.com/acme/monorepo.git` → `https://git.example.com` (the token audience).
 fn origin_of(url: &str) -> String {
-    match url.split_once("://") {
-        Some((scheme, rest)) => {
-            let host = rest.split('/').next().unwrap_or(rest);
-            format!("{scheme}://{host}")
+    match url.find("://") {
+        Some(i) => {
+            let rest = &url[i + 3..];
+            let end = rest.find('/').unwrap_or(rest.len());
+            url[..i + 3 + end].to_string()
         }
         None => url.to_string(),
     }

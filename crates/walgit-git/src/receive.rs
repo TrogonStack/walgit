@@ -16,12 +16,12 @@ use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use crate::pkt::{self, PktLine};
 use crate::{GitError, RefSnapshotData};
 
-#[allow(
-    clippy::struct_excessive_bools,
-    reason = "one field per capability the client advertised; the protocol defines them independently"
-)]
 /// Capabilities negotiated by the client in the first receive-pack command.
 #[derive(Debug, Default, Clone)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "Git capabilities are independent protocol flags"
+)]
 pub struct ReceiveCaps {
     pub report_status: bool,
     pub report_status_v2: bool,
@@ -67,10 +67,8 @@ impl<R: AsyncRead + Unpin> AsyncRead for PrefixedReader<R> {
         let this = self.get_mut();
         if !this.prefix.is_empty() {
             let n = this.prefix.len().min(buf.remaining());
-            for _ in 0..n {
-                if let Some(b) = this.prefix.pop_front() {
-                    buf.put_slice(&[b]);
-                }
+            for byte in this.prefix.drain(..n) {
+                buf.put_slice(&[byte]);
             }
             return std::task::Poll::Ready(Ok(()));
         }
@@ -105,9 +103,14 @@ pub async fn parse<R: AsyncRead + Unpin>(
     let first = loop {
         match pkt::read_pkt_line(&mut r).await? {
             Some(PktLine::Data(b)) if b.starts_with(b"shallow ") => {
-                let oid = b.get(8..).unwrap_or_default();
-                caps.shallow
-                    .push(String::from_utf8_lossy(oid).trim().to_string());
+                caps.shallow.push(
+                    String::from_utf8_lossy(
+                        b.strip_prefix(b"shallow ")
+                            .ok_or_else(|| GitError::Protocol("missing shallow prefix".into()))?,
+                    )
+                    .trim()
+                    .to_string(),
+                );
             }
             other => break other,
         }
@@ -143,9 +146,14 @@ pub async fn parse<R: AsyncRead + Unpin>(
         match line {
             None | Some(PktLine::Flush | PktLine::Delim | PktLine::ResponseEnd) => break,
             Some(PktLine::Data(b)) if b.starts_with(b"shallow ") => {
-                let oid = b.get(8..).unwrap_or_default();
-                caps.shallow
-                    .push(String::from_utf8_lossy(oid).trim().to_string());
+                caps.shallow.push(
+                    String::from_utf8_lossy(
+                        b.strip_prefix(b"shallow ")
+                            .ok_or_else(|| GitError::Protocol("missing shallow prefix".into()))?,
+                    )
+                    .trim()
+                    .to_string(),
+                );
             }
             Some(PktLine::Data(b)) => {
                 let (update, _) = parse_command_line(&b)?;
@@ -181,11 +189,9 @@ pub async fn parse<R: AsyncRead + Unpin>(
 
 fn parse_command_line(b: &[u8]) -> Result<(walgit_proto::v1::RefUpdate, String), GitError> {
     // First line: "<old> <new> <ref>\0<caps>". Subsequent lines have no caps.
-    let (cmd_bytes, caps_bytes) = b
-        .iter()
-        .position(|&c| c == 0)
-        .and_then(|idx| Some((b.get(..idx)?, b.get(idx + 1..)?)))
-        .unwrap_or((b, &[]));
+    let mut sections = b.splitn(2, |&c| c == 0);
+    let cmd_bytes = sections.next().unwrap_or_default();
+    let caps_bytes = sections.next().unwrap_or_default();
     let s = String::from_utf8_lossy(cmd_bytes);
     let s = s.trim_end_matches('\n');
     let mut parts = s.splitn(3, ' ');
@@ -223,11 +229,11 @@ fn apply_caps(caps: &mut ReceiveCaps, s: &str) {
             "quiet" => caps.quiet = true,
             "push-options" => caps.push_options = true,
             "ofs-delta" => caps.ofs_delta = true,
-            _ if let Some(v) = tok.strip_prefix("agent=") => caps.agent = Some(v.to_string()),
-            _ if let Some(v) = tok.strip_prefix("object-format=") => {
-                caps.object_format = Some(v.to_string());
-            }
-            _ => {}
+            _ => match tok.split_once('=') {
+                Some(("agent", value)) => caps.agent = Some(value.to_string()),
+                Some(("object-format", value)) => caps.object_format = Some(value.to_string()),
+                _ => {}
+            },
         }
     }
 }

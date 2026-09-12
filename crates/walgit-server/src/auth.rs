@@ -11,9 +11,9 @@
 //!      signed-in browser): HMAC-signed, stateless, the shape git and scripts
 //!      use; also accepted as a Basic password;
 //!   3. the **session cookie** set by the browser sign-in (`web/login.rs`).
-//!      Static `tokens` are honoured in this mode too (robots, CI).
-//!      Every path ends in the same allowlist: `allowed_domains` / `allowed_emails`,
-//!      `write_domains`.
+//!   Static `tokens` are honoured in this mode too (robots, CI).
+//!   Every path ends in the same allowlist: `allowed_domains` / `allowed_emails`,
+//!   `write_domains`.
 //!
 //! An edge in front of walgit may take the client's `Authorization` for its own
 //! hop credential; it then announces `client-authorization` in
@@ -586,7 +586,7 @@ impl Authenticator {
     /// Principal from a valid, unexpired session cookie (policy re-applied).
     fn authenticate_cookie(&self, headers: &HeaderMap) -> Option<Principal> {
         let (_, _, email) = self.session_claims(headers)?;
-        self.principal_for_email(&email).ok()
+        self.principal_for_email(email).ok()
     }
 
     /// Sliding sessions: a fresh cookie value when the request carries a valid
@@ -597,7 +597,7 @@ impl Authenticator {
         if unix_now()?.saturating_sub(iat) < self.session_ttl.as_secs() / 4 {
             return None;
         }
-        let principal = self.principal_for_email(&email).ok()?;
+        let principal = self.principal_for_email(email).ok()?;
         self.session_cookie_value(&principal.name)
     }
 
@@ -660,7 +660,7 @@ impl Authenticator {
         }
         if tok.starts_with(ACCESS_TOKEN_PREFIX) {
             return Some(match self.access_token_claims(tok) {
-                Some((_, email)) => self.principal_for_email(&email),
+                Some((_, email)) => self.principal_for_email(email),
                 None => Err(AuthError::Invalid),
             });
         }
@@ -797,11 +797,11 @@ impl Authenticator {
             return Err(AuthError::Invalid);
         }
         tracing::debug!(iss = %claims.iss, aud = ?claims.aud, email = %claims.email, "ID token validated");
-        self.principal_for_email(&claims.email)
+        self.principal_for_email(claims.email)
     }
 
     /// Apply the domain/email allowlist and `write_domains` policy to a verified email.
-    fn principal_for_email(&self, email: &str) -> Result<Principal, AuthError> {
+    fn principal_for_email(&self, email: String) -> Result<Principal, AuthError> {
         let Some((_, domain)) = email.rsplit_once('@') else {
             return Err(AuthError::Invalid);
         };
@@ -817,9 +817,9 @@ impl Authenticator {
             Some(domains) => domains.iter().any(|d| d == &domain_lower),
         };
         Ok(Principal {
-            name: email.to_owned(),
+            name: email.clone(),
             write,
-            admin: self.is_admin(email),
+            admin: self.is_admin(&email),
             anonymous: false,
         })
     }
@@ -894,24 +894,24 @@ fn edge_owns_authorization(headers: &HeaderMap) -> bool {
         })
 }
 
-/// The client's `Authorization` header value (edge-forwarded copy first).
+/// The client's `Authorization` header value: the header itself when walgit is hit
+/// directly, the edge-forwarded copy when an edge announced `client-authorization`.
 fn client_authorization(headers: &HeaderMap) -> Option<String> {
-    if let Some(v) = headers
+    // Nothing announced the capability, so `Authorization` is the client's own and a
+    // forwarded copy nobody vouched for is not read at all (D39 (2), §1.3).
+    if !edge_owns_authorization(headers) {
+        return headers
+            .get(axum::http::header::AUTHORIZATION)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string);
+    }
+    // Behind the edge, a missing copy means the client sent no credential; the
+    // Authorization that is there is the hop's own.
+    headers
         .get(FORWARDED_AUTHORIZATION_HEADER)
         .and_then(|v| v.to_str().ok())
         .map(str::trim)
         .filter(|v| !v.is_empty())
-    {
-        return Some(v.to_string());
-    }
-    // Behind the edge, a missing copy means the client sent no credential; the
-    // Authorization that is there is the hop's own.
-    if edge_owns_authorization(headers) {
-        return None;
-    }
-    headers
-        .get(axum::http::header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
         .map(str::to_string)
 }
 
@@ -955,12 +955,12 @@ fn base64_decode(s: &str) -> Option<Vec<u8>> {
         if b == b'=' {
             break;
         }
-        let val = u32::try_from(TABLE.iter().position(|&t| t == b)?).unwrap_or(u32::MAX);
+        let val = TABLE.iter().position(|&t| t == b)? as u32;
         buf = (buf << 6) | val;
         bits += 6;
         if bits >= 8 {
             bits -= 8;
-            out.push(u8::try_from((buf >> bits) & 0xFF).unwrap_or(0));
+            out.push((buf >> bits) as u8);
             buf &= (1 << bits) - 1;
         }
     }
@@ -1002,7 +1002,8 @@ mod tests {
 
     /// Behind the edge (`client-authorization` capability) `Authorization` is the hop's own
     /// credential: with no `X-Walgit-Authorization` there is no client bearer (so the session
-    /// cookie gets its turn). Without the capability, `Authorization` is the client's.
+    /// cookie gets its turn). Without the capability, `Authorization` is the client's and the
+    /// forwarded header is not read at all.
     #[test]
     fn edge_owned_authorization_is_not_the_client() {
         let mut h = HeaderMap::new();
@@ -1018,6 +1019,24 @@ mod tests {
             "Bearer client".parse().unwrap(),
         );
         assert_eq!(bearer_token(&h).as_deref(), Some("client"));
+
+        let mut direct = HeaderMap::new();
+        direct.insert(AUTHORIZATION, "Bearer a".parse().unwrap());
+        direct.insert(FORWARDED_AUTHORIZATION_HEADER, "Bearer b".parse().unwrap());
+        assert_eq!(
+            bearer_token(&direct).as_deref(),
+            Some("a"),
+            "hit directly, a forwarded copy no edge announced is ignored"
+        );
+        direct.insert(
+            crate::static_object::CAPABILITIES_HEADER,
+            "client-authorization".parse().unwrap(),
+        );
+        assert_eq!(
+            bearer_token(&direct).as_deref(),
+            Some("b"),
+            "the announced capability makes the forwarded copy the client's"
+        );
     }
 
     #[test]
@@ -1084,6 +1103,7 @@ GcZ0izY/30012ajdHY+/QK5lsMoxTnn0skdS+spLxaS5ZEO4qvPVb8RAoCkWMMal
     fn config() -> walgit_config::Config {
         let mut cfg = walgit_config::Config::default();
         cfg.server.auth.mode = AuthMode::Oidc;
+        cfg.server.auth.issuer = ISSUER.into();
         cfg.server.auth.allowed_domains = vec!["Example.com".into()];
         cfg.server.auth.audiences = vec![AUD.into()];
         cfg.server.auth.anonymous_read = false;

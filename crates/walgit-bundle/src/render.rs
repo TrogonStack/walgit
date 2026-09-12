@@ -1,10 +1,10 @@
+#![allow(clippy::too_many_arguments)]
 //! Render the bundle list in git's bundle-list config format and protocol v2
 //! key=value lines.
 //!
 //! See: <https://git-scm.com/docs/bundle-uri> and
 //!      <https://git-scm.com/docs/gitprotocol-v2> (bundle-uri command).
 
-use std::fmt::Write as _;
 use std::time::Duration;
 
 use walgit_config::{BundleServe, BundlesConfig};
@@ -54,10 +54,11 @@ static SIGNING_WARNED: std::sync::LazyLock<std::sync::Mutex<std::collections::Ha
 
 fn warn_signing_once(owner: &str, repo: &str, e: &dyn std::fmt::Display) {
     let key = format!("{owner}/{repo}");
-    let mut seen = SIGNING_WARNED
+    if SIGNING_WARNED
         .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if seen.insert(key.clone()) {
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(key.clone())
+    {
         tracing::warn!(repo = %key, error = %e, "signed bundle URL failed; serving proxy URIs instead (check the store signing permissions)");
     }
 }
@@ -81,10 +82,6 @@ fn proxy_uri(entry: &BundleEntry, owner: &str, repo: &str, base_url: &str) -> St
     )
 }
 
-#[allow(
-    clippy::too_many_arguments,
-    reason = "one parameter per input the render needs; a wrapper struct would only be built and destructured at the call sites"
-)]
 /// Render the bundle list as git config text (bundle-list format).
 ///
 /// ```ini
@@ -140,11 +137,26 @@ pub async fn render_list_text(
         )
         .await?;
         out.push('\n');
-        let _ = writeln!(out, "[bundle \"{}\"]", entry.id);
-        let _ = writeln!(out, "    uri = {uri}");
-        let _ = writeln!(out, "    creationToken = {}", entry.creation_token);
+        {
+            let _ =
+                std::fmt::Write::write_fmt(&mut out, format_args!("[bundle \"{}\"]\n", entry.id));
+        };
+        {
+            let _ = std::fmt::Write::write_fmt(&mut out, format_args!("    uri = {uri}\n"));
+        };
+        {
+            let _ = std::fmt::Write::write_fmt(
+                &mut out,
+                format_args!("    creationToken = {}\n", entry.creation_token),
+            );
+        };
         if !entry.filter.is_empty() {
-            let _ = writeln!(out, "    filter = {}", entry.filter);
+            {
+                let _ = std::fmt::Write::write_fmt(
+                    &mut out,
+                    format_args!("    filter = {}\n", entry.filter),
+                );
+            };
         }
     }
 

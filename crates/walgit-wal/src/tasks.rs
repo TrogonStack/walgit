@@ -30,6 +30,13 @@ const KEEP_RECORDS: usize = 30;
 const KEEP_LOG: usize = 60;
 const REPLAY: usize = 200;
 
+/// Replayed packets, future packets, and the terminal outcome if already finished.
+pub type TaskAttachment = (
+    Vec<Progress>,
+    tokio::sync::broadcast::Receiver<Progress>,
+    Option<Result<TaskOutcome, (u16, String)>>,
+);
+
 #[derive(Serialize, Clone, Debug)]
 pub struct TaskRecord {
     pub id: String,
@@ -105,18 +112,8 @@ impl TaskState {
     pub fn record(&self) -> TaskRecord {
         self.record.lock().clone()
     }
-    #[allow(
-        clippy::type_complexity,
-        reason = "returns the snapshot and its subscription together; both halves are used at the single call site"
-    )]
     /// Subscribe + snapshot of everything so far (no gap, no duplicates).
-    pub fn attach(
-        &self,
-    ) -> (
-        Vec<Progress>,
-        tokio::sync::broadcast::Receiver<Progress>,
-        Option<Result<TaskOutcome, (u16, String)>>,
-    ) {
+    pub fn attach(&self) -> TaskAttachment {
         let replay = self.replay.lock();
         let rx = self.tx.subscribe();
         let outcome = self.outcome.lock().clone();
@@ -450,7 +447,7 @@ impl Tasks {
         };
         tracing::info!(repo = %record.repo, kind = %record.kind, id = %record.id, ok, outcome, elapsed_ms = record.elapsed_ms, bytes, objects, "task finished: {}", record.summary);
         metrics::counter!("walgit_tasks_finished_total", "kind" => record.kind.clone(), "ok" => ok.to_string()).increment(1);
-        metrics::histogram!("walgit_task_duration_seconds", "kind" => record.kind.clone(), "ok" => ok.to_string()).record(record.elapsed_ms as f64 / 1000.0);
+        metrics::histogram!("walgit_task_duration_seconds", "kind" => record.kind.clone(), "ok" => ok.to_string()).record(std::time::Duration::from_millis(record.elapsed_ms).as_secs_f64());
         record
     }
 

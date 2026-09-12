@@ -125,8 +125,8 @@ pub async fn run_pass(state: &Arc<AppState>) -> anyhow::Result<FollowReport> {
             break;
         }
         let handle = state.registry.open(&id).await?;
-        // the manifest carries the settings (D24)
-        drop(handle.sync_refs().await?);
+        let _refs = handle.sync_refs().await?; // the manifest carries the settings (D24)
+        drop(_refs);
         let cfg = handle.effective_config();
         let Some(upstream) = cfg.upstream.git.clone() else {
             continue;
@@ -145,7 +145,7 @@ pub async fn run_pass(state: &Arc<AppState>) -> anyhow::Result<FollowReport> {
             // the scratch's alternates while git reads them.
             let guard = handle.sync().await?;
             let have = current(&handle, &cfg.upstream.follow)?;
-            let token = token_for(state, &cfg)?;
+            let token = token_for(state, &cfg).await?;
             let delta = walgit_git::follow::fetch_refs(
                 &upstream,
                 token.as_deref(),
@@ -303,7 +303,7 @@ pub(crate) async fn op(
             .await
             .map_err(|e| format!("reading the fetched delta: {e}"))?
     } else {
-        let token = token_for(state, &cfg).map_err(|e| format!("{e:#}"))?;
+        let token = token_for(state, &cfg).await.map_err(|e| format!("{e:#}"))?;
         log(format!("fetching {} from {upstream}", refs.join(", ")));
         walgit_git::follow::fetch_refs(
             &upstream,
@@ -484,12 +484,16 @@ fn current(
         .collect())
 }
 
-fn token_for(state: &AppState, cfg: &walgit_config::Config) -> anyhow::Result<Option<String>> {
+async fn token_for(
+    state: &AppState,
+    cfg: &walgit_config::Config,
+) -> anyhow::Result<Option<String>> {
     match cfg.upstream.token_env.as_deref() {
         Some(name) => Ok(Some(
             state
                 .lfs_upstream
                 .secret(name)
+                .await
                 .map_err(|e| anyhow::anyhow!("upstream token: {e}"))?,
         )),
         None => Ok(None),
@@ -511,6 +515,6 @@ fn short(oid: &str) -> &str {
     if oid.is_empty() {
         "(none)"
     } else {
-        oid.get(..12).unwrap_or(oid)
+        &oid[..oid.len().min(12)]
     }
 }

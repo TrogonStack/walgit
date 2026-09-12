@@ -172,9 +172,9 @@ pub struct LeaseGuard {
 }
 
 impl LeaseGuard {
-    #[allow(
+    #[expect(
         clippy::too_many_arguments,
-        reason = "constructor arguments; a builder here would add a layer without removing one"
+        reason = "Lease construction collects its store identity and timing in one place"
     )]
     fn new(
         store: DynStore,
@@ -289,8 +289,6 @@ impl Drop for LeaseGuard {
         let key = self.key.clone();
         let version = self.version.clone();
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
-            // Detached on purpose: Drop cannot await, and a failed release is
-            // recovered by the lease expiring.
             drop(handle.spawn(async move {
                 let _ = store.delete(&key, Some(version)).await;
             }));
@@ -427,6 +425,7 @@ mod tests {
     #[tokio::test]
     async fn cas_update_convergence_64_incrementers() {
         const N: u32 = 64;
+
         let store = dyn_store();
         let key = "counter.pb";
 
@@ -470,6 +469,7 @@ mod tests {
     #[tokio::test]
     async fn lease_exclusivity_32_concurrent() {
         const N: u32 = 32;
+
         let store = dyn_store();
         let key = "leases/excl.pb";
 

@@ -110,10 +110,9 @@ pub async fn fetch_objects_as_pack(
     .map_err(GitError::Io)?;
     {
         use tokio::io::AsyncWriteExt;
-        let mut stdin = child
-            .stdin
-            .take()
-            .ok_or_else(|| GitError::Io(std::io::Error::other("git index-pack stdin")))?;
+        let mut stdin = child.stdin.take().ok_or_else(|| {
+            GitError::InvalidInput("git pack-objects stdin unavailable".to_owned())
+        })?;
         let mut input = oids.join("\n");
         input.push('\n');
         stdin

@@ -36,6 +36,10 @@ pub struct Remote {
 fn not_found(m: impl Into<String>) -> ApiError {
     ApiError::NotFound(m.into())
 }
+fn wal(e: walgit_wal::WalError) -> ApiError {
+    ApiError::Internal(format!("remote objects: {e}"))
+}
+
 /// A parsed commit (what the walks and renderers need).
 #[derive(Clone)]
 pub struct CommitMeta {
@@ -77,14 +81,14 @@ impl Remote {
         self.packs
             .find(oid)
             .await
-            .map_err(|e| ApiError::Internal(format!("remote objects: {e}")))?
+            .map_err(wal)?
             .ok_or_else(|| not_found(format!("object {oid} not in the pack set")))
     }
 
     /// Read + write into the local loose store (so git can see it).
     pub async fn fault(&self, oid: &gix_hash::oid) -> Result<Arc<Obj>, ApiError> {
         let o = self.get(oid).await?;
-        self.write_local(oid, &o)?;
+        self.write_local(vec![(oid.to_owned(), o.clone())]).await?;
         Ok(o)
     }
 
@@ -100,33 +104,56 @@ impl Remote {
         };
         for chunk in todo.chunks(PAR) {
             let results = futures::future::join_all(chunk.iter().map(|o| self.get(o))).await;
+            let mut batch = Vec::with_capacity(chunk.len());
             for (oid, r) in chunk.iter().zip(results) {
-                let o = r?;
-                self.write_local(oid, &o)?;
+                batch.push((*oid, r?));
             }
+            self.write_local(batch).await?;
         }
         Ok(())
     }
 
-    fn write_local(&self, oid: &gix_hash::oid, o: &Obj) -> Result<(), ApiError> {
-        if self.faulted.lock().contains(oid) {
+    /// Write freshly read objects into the local loose store, skipping what is
+    /// already faulted. Deflating an object and creating and renaming its file
+    /// is blocking filesystem work, so a whole batch goes to one
+    /// `spawn_blocking` rather than running on the tokio worker that read it
+    /// (principle VI: never block the async runtime).
+    async fn write_local(&self, batch: Vec<(ObjectId, Arc<Obj>)>) -> Result<(), ApiError> {
+        let todo: Vec<(ObjectId, Arc<Obj>)> = {
+            let done = self.faulted.lock();
+            batch
+                .into_iter()
+                .filter(|(oid, _)| !done.contains(oid))
+                .collect()
+        };
+        if todo.is_empty() {
             return Ok(());
         }
-        self.local
-            .write_loose_object(o.kind, oid, &o.data)
-            .map_err(|e| ApiError::Internal(format!("fault object {oid}: {e}")))?;
-        self.faulted.lock().insert(oid.to_owned());
-        Ok(())
+        let local = self.local.clone();
+        let (written, outcome) = tokio::task::spawn_blocking(move || {
+            let mut written: Vec<ObjectId> = Vec::with_capacity(todo.len());
+            for (oid, o) in todo {
+                if let Err(e) = local.write_loose_object(o.kind, &oid, &o.data) {
+                    let msg = format!("fault object {oid}: {e}");
+                    return (written, Err(ApiError::Internal(msg)));
+                }
+                written.push(oid);
+            }
+            (written, Ok(()))
+        })
+        .await
+        .map_err(|e| ApiError::Internal(format!("fault write task: {e}")))?;
+        if !written.is_empty() {
+            self.faulted.lock().extend(written);
+        }
+        outcome
     }
 
     pub async fn kind_and_size(
         &self,
         oid: &gix_hash::oid,
     ) -> Result<Option<(Kind, u64)>, ApiError> {
-        self.packs
-            .header(oid)
-            .await
-            .map_err(|e| ApiError::Internal(format!("remote objects: {e}")))
+        self.packs.header(oid).await.map_err(wal)
     }
 
     /// `rev-parse --verify <rev>^{commit}` without objects on disk: full or
@@ -209,6 +236,10 @@ impl Remote {
             };
             cur = e.oid;
             mode = Some(e.mode);
+            if !e.mode.is_tree() {
+                // more segments after a blob => absent
+                continue;
+            }
         }
         match mode {
             None => Ok(Some((cur, gix_object::tree::EntryKind::Tree.into()))),
@@ -406,7 +437,7 @@ impl Remote {
     /// blobs of changed entries (both sides). Root commits diff against the
     /// empty tree.
     pub async fn fault_commit_diff(&self, commit: &gix_hash::oid) -> Result<CommitMeta, ApiError> {
-        let meta = self.commit(commit).await?;
+        let c = self.commit(commit).await?;
         self.fault(commit).await?;
         // The renderer diffs against the first parent only
         // (`--diff-merges=first-parent`); git still parses every parent and
@@ -414,22 +445,21 @@ impl Remote {
         // the diff for the first parent alone — a merge into a monorepo trunk
         // otherwise pulls the whole other-branch delta (20 k+ objects, 503).
         let mut stack: Vec<(Option<ObjectId>, Option<ObjectId>)> = Vec::new();
-        if meta.parents.is_empty() {
-            stack.push((None, Some(meta.tree)));
+        if c.parents.is_empty() {
+            stack.push((None, Some(c.tree)));
         }
-        for (i, p) in meta.parents.iter().enumerate() {
+        for (i, p) in c.parents.iter().enumerate() {
             let pm = self.commit(p).await?;
             self.fault(p).await?;
             if i == 0 {
-                stack.push((Some(pm.tree), Some(meta.tree)));
+                stack.push((Some(pm.tree), Some(c.tree)));
             } else {
                 self.fault(&pm.tree).await?;
             }
         }
-        let hex = meta.id.to_hex().to_string();
         self.reporter.notice(format!(
             "Reading the trees and blobs changed by {}",
-            hex.get(..12).unwrap_or(&hex)
+            &c.id.to_hex().to_string()[..12]
         ));
         // Level-parallel: every tree pair of the current level is faulted in
         // one concurrent batch (range reads ~50 ms each; serially a large repository
@@ -439,9 +469,9 @@ impl Remote {
         while !stack.is_empty() {
             let level = std::mem::take(&mut stack);
             let mut want: Vec<ObjectId> = Vec::new();
-            for (lhs_tree, rhs_tree) in &level {
-                want.extend(lhs_tree.iter().copied());
-                want.extend(rhs_tree.iter().copied());
+            for (a, b) in &level {
+                want.extend(a.iter().copied());
+                want.extend(b.iter().copied());
             }
             want.sort_unstable();
             want.dedup();
@@ -449,28 +479,28 @@ impl Remote {
             if count > MAX_DIFF_OBJECTS {
                 return Err(ApiError::ServiceUnavailable(format!(
                     "commit {} touches more than {MAX_DIFF_OBJECTS} objects; too large to render from the remote pack set",
-                    meta.id
+                    c.id
                 )));
             }
             self.fault_many(&want).await?;
             self.reporter
                 .bar("Reading changed objects", count as u64, None, "objects");
             let mut blobs: Vec<ObjectId> = Vec::new();
-            for (lhs_tree, rhs_tree) in level {
-                let ea = match lhs_tree {
-                    Some(tree) => self.tree_entries(&tree).await?,
+            for (a, b) in level {
+                let ea = match a {
+                    Some(t) => self.tree_entries(&t).await?,
                     None => Vec::new(),
                 };
-                let eb = match rhs_tree {
-                    Some(tree) => self.tree_entries(&tree).await?,
+                let eb = match b {
+                    Some(t) => self.tree_entries(&t).await?,
                     None => Vec::new(),
                 };
                 // Merge-walk by git tree order.
                 let (mut i, mut j) = (0, 0);
                 while i < ea.len() || j < eb.len() {
                     let ord = match (ea.get(i), eb.get(j)) {
-                        (Some(lhs), Some(rhs)) => {
-                            tree_cmp(&lhs.name, lhs.mode.is_tree(), &rhs.name, rhs.mode.is_tree())
+                        (Some(x), Some(y)) => {
+                            tree_cmp(&x.name, x.mode.is_tree(), &y.name, y.mode.is_tree())
                         }
                         (Some(_), None) => std::cmp::Ordering::Less,
                         (None, Some(_)) => std::cmp::Ordering::Greater,
@@ -478,58 +508,52 @@ impl Remote {
                     };
                     match ord {
                         std::cmp::Ordering::Equal => {
-                            let (Some(lhs), Some(rhs)) = (ea.get(i), eb.get(j)) else {
-                                break;
-                            };
+                            let (x, y) = (&ea[i], &eb[j]);
                             i += 1;
                             j += 1;
-                            if lhs.oid == rhs.oid && lhs.mode == rhs.mode {
+                            if x.oid == y.oid && x.mode == y.mode {
                                 continue;
                             }
-                            match (lhs.mode.is_tree(), rhs.mode.is_tree()) {
-                                (true, true) => stack.push((Some(lhs.oid), Some(rhs.oid))),
+                            match (x.mode.is_tree(), y.mode.is_tree()) {
+                                (true, true) => stack.push((Some(x.oid), Some(y.oid))),
                                 (true, false) => {
-                                    stack.push((Some(lhs.oid), None));
-                                    if rhs.mode.is_blob_or_symlink() {
-                                        blobs.push(rhs.oid);
+                                    stack.push((Some(x.oid), None));
+                                    if y.mode.is_blob_or_symlink() {
+                                        blobs.push(y.oid);
                                     }
                                 }
                                 (false, true) => {
-                                    stack.push((None, Some(rhs.oid)));
-                                    if lhs.mode.is_blob_or_symlink() {
-                                        blobs.push(lhs.oid);
+                                    stack.push((None, Some(y.oid)));
+                                    if x.mode.is_blob_or_symlink() {
+                                        blobs.push(x.oid);
                                     }
                                 }
                                 (false, false) => {
-                                    if lhs.mode.is_blob_or_symlink() {
-                                        blobs.push(lhs.oid);
+                                    if x.mode.is_blob_or_symlink() {
+                                        blobs.push(x.oid);
                                     }
-                                    if rhs.mode.is_blob_or_symlink() && rhs.oid != lhs.oid {
-                                        blobs.push(rhs.oid);
+                                    if y.mode.is_blob_or_symlink() && y.oid != x.oid {
+                                        blobs.push(y.oid);
                                     }
                                 }
                             }
                         }
                         std::cmp::Ordering::Less => {
-                            let Some(lhs) = ea.get(i) else {
-                                break;
-                            };
+                            let x = &ea[i];
                             i += 1;
-                            if lhs.mode.is_tree() {
-                                stack.push((Some(lhs.oid), None));
-                            } else if lhs.mode.is_blob_or_symlink() {
-                                blobs.push(lhs.oid);
+                            if x.mode.is_tree() {
+                                stack.push((Some(x.oid), None));
+                            } else if x.mode.is_blob_or_symlink() {
+                                blobs.push(x.oid);
                             }
                         }
                         std::cmp::Ordering::Greater => {
-                            let Some(rhs) = eb.get(j) else {
-                                break;
-                            };
+                            let y = &eb[j];
                             j += 1;
-                            if rhs.mode.is_tree() {
-                                stack.push((None, Some(rhs.oid)));
-                            } else if rhs.mode.is_blob_or_symlink() {
-                                blobs.push(rhs.oid);
+                            if y.mode.is_tree() {
+                                stack.push((None, Some(y.oid)));
+                            } else if y.mode.is_blob_or_symlink() {
+                                blobs.push(y.oid);
                             }
                         }
                     }
@@ -541,7 +565,7 @@ impl Remote {
             if count > MAX_DIFF_OBJECTS {
                 return Err(ApiError::ServiceUnavailable(format!(
                     "commit {} touches more than {MAX_DIFF_OBJECTS} objects; too large to render from the remote pack set",
-                    meta.id
+                    c.id
                 )));
             }
             self.fault_many(&blobs).await?;
@@ -550,14 +574,14 @@ impl Remote {
             .refresh_async()
             .await
             .map_err(|e| ApiError::Internal(e.to_string()))?;
-        Ok(meta)
+        Ok(c)
     }
 }
 
 /// git's tree entry ordering: names compared as if trees had a trailing '/'.
 fn tree_cmp(a: &[u8], a_tree: bool, b: &[u8], b_tree: bool) -> std::cmp::Ordering {
     let n = a.len().min(b.len());
-    match a.iter().take(n).cmp(b.iter().take(n)) {
+    match a[..n].cmp(&b[..n]) {
         std::cmp::Ordering::Equal => {}
         o => return o,
     }

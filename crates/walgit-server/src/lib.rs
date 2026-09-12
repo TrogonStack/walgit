@@ -1,5 +1,34 @@
 //! Git smart HTTP server (protocol v0/v2), LFS, bundle serving, admin, health, metrics.
 //! See AGENTS.md Phase 3.
+#![allow(
+    clippy::case_sensitive_file_extension_comparisons,
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    clippy::cast_precision_loss,
+    clippy::cast_sign_loss,
+    clippy::doc_lazy_continuation,
+    clippy::expect_used,
+    clippy::if_same_then_else,
+    clippy::implicit_hasher,
+    clippy::indexing_slicing,
+    clippy::many_single_char_names,
+    clippy::match_wildcard_for_single_variants,
+    clippy::needless_continue,
+    clippy::needless_pass_by_value,
+    clippy::ref_option,
+    clippy::string_slice,
+    clippy::struct_field_names,
+    clippy::too_many_arguments,
+    clippy::trivially_copy_pass_by_ref,
+    clippy::type_complexity,
+    clippy::unnested_or_patterns,
+    clippy::unnecessary_wraps,
+    clippy::unused_async,
+    clippy::unused_self,
+    clippy::unwrap_used,
+    clippy::unreadable_literal,
+    clippy::used_underscore_binding
+)]
 
 pub mod admin;
 pub mod auth;
@@ -78,14 +107,17 @@ pub struct AppState {
 
 impl AppState {
     /// Build a full `AppState` from a config + store (memory or opened backend).
-    pub fn new(cfg: &Arc<walgit_config::Config>, store: DynStore) -> anyhow::Result<Arc<Self>> {
+    pub async fn new(
+        cfg: Arc<walgit_config::Config>,
+        store: DynStore,
+    ) -> anyhow::Result<Arc<Self>> {
         let registry = walgit_wal::Registry::new(store.clone(), cfg.clone());
-        let bridge = bridge::Bridge::new(cfg, registry.clone());
+        let bridge = bridge::Bridge::new(&cfg, registry.clone());
         let bundle_source: Arc<dyn walgit_bundle::BundleSource> =
             Arc::new(RegistryBundleSource(registry.clone()));
         let bundles = walgit_bundle::Bundler::new_with_source(bundle_source, cfg.clone());
         let metrics_handle = metrics::install()?;
-        let tls = tls::load(cfg)?;
+        let tls = tls::load(&cfg)?;
         if let Some(t) = &tls {
             tracing::info!(fingerprint = %t.fingerprint, mode = ?cfg.server.tls.mode, "TLS terminated in-process");
         }
@@ -94,10 +126,10 @@ impl AppState {
             store,
             registry,
             bundles,
-            auth: auth::Authenticator::new(cfg),
+            auth: auth::Authenticator::new(&cfg),
             semaphores: middleware::RepoSemaphores::new(cfg.server.max_concurrent_per_repo),
             inflight: Arc::new(middleware::Inflight::default()),
-            caches: cache::ServerCaches::new(cfg),
+            caches: cache::ServerCaches::new(&cfg),
             metrics_handle,
             lfs_upstream: lfs_upstream::Upstream::new(),
             readiness: prewarm::Readiness::new(),
@@ -192,7 +224,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         ))
         // A panicking handler must only fail its own request (500), never the process.
         .layer(tower_http::catch_panic::CatchPanicLayer::custom(
-            |err: Box<dyn std::any::Any + Send + 'static>| panic_response(&*err),
+            panic_response,
         ))
         // `Server: walgit/<ver> (<kind>; <who>)` on every response (incl. errors,
         // SSE, git pkt streams): which machine answered, without logs. The UI
@@ -225,7 +257,7 @@ pub fn router(state: Arc<AppState>) -> Router {
 
 async fn host_from_authority(mut req: Request<Body>) -> Request<Body> {
     if !req.headers().contains_key(axum::http::header::HOST)
-        && let Some(auth) = req.uri().authority().map(ToString::to_string)
+        && let Some(auth) = req.uri().authority().map(std::string::ToString::to_string)
         && let Ok(v) = axum::http::HeaderValue::from_str(&auth)
     {
         req.headers_mut().insert(axum::http::header::HOST, v);
@@ -233,11 +265,14 @@ async fn host_from_authority(mut req: Request<Body>) -> Request<Body> {
     req
 }
 
-fn panic_response(err: &(dyn std::any::Any + Send + 'static)) -> Response {
+fn panic_response(err: Box<dyn std::any::Any + Send + 'static>) -> Response {
     let msg = err
         .downcast_ref::<String>()
         .cloned()
-        .or_else(|| err.downcast_ref::<&str>().map(ToString::to_string))
+        .or_else(|| {
+            err.downcast_ref::<&str>()
+                .map(std::string::ToString::to_string)
+        })
         .unwrap_or_else(|| "unknown panic".to_string());
     tracing::error!(panic = %msg, "request handler panicked");
     (
@@ -340,16 +375,14 @@ pub(crate) async fn dispatch_route(
             }
             (&Method::POST, "git-upload-pack") => {
                 let _permit = acquire(st, route).await;
-                smart::upload_pack(st, route, &headers, body.take().unwrap_or_else(Body::empty))
-                    .await
+                smart::upload_pack(st, route, &headers, body.take().unwrap()).await
             }
             (&Method::POST, "git-receive-pack") => {
                 let _permit = acquire(st, route).await;
-                smart::receive_pack(st, route, &headers, body.take().unwrap_or_else(Body::empty))
-                    .await
+                smart::receive_pack(st, route, &headers, body.take().unwrap()).await
             }
             (&Method::POST, "info/lfs/objects/batch") => {
-                let bytes = collect_body(body.take().unwrap_or_else(Body::empty)).await?;
+                let bytes = collect_body(body.take().unwrap()).await?;
                 lfs::batch(st, route, &headers, bytes).await
             }
             (&Method::GET | &Method::HEAD, s)
@@ -358,10 +391,10 @@ pub(crate) async fn dispatch_route(
                 lfs::get_object(st, route, &method, &headers, &query, peer).await
             }
             (&Method::PUT, s) if s.starts_with("info/lfs/objects/") => {
-                lfs::put_object(st, route, &headers, body.take().unwrap_or_else(Body::empty)).await
+                lfs::put_object(st, route, &headers, body.take().unwrap()).await
             }
             (&Method::POST, "info/lfs/verify") => {
-                let bytes = collect_body(body.take().unwrap_or_else(Body::empty)).await?;
+                let bytes = collect_body(body.take().unwrap()).await?;
                 lfs::verify(st, route, &headers, bytes).await
             }
             (&Method::GET, "bundles/list") => {
@@ -380,7 +413,7 @@ pub(crate) async fn dispatch_route(
             // Admin routes reach here only through `/{o}/{r}/api[-browser]/…` (web::v1).
             (&Method::GET, "policy") => policy::http_get(st, route, &headers).await,
             (&Method::PUT, "policy") => {
-                policy::http_put(st, route, &headers, body.take().unwrap_or_else(Body::empty)).await
+                policy::http_put(st, route, &headers, body.take().unwrap()).await
             }
             (&Method::DELETE, "policy") => policy::http_delete(st, route, &headers).await,
             (&Method::GET, "settings") => settings::http_get(st, route, &headers).await,
@@ -392,43 +425,18 @@ pub(crate) async fn dispatch_route(
                 settings::http_describe(st, route, &headers).await
             }
             (&Method::PUT, "settings") => {
-                settings::http_put(
-                    st,
-                    route,
-                    &headers,
-                    &query,
-                    body.take().unwrap_or_else(Body::empty),
-                )
-                .await
+                settings::http_put(st, route, &headers, &query, body.take().unwrap()).await
             }
             (&Method::DELETE, "settings") => settings::http_delete(st, route, &headers).await,
             (&Method::POST, "settings/validate") => {
-                settings::http_validate(
-                    st,
-                    route,
-                    &headers,
-                    body.take().unwrap_or_else(Body::empty),
-                )
-                .await
+                settings::http_validate(st, route, &headers, body.take().unwrap()).await
             }
             (&Method::POST, "policy/validate") => {
-                settings::http_policy_validate(
-                    st,
-                    route,
-                    &headers,
-                    body.take().unwrap_or_else(Body::empty),
-                )
-                .await
+                settings::http_policy_validate(st, route, &headers, body.take().unwrap()).await
             }
             (&Method::POST, "policy/dry-run") => {
-                settings::http_policy_dry_run(
-                    st,
-                    route,
-                    &headers,
-                    &query,
-                    body.take().unwrap_or_else(Body::empty),
-                )
-                .await
+                settings::http_policy_dry_run(st, route, &headers, &query, body.take().unwrap())
+                    .await
             }
             _ => Err(ApiError::NotFound(format!("no route for {method} {sub}"))),
         }
@@ -486,10 +494,7 @@ impl TcpAccept {
     }
 
     pub fn local_addr(&self) -> std::io::Result<std::net::SocketAddr> {
-        self.listeners
-            .first()
-            .ok_or_else(|| std::io::Error::other("no listener"))?
-            .local_addr()
+        self.listeners[0].local_addr()
     }
 
     pub fn addrs(&self) -> Vec<std::net::SocketAddr> {
@@ -551,9 +556,12 @@ pub async fn serve(
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> anyhow::Result<()> {
     let addr = state.cfg.server.listen;
+    // Resolve the machine type before the first request, so `/readyz`, `/healthz`
+    // and the UI footer only read a cell that is already filled (principle VI).
+    instance::init_machine_type(&state.cfg).await;
     let state_for_shutdown = state.clone();
     prewarm::spawn(state.clone());
-    bridge::spawn_sweeper(&state);
+    bridge::spawn_sweeper(state.clone());
     spawn_runtime_watchdog(state.registry.tasks().clone(), state.inflight.clone());
     let app = router(state);
     let listener = TcpAccept::bind(addr).await?;

@@ -29,11 +29,7 @@ pub async fn list(
     if !st.cfg.bundles.advertise {
         return Err(ApiError::NotFound("bundles disabled".into()));
     }
-    let principal = st
-        .auth
-        .require_read(headers)
-        .await
-        .map_err(ApiError::from)?;
+    let principal = st.auth.require_read(headers).await.map_err(auth_err)?;
     // This principal tried bundle-uri (see `smart::bundle_fallback_allowed`).
     st.caches.bundle_attempts.insert(
         format!("{}\0{}", route.id, principal.name),
@@ -83,7 +79,7 @@ pub async fn list(
         .bundles
         .render_list(&route.id, &base, filter.as_deref(), fulls)
         .await
-        .map_err(ApiError::from)?;
+        .map_err(bundle_err)?;
     match text {
         Some(t) => {
             st.caches
@@ -100,11 +96,11 @@ fn render_bundle_list_response(text: String) -> Response {
     let h = resp.headers_mut();
     h.insert(
         axum::http::header::CONTENT_TYPE,
-        axum::http::HeaderValue::from_static("text/plain; charset=utf-8"),
+        "text/plain; charset=utf-8".parse().unwrap(),
     );
     h.insert(
         axum::http::header::CACHE_CONTROL,
-        axum::http::HeaderValue::from_static("no-cache"),
+        "no-cache".parse().unwrap(),
     );
     resp
 }
@@ -119,11 +115,7 @@ pub async fn object(
     headers: &HeaderMap,
     peer: Option<std::net::SocketAddr>,
 ) -> Result<Response, ApiError> {
-    let _ = st
-        .auth
-        .require_read(headers)
-        .await
-        .map_err(ApiError::from)?;
+    let _ = st.auth.require_read(headers).await.map_err(auth_err)?;
     let handle = open_repo(st, &route.id, false).await?;
     let store = handle.store().clone();
 
@@ -153,6 +145,21 @@ pub async fn object(
     .await
 }
 
+fn auth_err(e: crate::auth::AuthError) -> ApiError {
+    match e {
+        crate::auth::AuthError::Invalid | crate::auth::AuthError::Unauthorized => {
+            ApiError::Unauthorized
+        }
+        crate::auth::AuthError::Forbidden => ApiError::Forbidden,
+        crate::auth::AuthError::Unavailable => {
+            ApiError::ServiceUnavailable("auth provider unavailable".into())
+        }
+    }
+}
+fn bundle_err(e: walgit_bundle::BundleError) -> ApiError {
+    ApiError::Internal(format!("bundle: {e}"))
+}
+
 /// Full bundle = header ∘ the single tier-2 base pack, refs from the checkpoint
 /// at the base's seq (written now when the base is at head and none exists).
 /// Full bundle = header (refs at the base's seq) ∘ tier-2 base pack via GCS
@@ -175,13 +182,12 @@ pub async fn compose_full_from_base(
     // The base is the tier-2 pack that is not a derived history pack (D18:
     // `compact --base` publishes both at tier 2; the weekly composes the base).
     let bases = walgit_wal::base_packs(&manifest);
-    let [base] = bases.as_slice() else {
-        anyhow::bail!(
-            "compose needs exactly one tier-2 base pack (found {}; history packs excluded): an imported pack set — the base rebuild unit (`compact --base`) collapses it first",
-            bases.len()
-        );
-    };
-    let base = (*base).clone();
+    anyhow::ensure!(
+        bases.len() == 1,
+        "compose needs exactly one tier-2 base pack (found {}; history packs excluded): an imported pack set — the base rebuild unit (`compact --base`) collapses it first",
+        bases.len()
+    );
+    let base = bases[0].clone();
     let seq = base.seq;
     let store = handle.store();
     // Refs at the base's seq: the checkpoint there when one exists (the rebuild checkpoints right
@@ -225,7 +231,7 @@ pub async fn compose_full_from_base(
             .filter(|p| p.kind == walgit_proto::v1::PackKind::History as i32 && p.derived_from == base.checksum)
             .max_by_key(|p| p.seq)
             .cloned()
-            .ok_or_else(|| anyhow::anyhow!("strategy {strategy} is filtered but base {} has no history pack (D18) to compose; rebuild the base with git.history_pack on", base.checksum.get(..12).unwrap_or(&base.checksum)))?,
+            .ok_or_else(|| anyhow::anyhow!("strategy {strategy} is filtered but base {} has no history pack (D18) to compose; rebuild the base with git.history_pack on", &base.checksum[..12]))?,
         None => base.clone(),
     };
     let pack_path = handle

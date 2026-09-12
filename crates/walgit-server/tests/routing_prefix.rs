@@ -1,3 +1,10 @@
+#![allow(
+    clippy::case_sensitive_file_extension_comparisons,
+    clippy::unnecessary_wraps
+)]
+// Test fixtures use panics to fail the test, including shared helper functions.
+#![allow(clippy::panic, clippy::string_slice)]
+
 //! D26/D27 + no-compat banner: **repo prefix first, lane segment second**.
 //! Source-level (grep), not HTTP.
 //!
@@ -8,19 +15,10 @@
 //!   `/api-browser/v1/authenticate`, `/services/api/owners|instance`.
 //! * Clients must not emit the deleted lane-first repo forms.
 
-#![allow(
-    clippy::unwrap_used,
-    clippy::expect_used,
-    clippy::panic,
-    clippy::indexing_slicing,
-    clippy::many_single_char_names
-)]
-// clippy.toml exempts #[test] functions from the panic-path lints, but not the plain
-// helper functions beside them in the same file. A panic in a fixture builder is how
-// that fixture reports it could not be built, exactly as in the tests it serves.
-
 use std::fs;
 use std::path::{Path, PathBuf};
+
+type TestResult = anyhow::Result<()>;
 
 fn root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
@@ -80,22 +78,17 @@ fn route_literals(src: &str) -> Vec<(usize, String)> {
         let Some(idx) = t.find(".route(\"") else {
             continue;
         };
-        let Some(rest) = t.get(idx + ".route(\"".len()..) else {
-            continue;
-        };
+        let rest = &t[idx + ".route(\"".len()..];
         let Some(end) = rest.find('"') else {
             continue;
         };
-        let Some(route) = rest.get(..end) else {
-            continue;
-        };
-        out.push((i + 1, route.to_string()));
+        out.push((i + 1, rest[..end].to_string()));
     }
     out
 }
 
 #[test]
-fn repo_scoped_routes_start_with_owner_repo() {
+fn repo_scoped_routes_start_with_owner_repo() -> TestResult {
     let files = [
         "crates/walgit-server/src/lib.rs",
         "crates/walgit-server/src/web/api.rs",
@@ -115,6 +108,7 @@ fn repo_scoped_routes_start_with_owner_repo() {
         "repo-scoped routes must start with /{{owner}}/{{repo}} (or be on the D26 allow-list):\n{}",
         bad.join("\n")
     );
+    Ok(())
 }
 
 fn forbidden_client_hits(src: &str, rel: &str) -> Vec<String> {
@@ -143,7 +137,7 @@ fn forbidden_client_hits(src: &str, rel: &str) -> Vec<String> {
 }
 
 #[test]
-fn clients_emit_prefix_form() {
+fn clients_emit_prefix_form() -> TestResult {
     let mut hits = Vec::new();
     hits.extend(forbidden_client_hits(
         &read("web/src/api.ts"),
@@ -168,13 +162,10 @@ fn clients_emit_prefix_form() {
         "UI/SDK/setup must not emit lane-first repo URLs (/api/v1/repos, /api-browser/v1/repos, /services/api/{{o}}/{{r}}):\n{}",
         hits.join("\n")
     );
+    Ok(())
 }
 
 fn walk_ts(dir: &str) -> Vec<(String, String)> {
-    #[allow(
-        clippy::case_sensitive_file_extension_comparisons,
-        reason = "the repository's own sources, whose extensions are lowercase by convention"
-    )]
     fn rec(dir: &Path, root: &Path, out: &mut Vec<(String, String)>) {
         let Ok(rd) = fs::read_dir(dir) else { return };
         for e in rd.flatten() {
@@ -195,8 +186,10 @@ fn walk_ts(dir: &str) -> Vec<(String, String)> {
             }
         }
     }
+
     let mut out = Vec::new();
     let base = root().join(dir);
+
     rec(&base, &root(), &mut out);
     out
 }

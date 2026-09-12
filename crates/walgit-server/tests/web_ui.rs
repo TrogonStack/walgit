@@ -1,14 +1,3 @@
-#![allow(
-    clippy::unwrap_used,
-    clippy::expect_used,
-    clippy::panic,
-    clippy::indexing_slicing,
-    clippy::many_single_char_names
-)]
-// clippy.toml exempts #[test] functions from the panic-path lints, but not the plain
-// helper functions beside them in the same file. A panic in a fixture builder is how
-// that fixture reports it could not be built, exactly as in the tests it serves.
-
 mod harness;
 
 use anyhow::Result;
@@ -53,10 +42,6 @@ async fn page_routes_serve_index_without_cache() -> Result<()> {
     Ok(())
 }
 
-#[allow(
-    clippy::case_sensitive_file_extension_comparisons,
-    reason = "the build writes these asset names itself, always lowercase"
-)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn assets_have_content_type_and_immutable_cache() -> Result<()> {
     let server = Server::start().await?;
@@ -70,7 +55,12 @@ async fn assets_have_content_type_and_immutable_cache() -> Result<()> {
     let marker = "/_ui/assets/";
     let asset = index
         .split('"')
-        .find(|part| part.starts_with(marker) && part.ends_with(".js"))
+        .find(|part| {
+            part.starts_with(marker)
+                && std::path::Path::new(part)
+                    .extension()
+                    .is_some_and(|ext| ext.eq_ignore_ascii_case("js"))
+        })
         .expect("built index references a JavaScript asset");
     let response = client
         .get(format!("{}{}", server.base_url, asset))

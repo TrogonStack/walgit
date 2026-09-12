@@ -2,11 +2,7 @@
 //! `WALGIT__SECTION__KEY=value` (double underscore = nesting), applied after
 //! the file is parsed. `PORT` (a serverless host) overrides `server.listen` port.
 
-use std::{
-    net::{IpAddr, Ipv4Addr, SocketAddr},
-    path::PathBuf,
-    time::Duration,
-};
+use std::{net::SocketAddr, path::PathBuf, time::Duration};
 
 use anyhow::{Context, Result};
 pub use bytesize::ByteSize;
@@ -150,7 +146,8 @@ pub struct AuthConfig {
     pub tokens: Vec<StaticToken>,
     /// OIDC issuer (`oidc` mode). Discovery at `<issuer>/.well-known/openid-configuration`
     /// supplies the JWKS, authorization and token endpoints. Any compliant provider works
-    /// (Google, Microsoft Entra, Okta, Auth0, Keycloak, Dex, GitLab, ...).
+    /// (Google, Microsoft Entra, Okta, Auth0, Keycloak, Dex, GitLab, ...). No default:
+    /// `Config::validate` refuses `oidc` mode until it is set.
     pub issuer: String,
     /// Email domains accepted by `oidc` (the `email` claim, `email_verified` required).
     pub allowed_domains: Vec<String>,
@@ -214,6 +211,7 @@ pub enum AuthMode {
 pub struct StaticToken {
     pub principal: String,
     /// Read from env var if set, else literal.
+    #[serde(default)]
     pub token: String,
     #[serde(default)]
     pub token_env: Option<String>,
@@ -341,11 +339,12 @@ pub struct CacheConfig {
     pub store_mount: Option<PathBuf>,
 }
 
-// Each bool is one documented TOML key. Grouping them into sub-structs to satisfy
-// the lint would change the config file's shape, which is a user-facing contract.
-#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "Independent configuration switches, not mutually exclusive states"
+)]
 pub struct WalConfig {
     /// Coalesce concurrent publishes to one repo within this window into one index CAS.
     #[serde(with = "humantime_serde")]
@@ -537,11 +536,12 @@ pub enum RepackEngine {
     Git,
 }
 
-// Each bool is one documented TOML key. Grouping them into sub-structs to satisfy
-// the lint would change the config file's shape, which is a user-facing contract.
-#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "Independent configuration switches, not mutually exclusive states"
+)]
 pub struct BundlesConfig {
     pub enabled: bool,
     pub strategy: Vec<BundleStrategy>,
@@ -693,11 +693,12 @@ pub struct UpstreamConfig {
     pub follow: Vec<String>,
 }
 
-// Each bool is one documented TOML key. Grouping them into sub-structs to satisfy
-// the lint would change the config file's shape, which is a user-facing contract.
-#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "Independent configuration switches, not mutually exclusive states"
+)]
 pub struct GitConfig {
     /// Path to the upstream git binary (repack, bundle, optional upload-pack engine).
     pub binary: PathBuf,
@@ -823,24 +824,22 @@ pub const SETTINGS_SECTIONS: &[&str] = &["bundles", "maintenance", "compaction",
 /// D24: maximum size of a settings document.
 pub const SETTINGS_MAX_BYTES: usize = 16 * 1024;
 
-/// Recursively merge `from` into `into`, table by table; non-table values replace.
-fn merge(into: &mut toml::Table, from: &toml::Table) {
-    for (k, v) in from {
-        match (into.get_mut(k), v) {
-            (Some(toml::Value::Table(a)), toml::Value::Table(b)) => merge(a, b),
-            _ => {
-                into.insert(k.clone(), v.clone());
-            }
-        }
-    }
-}
-
 impl Config {
     /// D24: the effective configuration for one repository = this (the host's
     /// walgit.toml ⊕ env) with the repository's settings TOML merged on top.
     /// Only [`SETTINGS_SECTIONS`] may appear; the result is validated like a
     /// config file. Empty settings = `self` unchanged.
     pub fn with_settings(&self, settings_toml: &str) -> Result<Config> {
+        fn merge(into: &mut toml::Table, from: &toml::Table) {
+            for (k, v) in from {
+                match (into.get_mut(k), v) {
+                    (Some(toml::Value::Table(a)), toml::Value::Table(b)) => merge(a, b),
+                    _ => {
+                        into.insert(k.clone(), v.clone());
+                    }
+                }
+            }
+        }
         if settings_toml.trim().is_empty() {
             return Ok(self.clone());
         }
@@ -1029,7 +1028,7 @@ pub fn repo_listed(list: &[String], owner: &str, name: &str) -> bool {
 impl Default for ServerConfig {
     fn default() -> Self {
         ServerConfig {
-            listen: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8080),
+            listen: std::net::SocketAddr::from(([127, 0, 0, 1], 8080)),
             http2: true,
             max_concurrent_requests: 512,
             max_concurrent_per_repo: 64,
@@ -1052,7 +1051,7 @@ impl Default for AuthConfig {
             mode: AuthMode::None,
             anonymous_read: true,
             tokens: vec![],
-            issuer: "https://accounts.google.com".into(),
+            issuer: String::new(),
             allowed_domains: vec![],
             allowed_emails: vec![],
             audiences: vec![],
@@ -1303,7 +1302,7 @@ impl Config {
             };
             vars_seen.push(k.clone());
             let path: Vec<String> = rest.split("__").map(str::to_ascii_lowercase).collect();
-            if path.is_empty() || path.iter().any(String::is_empty) {
+            if path.is_empty() || path.iter().any(std::string::String::is_empty) {
                 continue;
             }
             let value: toml::Value = v
@@ -1318,18 +1317,18 @@ impl Config {
                     path: &[String],
                     value: toml::Value,
                 ) -> std::result::Result<(), String> {
-                    let Some((head, rest)) = path.split_first() else {
-                        return Err("empty key path".to_string());
+                    let Some((key, rest)) = path.split_first() else {
+                        return Err("empty configuration path".into());
                     };
                     if rest.is_empty() {
-                        cur.insert(head.clone(), value);
+                        cur.insert(key.clone(), value);
                         return Ok(());
                     }
                     let next = cur
-                        .entry(head.clone())
-                        .or_insert_with(|| toml::Value::Table(toml::Table::default()))
+                        .entry(key.clone())
+                        .or_insert_with(|| toml::Value::Table(toml::Table::new()))
                         .as_table_mut()
-                        .ok_or_else(|| format!("{head} is not a table"))?;
+                        .ok_or_else(|| format!("{key} is not a table"))?;
                     set(next, rest, value)
                 }
                 match set(&mut trial, &path, value) {
@@ -1622,7 +1621,7 @@ impl Config {
         }
         let mut v: Vec<String> = ["localhost", "*.localhost", "127.0.0.1", "::1"]
             .iter()
-            .map(ToString::to_string)
+            .map(std::string::ToString::to_string)
             .collect();
         if let Some(u) = &self.server.public_url {
             let host = u
@@ -1891,6 +1890,8 @@ listen = \"0.0.0.0:1\"\n",
             .unwrap_err()
             .to_string();
         assert!(e.contains("[server]"), "{e}");
+        // A section the docs once promised but the code never accepted.
+        assert!(base.with_settings("[integrations]\nx = 1\n").is_err());
         // Unknown key inside an allowed section.
         assert!(base.with_settings("[bundles]\nnope = 1\n").is_err());
         // Invalid effective config (incremental without a base).
@@ -1935,10 +1936,31 @@ audiences = ["walgit-cli", "https://git.example.com"]
         let err = Config::parse("[store]\nbucket = \"b\"\n[server.auth]\nmode = \"token\"\n")
             .unwrap_err();
         assert!(err.to_string().contains("tokens"), "{err}");
-        // oidc: anonymous_read off, an allowlist, and a way in.
-        let err = Config::parse("[store]\nbucket = \"b\"\n[server.auth]\nmode = \"oidc\"\nanonymous_read = false\nallowed_domains = [\"example.com\"]\n").unwrap_err();
+        // `token_env` alone is a whole entry: the README quick start writes exactly this.
+        let readme = Config::parse(
+            "[store]\nbucket = \"b\"\n[server.auth]\nmode = \"token\"\ntokens = [{ principal = \"me\", token_env = \"WALGIT_TOKEN_ME\", write = true }]\n",
+        )
+        .unwrap();
+        let t = &readme.server.auth.tokens[0];
+        assert_eq!(t.principal, "me");
+        assert!(t.token.is_empty(), "{:?}", t.token);
+        assert_eq!(t.token_env.as_deref(), Some("WALGIT_TOKEN_ME"));
+        assert!(t.write && !t.admin);
+        // Neither key names a secret, so the entry could never let anyone in.
+        let err = Config::parse(
+            "[store]\nbucket = \"b\"\n[server.auth]\nmode = \"token\"\ntokens = [{ principal = \"me\", write = true }]\n",
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("needs `token` or `token_env`"),
+            "{err}"
+        );
+        // oidc: an issuer, anonymous_read off, an allowlist, and a way in.
+        let err = Config::parse("[store]\nbucket = \"b\"\n[server.auth]\nmode = \"oidc\"\nanonymous_read = false\nallowed_domains = [\"example.com\"]\noauth_client_id = \"x\"\noauth_client_secret = \"y\"\nsession_secret = \"0123456789abcdef0123456789abcdef\"\n").unwrap_err();
+        assert!(err.to_string().contains("issuer"), "{err}");
+        let err = Config::parse("[store]\nbucket = \"b\"\n[server.auth]\nmode = \"oidc\"\nissuer = \"https://login.example.com\"\nanonymous_read = false\nallowed_domains = [\"example.com\"]\n").unwrap_err();
         assert!(err.to_string().contains("way in"), "{err}");
-        let err = Config::parse("[store]\nbucket = \"b\"\n[server.auth]\nmode = \"oidc\"\nanonymous_read = false\nallowed_domains = [\"example.com\"]\noauth_client_id = \"x\"\noauth_client_secret = \"y\"\n").unwrap_err();
+        let err = Config::parse("[store]\nbucket = \"b\"\n[server.auth]\nmode = \"oidc\"\nissuer = \"https://login.example.com\"\nanonymous_read = false\nallowed_domains = [\"example.com\"]\noauth_client_id = \"x\"\noauth_client_secret = \"y\"\n").unwrap_err();
         assert!(err.to_string().contains("session_secret"), "{err}");
         let ok = Config::parse("[store]\nbucket = \"b\"\n[server.auth]\nmode = \"oidc\"\nissuer = \"https://login.example.com\"\nanonymous_read = false\nallowed_domains = [\"example.com\"]\noauth_client_id = \"x\"\noauth_client_secret = \"y\"\nsession_secret = \"0123456789abcdef0123456789abcdef\"\n").unwrap();
         assert_eq!(ok.server.auth.issuer, "https://login.example.com");
@@ -1948,6 +1970,11 @@ audiences = ["walgit-cli", "https://git.example.com"]
         )
         .unwrap_err();
         assert!(err.to_string().contains("loopback-only"), "{err}");
+        // The issuer is an oidc-only requirement: none and token mode validate without one.
+        let none = Config::parse("[store]\nbucket = \"b\"\n").unwrap();
+        assert_eq!(none.server.auth.issuer, "");
+        let tok = Config::parse("[store]\nbucket = \"b\"\n[server.auth]\nmode = \"token\"\ntokens = [{ principal = \"ci\", token = \"s\" }]\n").unwrap();
+        assert_eq!(tok.server.auth.issuer, "");
     }
 
     #[test]

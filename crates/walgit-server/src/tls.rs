@@ -42,18 +42,8 @@ pub fn load(cfg: &Config) -> anyhow::Result<Option<Arc<Tls>>> {
     let (cert_pem, key_pem) = match cfg.server.tls.mode {
         TlsMode::Off => return Ok(None),
         TlsMode::Files => {
-            let cert = cfg
-                .server
-                .tls
-                .cert
-                .as_ref()
-                .context("server.tls.cert is required when server.tls.mode is \"files\"")?;
-            let key = cfg
-                .server
-                .tls
-                .key
-                .as_ref()
-                .context("server.tls.key is required when server.tls.mode is \"files\"")?;
+            let cert = cfg.server.tls.cert.as_ref().expect("validated");
+            let key = cfg.server.tls.key.as_ref().expect("validated");
             (
                 std::fs::read_to_string(cert)
                     .with_context(|| format!("reading server.tls.cert {}", cert.display()))?,
@@ -73,14 +63,11 @@ pub fn load(cfg: &Config) -> anyhow::Result<Option<Arc<Tls>>> {
     let key: PrivateKeyDer<'static> = rustls_pemfile::private_key(&mut key_pem.as_bytes())
         .context("parsing TLS private key PEM")?
         .ok_or_else(|| anyhow::anyhow!("TLS key PEM holds no private key"))?;
-    let leaf = certs
-        .first()
-        .context("TLS certificate PEM holds no certificate")?;
     let fingerprint = {
         use sha2::Digest;
         format!(
             "sha256:{}",
-            hex::encode(sha2::Sha256::digest(leaf.as_ref()))
+            hex::encode(sha2::Sha256::digest(certs[0].as_ref()))
         )
     };
     let mut sc = rustls::ServerConfig::builder_with_provider(Arc::new(

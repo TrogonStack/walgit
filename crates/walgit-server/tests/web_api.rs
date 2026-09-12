@@ -1,15 +1,7 @@
-//! web/API.md §6 conformance for the read-only JSON API.
+// Test fixtures use panics to fail the test, including shared helper functions.
+#![allow(clippy::indexing_slicing, clippy::string_slice, clippy::unwrap_used)]
 
-#![allow(
-    clippy::unwrap_used,
-    clippy::expect_used,
-    clippy::panic,
-    clippy::indexing_slicing,
-    clippy::many_single_char_names
-)]
-// clippy.toml exempts #[test] functions from the panic-path lints, but not the plain
-// helper functions beside them in the same file. A panic in a fixture builder is how
-// that fixture reports it could not be built, exactly as in the tests it serves.
+//! web/API.md §6 conformance for the read-only JSON API.
 
 mod harness;
 
@@ -32,7 +24,7 @@ async fn get(
         .headers()
         .get("content-type")
         .and_then(|v| v.to_str().ok())
-        .map(ToString::to_string);
+        .map(std::string::ToString::to_string);
     let text = resp.text().await?;
     Ok((status, text, ct))
 }
@@ -123,6 +115,7 @@ fn fixture(server: &Server) -> anyhow::Result<std::path::PathBuf> {
 
 /// web/API.md §6 against one server (called for the local-packs instance and
 /// for a sibling that serves the same repo remotely).
+#[allow(clippy::many_single_char_names)]
 async fn conformance(
     server: &Server,
     src: &std::path::Path,
@@ -192,11 +185,7 @@ async fn conformance(
     let r = json(server, "/o/r/api/resolve/v1.0").await?;
     assert_eq!(r["kind"], "tag");
     assert_eq!(r["sha"], v1_peeled);
-    let r = json(
-        server,
-        &format!("/o/r/api/resolve/{}/src", head.get(..8).unwrap_or(head)),
-    )
-    .await?;
+    let r = json(server, &format!("/o/r/api/resolve/{}/src", &head[..8])).await?;
     assert_eq!(r["kind"], "commit");
     assert_eq!(r["sha"], head);
     assert_eq!(r["path"], "src");
@@ -353,10 +342,9 @@ async fn conformance(
     assert!(m["patch"].as_str().unwrap().contains("diff --git"));
     assert!(!m["patch"].as_str().unwrap().contains("diff --cc"));
     // short sha and 404
-    let short = feature.get(..10).unwrap_or(feature);
-    let d = json(server, &format!("/o/r/api/commit/{short}")).await?;
+    let d = json(server, &format!("/o/r/api/commit/{}", &feature[..10])).await?;
     assert_eq!(d["commit"]["sha"], feature);
-    let (_, _, h) = get_h(server, &format!("/o/r/api/commit/{short}"), &[]).await?;
+    let (_, _, h) = get_h(server, &format!("/o/r/api/commit/{}", &feature[..10]), &[]).await?;
     assert_eq!(hdr(&h, "etag"), format!("\"{feature}\""));
     let (_, _, h) = get_h(server, &format!("/o/r/api/commit/{feature}"), &[]).await?;
     assert!(hdr(&h, "cache-control").contains("immutable"));

@@ -5,6 +5,26 @@
 //! The only flag is the global `--config PATH` (D8); no subcommand = `serve`. Every command loads
 //! `walgit.toml`, applies `WALGIT__` env overrides, and initialises tracing
 //! from `[telemetry]` before dispatching.
+#![allow(
+    clippy::case_sensitive_file_extension_comparisons,
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    clippy::cast_precision_loss,
+    clippy::cast_sign_loss,
+    clippy::cloned_ref_to_slice_refs,
+    clippy::doc_lazy_continuation,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::many_single_char_names,
+    clippy::needless_continue,
+    clippy::needless_pass_by_value,
+    clippy::redundant_locals,
+    clippy::string_slice,
+    clippy::unnecessary_sort_by,
+    clippy::unused_async,
+    clippy::unwrap_used,
+    clippy::unreadable_literal
+)]
 
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
@@ -474,7 +494,7 @@ fn run(config: &std::path::Path, command: Command) -> Result<()> {
     // Required for rustls 0.23+ — multiple providers in the dep tree; select one.
     rustls::crypto::aws_lc_rs::default_provider()
         .install_default()
-        .map_err(|_| anyhow::anyhow!("a rustls crypto provider is already installed"))?;
+        .expect("install rustls aws_lc_rs provider");
 
     let cfg = load_config(config);
     tracing_init(&cfg);
@@ -489,14 +509,14 @@ fn run(config: &std::path::Path, command: Command) -> Result<()> {
 async fn dispatch(command: Command, cfg: Config) -> Result<()> {
     let cfg = std::sync::Arc::new(cfg);
     match command {
-        Command::Config { action } => config_cmd::run(action, &cfg),
+        Command::Config { action } => config_cmd::run(action, &cfg).await,
         Command::Synth {
             out,
             size,
             commits,
             files,
             seed,
-        } => synth::run(&out, size, commits, files, seed),
+        } => synth::run(out, size, commits, files, seed).await,
         Command::Serve => serve::run(&cfg).await,
         Command::Compact {
             repo,

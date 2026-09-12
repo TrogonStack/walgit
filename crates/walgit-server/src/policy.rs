@@ -218,7 +218,7 @@ impl RepoPolicy {
 fn valid_name(s: &str) -> bool {
     let b = s.as_bytes();
     (1..=63).contains(&b.len())
-        && b.first().is_some_and(u8::is_ascii_lowercase)
+        && b[0].is_ascii_lowercase()
         && b.iter()
             .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || *c == b'-')
 }
@@ -226,28 +226,28 @@ fn valid_name(s: &str) -> bool {
 /// Two overlapping protect rules with non-empty, disjoint bypass lists cannot
 /// both be satisfied. AND would lock out the intended bot.
 fn check_overlap_bypass(p: &RepoPolicy) -> Result<(), String> {
-    let protect: Vec<(&Rule, &ProtectEffect)> = p
+    let protect: Vec<&Rule> = p
         .rules
         .iter()
-        .filter_map(|r| r.effect.protect.as_ref().map(|pr| (r, pr)))
+        .filter(|r| r.effect.protect.is_some())
         .collect();
-    for (i, (a, pa)) in protect.iter().enumerate() {
-        for (b, pb) in protect.iter().skip(i + 1) {
+    for (i, a) in protect.iter().enumerate() {
+        for b in &protect[i + 1..] {
             if !ref_patterns_may_overlap(&a.match_.refs, &b.match_.refs) {
                 continue;
             }
-            let ra = restrict_set(pa);
-            let rb = restrict_set(pb);
+            let ra = restrict_set(a.effect.protect.as_ref().unwrap());
+            let rb = restrict_set(b.effect.protect.as_ref().unwrap());
             if ra.is_disjoint(&rb) {
                 continue;
             }
-            let ba = &pa.bypass;
-            let bb = &pb.bypass;
+            let ba = &a.effect.protect.as_ref().unwrap().bypass;
+            let bb = &b.effect.protect.as_ref().unwrap().bypass;
             if ba.is_empty() || bb.is_empty() {
                 continue;
             }
-            let set_a: HashSet<&str> = ba.iter().map(String::as_str).collect();
-            let set_b: HashSet<&str> = bb.iter().map(String::as_str).collect();
+            let set_a: HashSet<&str> = ba.iter().map(std::string::String::as_str).collect();
+            let set_b: HashSet<&str> = bb.iter().map(std::string::String::as_str).collect();
             if set_a.is_disjoint(&set_b) {
                 return Err(format!(
                     "protect rules {:?} and {:?} overlap with disjoint bypass lists",
@@ -324,19 +324,18 @@ pub fn glob_match(pat: &str, text: &str) -> bool {
 fn glob_bytes(pat: &[u8], text: &[u8]) -> bool {
     let mut pi = 0;
     let mut ti = 0;
-    let tail = |from: usize| text.get(from..).unwrap_or_default();
-    while let Some(&p) = pat.get(pi) {
-        if p == b'*' && pat.get(pi + 1) == Some(&b'*') {
-            let mut rest = pat.get(pi + 2..).unwrap_or_default();
+    while pi < pat.len() {
+        if pat[pi] == b'*' && pi + 1 < pat.len() && pat[pi + 1] == b'*' {
+            let mut rest = &pat[pi + 2..];
             if rest.first() == Some(&b'/') {
-                rest = rest.get(1..).unwrap_or_default();
+                rest = &rest[1..];
             }
             if rest.is_empty() {
                 return true;
             }
             let mut i = ti;
             loop {
-                if glob_bytes(rest, tail(i)) {
+                if glob_bytes(rest, &text[i..]) {
                     return true;
                 }
                 if i >= text.len() {
@@ -344,26 +343,26 @@ fn glob_bytes(pat: &[u8], text: &[u8]) -> bool {
                 }
                 i += 1;
             }
-        } else if p == b'*' {
-            let rest = pat.get(pi + 1..).unwrap_or_default();
-            if glob_bytes(rest, tail(ti)) {
+        } else if pat[pi] == b'*' {
+            let rest = &pat[pi + 1..];
+            if glob_bytes(rest, &text[ti..]) {
                 return true;
             }
-            while text.get(ti).is_some_and(|&c| c != b'/') {
+            while ti < text.len() && text[ti] != b'/' {
                 ti += 1;
-                if glob_bytes(rest, tail(ti)) {
+                if glob_bytes(rest, &text[ti..]) {
                     return true;
                 }
             }
             return false;
-        } else if p == b'?' {
-            if text.get(ti).is_none_or(|&c| c == b'/') {
+        } else if pat[pi] == b'?' {
+            if ti >= text.len() || text[ti] == b'/' {
                 return false;
             }
             ti += 1;
             pi += 1;
         } else {
-            if text.get(ti) != Some(&p) {
+            if ti >= text.len() || text[ti] != pat[pi] {
                 return false;
             }
             ti += 1;
@@ -435,11 +434,9 @@ fn actor_list_matches(
         if let Some(rest) = p.strip_prefix('^') {
             let mut seen = HashSet::new();
             // Unresolvable exclude still excludes: treat missing group as hit.
-            if rest
-                .strip_prefix("group:")
-                .is_some_and(|g| !groups.contains_key(g))
-                || principal_matches(rest, principal, groups, &mut seen)
-            {
+            if rest.starts_with("group:") && !groups.contains_key(&rest[6..]) {
+                exc = true;
+            } else if principal_matches(rest, principal, groups, &mut seen) {
                 exc = true;
             }
         } else {
@@ -660,11 +657,7 @@ pub async fn http_get(
     route: &RepoRoute,
     headers: &HeaderMap,
 ) -> Result<Response, ApiError> {
-    let _ = st
-        .auth
-        .require_read(headers)
-        .await
-        .map_err(ApiError::from)?;
+    let _ = st.auth.require_read(headers).await.map_err(auth_err)?;
     ensure_repo(st, route).await?;
     let policy = load(&st.store, &route.id).await.map_err(store_err)?;
     let body = serde_json::to_vec_pretty(&policy)
@@ -686,11 +679,7 @@ pub async fn http_put(
     headers: &HeaderMap,
     body: axum::body::Body,
 ) -> Result<Response, ApiError> {
-    let _ = st
-        .auth
-        .require_admin(headers)
-        .await
-        .map_err(ApiError::from)?;
+    let _ = st.auth.require_admin(headers).await.map_err(auth_err)?;
     ensure_repo(st, route).await?;
     let bytes = crate::collect_body(body).await?;
     let policy = parse_bytes(&bytes).map_err(store_err)?;
@@ -705,11 +694,7 @@ pub async fn http_delete(
     route: &RepoRoute,
     headers: &HeaderMap,
 ) -> Result<Response, ApiError> {
-    let _ = st
-        .auth
-        .require_admin(headers)
-        .await
-        .map_err(ApiError::from)?;
+    let _ = st.auth.require_admin(headers).await.map_err(auth_err)?;
     ensure_repo(st, route).await?;
     clear(&st.store, &route.id).await.map_err(store_err)?;
     Ok((StatusCode::NO_CONTENT, "").into_response())
@@ -723,6 +708,18 @@ async fn ensure_repo(st: &AppState, route: &RepoRoute) -> Result<(), ApiError> {
             ApiError::Internal(format!("wal: {e}"))
         }
     })
+}
+
+fn auth_err(e: crate::auth::AuthError) -> ApiError {
+    match e {
+        crate::auth::AuthError::Invalid | crate::auth::AuthError::Unauthorized => {
+            ApiError::Unauthorized
+        }
+        crate::auth::AuthError::Forbidden => ApiError::Forbidden,
+        crate::auth::AuthError::Unavailable => {
+            ApiError::ServiceUnavailable("auth provider unavailable".into())
+        }
+    }
 }
 
 fn store_err(e: StoreError) -> ApiError {

@@ -217,9 +217,10 @@ fn not_modified(meta_version: &Version, opts: &ServeOptions<'_>) -> Response {
 fn range_not_satisfiable(meta: &ObjectMeta, opts: &ServeOptions<'_>) -> Response {
     let mut resp = StatusCode::RANGE_NOT_SATISFIABLE.into_response();
     base_headers(&mut resp, meta, opts);
-    if let Ok(v) = HeaderValue::from_str(&format!("bytes */{}", meta.size)) {
-        resp.headers_mut().insert(header::CONTENT_RANGE, v);
-    }
+    resp.headers_mut().insert(
+        header::CONTENT_RANGE,
+        HeaderValue::from_str(&format!("bytes */{}", meta.size)).unwrap(),
+    );
     resp.headers_mut()
         .insert(header::CONTENT_LENGTH, HeaderValue::from_static("0"));
     resp
@@ -303,11 +304,7 @@ pub async fn serve(
                 .insert(header::CONTENT_LENGTH, HeaderValue::from(meta.size));
             return Ok(resp);
         }
-        let Some(spec) = range else {
-            return Err(ApiError::Internal(
-                "range serve without a range spec".into(),
-            ));
-        };
+        let spec = range.unwrap();
         if if_range_allows(headers, &meta.version) {
             let Some(r) = spec.resolve(meta.size) else {
                 return Ok(range_not_satisfiable(&meta, &opts));
@@ -327,11 +324,16 @@ pub async fn serve(
                         (StatusCode::PARTIAL_CONTENT, Body::from_stream(body)).into_response();
                     base_headers(&mut resp, &meta, &opts);
                     let h = resp.headers_mut();
-                    if let Ok(v) =
-                        HeaderValue::from_str(&format!("bytes {}-{}/{}", r.start, r.end - 1, total))
-                    {
-                        h.insert(header::CONTENT_RANGE, v);
-                    }
+                    h.insert(
+                        header::CONTENT_RANGE,
+                        HeaderValue::from_str(&format!(
+                            "bytes {}-{}/{}",
+                            r.start,
+                            r.end - 1,
+                            total
+                        ))
+                        .unwrap(),
+                    );
                     h.insert(header::CONTENT_LENGTH, HeaderValue::from(r.end - r.start));
                     Ok(resp)
                 }

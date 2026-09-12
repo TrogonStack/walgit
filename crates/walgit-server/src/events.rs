@@ -174,14 +174,10 @@ pub(crate) struct WebhookSink {
 }
 
 impl WebhookSink {
-    #[allow(
-        clippy::expect_used,
-        reason = "the client builds unless the TLS backend is unavailable, and then the process cannot serve at all"
-    )]
     pub fn new(url: String, secret: Option<String>) -> Self {
         WebhookSink {
             url,
-            secret: secret.map(String::into_bytes),
+            secret: secret.map(std::string::String::into_bytes),
             client: reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(10))
                 .build()
@@ -190,10 +186,6 @@ impl WebhookSink {
     }
 
     /// `sha256=<hex>` over `body` with the shared secret.
-    #[allow(
-        clippy::expect_used,
-        reason = "HMAC accepts a key of any length, so new_from_slice cannot fail"
-    )]
     pub fn signature(secret: &[u8], body: &[u8]) -> String {
         use hmac::{Hmac, Mac};
         let mut mac = Hmac::<sha2::Sha256>::new_from_slice(secret).expect("hmac key");

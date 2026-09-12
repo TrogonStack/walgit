@@ -22,7 +22,7 @@ use std::sync::Arc;
 use axum::{
     Router,
     extract::{Path, Query, State},
-    http::{HeaderMap, HeaderValue, header},
+    http::{HeaderMap, header},
     response::{IntoResponse, Response},
     routing::get,
 };
@@ -33,7 +33,7 @@ use walgit_wal::{ObjectAccess, RepoHandle, Reporter};
 
 use crate::sse::Rendered;
 use crate::web::objects::{CommitMeta, Remote};
-use crate::{AppState, cache::RefIndex, error::ApiError};
+use crate::{AppState, auth::AuthError, cache::RefIndex, error::ApiError};
 
 const MAX_BLOB: usize = 2 * 1024 * 1024;
 const IMMUTABLE: &str = "private, max-age=31536000, immutable";
@@ -65,10 +65,6 @@ struct Resolved {
     path: String,
     kind: &'static str,
 }
-#[allow(
-    clippy::struct_field_names,
-    reason = "field names are the wire format clients read"
-)]
 #[derive(Serialize, Clone)]
 struct Commit {
     sha: String,
@@ -90,7 +86,11 @@ impl From<CommitMeta> for Commit {
         let (body, trailers) = super::trailers::split_trailers(&m.body);
         Commit {
             sha: m.id.to_string(),
-            parents: m.parents.iter().map(ToString::to_string).collect(),
+            parents: m
+                .parents
+                .iter()
+                .map(std::string::ToString::to_string)
+                .collect(),
             author: m.author,
             author_email: m.author_email,
             author_date: m.author_date,
@@ -151,10 +151,6 @@ struct Readme {
     name: String,
     contents: String,
 }
-#[allow(
-    clippy::struct_field_names,
-    reason = "field names are the wire format clients read"
-)]
 #[derive(Serialize)]
 struct Commits {
     #[serde(rename = "ref")]
@@ -224,6 +220,13 @@ pub fn router(state: Arc<AppState>) -> Router {
 /// *after* the repository prefix. No lane-first forms, no aliases (banner).
 pub const REPO_API_BASES: [&str; 2] = ["/{owner}/{repo}/api", "/{owner}/{repo}/api-browser"];
 
+pub(crate) fn auth_err(e: AuthError) -> ApiError {
+    match e {
+        AuthError::Invalid | AuthError::Unauthorized => ApiError::Unauthorized,
+        AuthError::Forbidden => ApiError::Forbidden,
+        AuthError::Unavailable => ApiError::ServiceUnavailable("auth provider unavailable".into()),
+    }
+}
 fn not_found(msg: impl Into<String>) -> ApiError {
     ApiError::NotFound(msg.into())
 }
@@ -266,7 +269,7 @@ impl Repo {
             .handle
             .sync_objects()
             .await
-            .map_err(crate::error::ApiError::from)?;
+            .map_err(crate::smart::wal_err)?;
         drop(guard);
         self.objects = true;
         self.access = access;
@@ -293,10 +296,7 @@ async fn open(
     owner: &str,
     name: &str,
 ) -> Result<Arc<RepoHandle>, ApiError> {
-    st.auth
-        .require_read(headers)
-        .await
-        .map_err(ApiError::from)?;
+    st.auth.require_read(headers).await.map_err(auth_err)?;
     let id = walgit_git::RepoId::new(owner, name).map_err(|_| not_found("repository"))?;
     st.registry.open(&id).await.map_err(|e| match e {
         walgit_wal::WalError::NotFound => not_found("repository"),
@@ -312,18 +312,12 @@ async fn view(
 ) -> Result<Repo, ApiError> {
     let (guard, access, objects) = match need {
         Need::Refs => (
-            handle
-                .sync_refs()
-                .await
-                .map_err(crate::error::ApiError::from)?,
+            handle.sync_refs().await.map_err(crate::smart::wal_err)?,
             ObjectAccess::Local,
             false,
         ),
         Need::Objects => {
-            let (g, a) = handle
-                .sync_objects()
-                .await
-                .map_err(crate::error::ApiError::from)?;
+            let (g, a) = handle.sync_objects().await.map_err(crate::smart::wal_err)?;
             (g, a, true)
         }
     };
@@ -391,9 +385,7 @@ where
                 .store()
                 .get(&shared_key(key), GetOptions::default())
                 .await
-            && let Ok(b) =
-                walgit_store::util::collect(body, usize::try_from(meta.size).unwrap_or(usize::MAX))
-                    .await
+            && let Ok(b) = walgit_store::util::collect(body, meta.size as usize).await
         {
             metrics::counter!("walgit_api_immutable_hit", "tier" => "store").increment(1);
             st.caches.api_immutable.insert(key.clone(), b.clone());
@@ -469,13 +461,10 @@ async fn instance_info(
     State(st): State<Arc<AppState>>,
     headers: HeaderMap,
 ) -> Result<Response, ApiError> {
-    st.auth
-        .require_read(&headers)
-        .await
-        .map_err(ApiError::from)?;
+    st.auth.require_read(&headers).await.map_err(auth_err)?;
     let mut r = axum::Json(crate::instance::info(&st.cfg)).into_response();
     r.headers_mut()
-        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+        .insert(header::CACHE_CONTROL, "no-store".parse().unwrap());
     Ok(r)
 }
 
@@ -485,10 +474,7 @@ pub(crate) async fn owners(
     State(st): State<Arc<AppState>>,
     headers: HeaderMap,
 ) -> Result<Response, ApiError> {
-    st.auth
-        .require_read(&headers)
-        .await
-        .map_err(ApiError::from)?;
+    st.auth.require_read(&headers).await.map_err(auth_err)?;
     let repos = st.registry.list().await.map_err(internal)?;
     let mut out: Vec<String> = repos.into_iter().map(|r| r.owner().to_string()).collect();
     out.sort();
@@ -500,10 +486,7 @@ pub(crate) async fn owner_repos(
     headers: HeaderMap,
     Path(owner): Path<String>,
 ) -> Result<Response, ApiError> {
-    st.auth
-        .require_read(&headers)
-        .await
-        .map_err(ApiError::from)?;
+    st.auth.require_read(&headers).await.map_err(auth_err)?;
     let repos = st.registry.list().await.map_err(internal)?;
     let mut out: Vec<String> = repos
         .into_iter()
@@ -574,7 +557,7 @@ async fn ref_list(
         .max(list.partition_point(|(name, _)| name.as_str() <= after));
     let mut refs = Vec::with_capacity(n.min(256));
     let mut more = false;
-    for (name, sha) in list.get(start..).unwrap_or_default() {
+    for (name, sha) in &list[start..] {
         if let Some(p) = &prefix
             && !name.starts_with(p.as_str())
         {
@@ -607,7 +590,7 @@ async fn ref_list(
         )));
         let mut resp = crate::sse::sse_response(futures::stream::iter(items));
         resp.headers_mut()
-            .insert(header::CACHE_CONTROL, HeaderValue::from_static(SWR));
+            .insert(header::CACHE_CONTROL, SWR.parse().unwrap());
         return Ok(resp);
     }
     Ok(json_swr(&RefPage { refs, more }, None).into_response(&headers))
@@ -632,10 +615,8 @@ async fn resolve_rest(r: &Repo, rest: &str) -> Result<Resolved, ApiError> {
     let mut cut_points: Vec<usize> = rest.match_indices('/').map(|(i, _)| i).collect();
     cut_points.push(rest.len());
     for &cut in cut_points.iter().rev() {
-        let Some((name, tail)) = rest.split_at_checked(cut) else {
-            continue;
-        };
-        let path = tail.trim_start_matches('/').to_string();
+        let name = &rest[..cut];
+        let path = rest[cut..].trim_start_matches('/').to_string();
         if let Some(sha) = r.index.branch(name) {
             return Ok(Resolved {
                 ref_name: name.to_string(),
@@ -905,27 +886,27 @@ async fn render_tree(
             continue;
         };
         let (meta, name) = item.split_at(tab);
-        let name = name.get(1..).unwrap_or_default();
+        let name = &name[1..];
         // `ls-tree -l` right-aligns the size with padding spaces.
         let fields: Vec<&[u8]> = meta
             .split(|b| *b == b' ')
             .filter(|f| !f.is_empty())
             .collect();
-        let [mode, kind, sha, size, ..] = fields.as_slice() else {
+        if fields.len() < 4 {
             continue;
-        };
-        let kind = String::from_utf8_lossy(kind).to_string();
+        }
+        let kind = String::from_utf8_lossy(fields[1]).to_string();
         let size = if kind == "blob" {
-            String::from_utf8_lossy(size).parse().unwrap_or(-1)
+            String::from_utf8_lossy(fields[3]).parse().unwrap_or(-1)
         } else {
             -1
         };
         entries.push(TreeEntry {
             name: String::from_utf8_lossy(name).to_string(),
             kind,
-            mode: String::from_utf8_lossy(mode).to_string(),
+            mode: String::from_utf8_lossy(fields[0]).to_string(),
             size,
-            sha: String::from_utf8_lossy(sha).to_string(),
+            sha: String::from_utf8_lossy(fields[2]).to_string(),
         });
     }
     sort_entries(&mut entries);
@@ -1008,7 +989,7 @@ async fn render_tree_remote(remote: &Remote, res: &Resolved) -> Result<bytes::By
                     .await
                     .ok()
                     .flatten()
-                    .map_or(-1, |(_, s)| i64::try_from(s).unwrap_or(i64::MAX))
+                    .map_or(-1, |(_, s)| s as i64)
             } else {
                 -1
             };
@@ -1123,14 +1104,11 @@ async fn blob(
                     .kind_and_size(&target)
                     .await?
                     .ok_or_else(|| not_found("blob"))?;
-                if usize::try_from(size).unwrap_or(usize::MAX) > MAX_BLOB {
-                    (i64::try_from(size).unwrap_or(i64::MAX), None)
+                if size as usize > MAX_BLOB {
+                    (size as i64, None)
                 } else {
                     let o = remote.get(&target).await?;
-                    (
-                        i64::try_from(size).unwrap_or(i64::MAX),
-                        Some(o.data.to_vec()),
-                    )
+                    (size as i64, Some(o.data.to_vec()))
                 }
             } else {
                 let bytes = git(
@@ -1142,9 +1120,9 @@ async fn blob(
                     ],
                 )
                 .await?;
-                (i64::try_from(bytes.len()).unwrap_or(i64::MAX), Some(bytes))
+                (bytes.len() as i64, Some(bytes))
             };
-            let is_text = size <= i64::try_from(MAX_BLOB).unwrap_or(i64::MAX)
+            let is_text = size <= MAX_BLOB as i64
                 && bytes
                     .as_ref()
                     .is_some_and(|b| !b.contains(&0) && std::str::from_utf8(b).is_ok());
@@ -1157,7 +1135,7 @@ async fn blob(
                     etag: (!immutable).then_some(etag),
                 });
             }
-            let b = if size > i64::try_from(MAX_BLOB).unwrap_or(i64::MAX) {
+            let b = if size > MAX_BLOB as i64 {
                 Blob {
                     ref_name: res.ref_name.clone(),
                     sha: res.sha.clone(),
@@ -1254,7 +1232,7 @@ async fn commits(
                 };
                 remote.reporter.notice(format!(
                     "{label} from {} (reading commits from the WAL pack set)",
-                    res.sha.get(..12).unwrap_or(&res.sha)
+                    &res.sha[..12]
                 ));
                 let all = remote
                     .walk(
@@ -1333,7 +1311,7 @@ async fn commit_detail(
                     .map_err(|_| not_found("commit"))?;
                 remote.reporter.notice(format!(
                     "Reading commit {} from the WAL pack set",
-                    sha.get(..12).unwrap_or(&sha)
+                    &sha[..12]
                 ));
                 remote.fault_commit_diff(&oid).await?;
             }
@@ -1404,23 +1382,21 @@ fn parse_stats(bytes: &[u8]) -> Vec<Stat> {
         .lines()
         .filter_map(|line| {
             let f: Vec<&str> = line.split('\t').collect();
-            let [adds, dels, rename, ..] = f.as_slice() else {
-                return None;
-            };
-            if !adds.chars().all(|c| c.is_ascii_digit()) && *adds != "-" {
+            if f.len() < 3 || (!f[0].chars().all(|c| c.is_ascii_digit()) && f[0] != "-") {
                 return None;
             }
+            let path = normalize_rename(f[2]);
             Some(Stat {
-                path: normalize_rename(rename),
-                additions: if *adds == "-" {
+                path,
+                additions: if f[0] == "-" {
                     -1
                 } else {
-                    adds.parse().unwrap_or(-1)
+                    f[0].parse().unwrap_or(-1)
                 },
-                deletions: if *dels == "-" {
+                deletions: if f[1] == "-" {
                     -1
                 } else {
-                    dels.parse().unwrap_or(-1)
+                    f[1].parse().unwrap_or(-1)
                 },
             })
         })
@@ -1430,16 +1406,16 @@ fn parse_stats(bytes: &[u8]) -> Vec<Stat> {
 /// return the new path.
 fn normalize_rename(s: &str) -> String {
     if let (Some(open), Some(close)) = (s.find('{'), s.rfind('}'))
-        && let Some(inner) = s.get(open + 1..close)
-        && let Some(head) = s.get(..open)
-        && let Some(tail) = s.get(close + 1..)
-        && let Some((_, new)) = inner.split_once(" => ")
+        && open < close
     {
-        let mut out = String::with_capacity(s.len());
-        out.push_str(head);
-        out.push_str(new);
-        out.push_str(tail);
-        return out.replace("//", "/");
+        let inner = &s[open + 1..close];
+        if let Some((_, new)) = inner.split_once(" => ") {
+            let mut out = String::with_capacity(s.len());
+            out.push_str(&s[..open]);
+            out.push_str(new);
+            out.push_str(&s[close + 1..]);
+            return out.replace("//", "/");
+        }
     }
     if let Some((_, new)) = s.split_once(" => ") {
         return new.to_string();

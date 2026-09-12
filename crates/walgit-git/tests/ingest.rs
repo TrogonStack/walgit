@@ -1,17 +1,7 @@
-#![allow(
-    clippy::unwrap_used,
-    clippy::expect_used,
-    clippy::panic,
-    clippy::indexing_slicing,
-    clippy::many_single_char_names
-)]
-// clippy.toml exempts #[test] functions from the panic-path lints, but not the plain
-// helper functions beside them in the same file. A panic in a fixture builder is how
-// that fixture reports it could not be built, exactly as in the tests it serves.
+#![allow(clippy::format_collect)]
 
 mod common;
 
-use std::fmt::Write as _;
 use std::path::Path;
 
 use std::io::Write;
@@ -244,18 +234,34 @@ async fn ingest_large_delta_pack() {
     );
     let mut stream = String::new();
     for i in 1..=2000 {
-        let _ = writeln!(
-            stream,
-            "commit refs/heads/main\nmark :{i}\nauthor bench <bench@example.com> {i} +0000\ncommitter bench <bench@example.com> {i} +0000"
-        );
+        {
+            let _ = std::fmt::Write::write_fmt(
+                &mut stream,
+                format_args!(
+                    "commit refs/heads/main\nmark :{i}\nauthor bench <bench@example.com> {i} +0000\ncommitter bench <bench@example.com> {i} +0000\n"
+                ),
+            );
+        };
         let message = format!("commit {i}\n");
-        let _ = writeln!(stream, "data {}\n{}", message.len(), message);
+        {
+            let _ = std::fmt::Write::write_fmt(
+                &mut stream,
+                format_args!("data {}\n{}\n", message.len(), message),
+            );
+        };
         if i > 1 {
-            let _ = writeln!(stream, "from :{}", i - 1);
+            {
+                let _ = std::fmt::Write::write_fmt(&mut stream, format_args!("from :{}\n", i - 1));
+            };
         }
         stream.push_str("M 100644 inline file.txt\n");
         let content = format!("content {i} {}\n", "x".repeat(256));
-        let _ = writeln!(stream, "data {}\n{}", content.len(), content);
+        {
+            let _ = std::fmt::Write::write_fmt(
+                &mut stream,
+                format_args!("data {}\n{}\n", content.len(), content),
+            );
+        };
     }
     let mut fast_import = Command::new("git")
         .current_dir(source.path())
@@ -414,10 +420,7 @@ async fn ingest_failures_name_the_cause_and_leave_nothing_behind() {
     let src = cm::SourceRepo::new();
     // A big blob, then a one-line edit: `pack-objects --thin ^a b` deltas the new blob against the
     // excluded one, so the thin pack really has an external base (tiny files produce no delta).
-    let mut big = String::new();
-    for i in 0..4000 {
-        let _ = writeln!(big, "line {i}");
-    }
+    let big: String = (0..4000).map(|i| format!("line {i}\n")).collect();
     let a = src.commit_file("big.txt", &big, "big");
     let b = src.commit_file("big.txt", &format!("{big}tail\n"), "edit");
     let opts = |thin: bool, max_bytes: Option<u64>| IngestOptions {

@@ -1,3 +1,4 @@
+#![allow(clippy::needless_continue, clippy::too_many_arguments)]
 //! Core bundling operations: ref resolution, bundle creation, store upload,
 //! bundle-list CAS management, pruning, and per-strategy leasing.
 //!
@@ -70,7 +71,7 @@ pub(crate) fn filter_refs(snap: &RefSnapshotData, patterns: &[String]) -> (Vec<S
     let effective: Vec<&str> = if patterns.is_empty() {
         vec!["refs/heads/*", "refs/tags/*", "HEAD"]
     } else {
-        patterns.iter().map(String::as_str).collect()
+        patterns.iter().map(std::string::String::as_str).collect()
     };
 
     let mut ref_names = Vec::new();
@@ -230,12 +231,12 @@ pub async fn create_bundle(
         "--stdout",
     ]
     .iter()
-    .map(ToString::to_string)
+    .map(std::string::ToString::to_string)
     .collect();
     if let Some(f) = filter {
         po_args.push(format!("--filter={f}"));
     }
-    let po_args: Vec<&str> = po_args.iter().map(String::as_str).collect();
+    let po_args: Vec<&str> = po_args.iter().map(std::string::String::as_str).collect();
     let mut child = git(&po_args)
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
@@ -247,7 +248,7 @@ pub async fn create_bundle(
         let mut stdin = child
             .stdin
             .take()
-            .ok_or_else(|| BundleError::Io("git pack-objects stdin".into()))?;
+            .ok_or_else(|| BundleError::Io("git pack-objects stdin was not piped".into()))?;
         stdin
             .write_all(revs.as_bytes())
             .await
@@ -268,12 +269,16 @@ pub async fn create_bundle(
     let mut stdout = child
         .stdout
         .take()
-        .ok_or_else(|| BundleError::Io("git pack-objects stdout".into()))?;
+        .ok_or_else(|| BundleError::Io("git pack-objects stdout was not piped".into()))?;
     let mut first = [0u8; 12];
     tokio::io::AsyncReadExt::read_exact(&mut stdout, &mut first)
         .await
         .map_err(|e| BundleError::Io(format!("pack header: {e}")))?;
-    let objects = u32::from_be_bytes([first[8], first[9], first[10], first[11]]);
+    let count_bytes: [u8; 4] = first
+        .get(8..12)
+        .and_then(|bytes| bytes.try_into().ok())
+        .ok_or_else(|| BundleError::Other("pack header lacks an object count".into()))?;
+    let objects = u32::from_be_bytes(count_bytes);
     {
         use tokio::io::AsyncWriteExt;
         file.write_all(&first)
@@ -332,7 +337,10 @@ pub fn bundle_checksum_file(path: &std::path::Path) -> std::io::Result<String> {
         if n == 0 {
             break;
         }
-        hasher.update(buf.get(..n).unwrap_or_default());
+        let chunk = buf
+            .get(..n)
+            .ok_or_else(|| std::io::Error::other("read exceeded checksum buffer"))?;
+        hasher.update(chunk);
     }
     Ok(hex::encode(hasher.finalize()))
 }
@@ -460,6 +468,7 @@ where
                         Ok(meta) => return Ok(Some((meta.version, new_list))),
                         Err(StoreError::PreconditionFailed { .. }) => {
                             debug!(attempt, "cas retry: list created by another writer");
+                            continue;
                         }
                         Err(e) => return Err(e.into()),
                     }
@@ -482,6 +491,7 @@ where
                             Ok(new_meta) => return Ok(Some((new_meta.version, new_list))),
                             Err(StoreError::PreconditionFailed { .. }) => {
                                 debug!(attempt, "cas retry: list changed by another writer");
+                                continue;
                             }
                             Err(e) => return Err(e.into()),
                         }
@@ -800,7 +810,7 @@ pub async fn build_and_upload(
             build_span.record("bytes", s);
             build_span.record("outcome", "ok");
             metrics::histogram!("walgit_bundle_build_seconds", "strategy" => strategy_name.to_string(), "kind" => match kind { BundleKind::Full => "full", BundleKind::Incremental => "incremental" }).record(t_build.elapsed().as_secs_f64());
-            metrics::histogram!("walgit_bundle_build_bytes", "strategy" => strategy_name.to_string()).record(s as f64);
+            metrics::histogram!("walgit_bundle_build_bytes", "strategy" => strategy_name.to_string()).record(metric_u64(s));
             s
         }
         Err(BundleError::Git(GitError::Subprocess { stderr, .. }))
@@ -882,6 +892,13 @@ pub async fn build_and_upload(
 
     debug!(strategy = strategy_name, kind = kind_str, key = %entry.key, slot = cut.slot, "bundle uploaded");
     Ok(entry)
+}
+
+/// Metrics use `f64`; values beyond its exact integer range are still useful as
+/// approximate byte counts.
+#[allow(clippy::cast_precision_loss)]
+fn metric_u64(value: u64) -> f64 {
+    value as f64
 }
 
 /// Find the most recent bundle entry for `strategy` in `list`.
@@ -1012,10 +1029,6 @@ pub fn full_bundle_header(
     (h, tips)
 }
 
-#[allow(
-    clippy::too_many_arguments,
-    reason = "one parameter per input the compose needs; a wrapper struct would only be built and destructured at the call sites"
-)]
 /// Publish `bundles/<strategy>/<stamp>-<pack>.bundle` = header ∘ `wal/<pack>.pack`
 /// by compose (falls back to streaming header + `pack_path` when the store
 /// cannot compose; then `pack_path` must be a local file) and return the entry

@@ -141,9 +141,6 @@ pub enum StartError {
 /// Start `op` for `id` on this instance as a background task and return its
 /// state (stream it with [`crate::sse::task_stream`]). The op keeps running if
 /// every client goes away.
-// The params map is threaded straight into `run`, which is not generic over the
-// hasher, so a generic `S` here would only move the concrete type one call deeper.
-#[allow(clippy::implicit_hasher)]
 pub async fn start(
     state: Arc<AppState>,
     id: RepoId,
@@ -322,7 +319,7 @@ async fn run(
                     serde_json::json!({"missing": 0}),
                 ));
             }
-            if usize::try_from(fsck.missing_total).unwrap_or(usize::MAX) > fsck.missing.len() {
+            if fsck.missing_total as usize > fsck.missing.len() {
                 log(format!(
                     "fsck listed {} of {} missing objects; repairing those, the next fsck finds the rest",
                     fsck.missing.len(),
@@ -334,6 +331,7 @@ async fn run(
                     state
                         .lfs_upstream
                         .secret(name)
+                        .await
                         .map_err(|e| format!("upstream token: {e}"))?,
                 ),
                 None => None,

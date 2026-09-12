@@ -13,7 +13,6 @@
 //! credential helper that reads it from the environment — never argv.
 
 use std::collections::HashMap;
-use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
@@ -43,7 +42,7 @@ impl FetchedDelta {
 
 /// Fetch `refs` from `upstream` into the scratch for `(owner, name)` under `dir`,
 /// negotiating from `have` (`ref → oid` we hold; missing = fetch its history).
-pub async fn fetch_refs<S: ::std::hash::BuildHasher>(
+pub async fn fetch_refs<S: std::hash::BuildHasher + Sync>(
     upstream: &str,
     token: Option<&str>,
     serving_objects: &Path,
@@ -123,10 +122,16 @@ pub async fn fetch_refs<S: ::std::hash::BuildHasher>(
         for r in refs {
             match have.get(r) {
                 Some(oid) => {
-                    let _ = writeln!(input, "update {} {oid}", follow_ref(r));
+                    let _ = std::fmt::Write::write_fmt(
+                        &mut input,
+                        format_args!("update {} {oid}\n", follow_ref(r)),
+                    );
                 }
                 None => {
-                    let _ = writeln!(input, "delete {}", follow_ref(r));
+                    let _ = std::fmt::Write::write_fmt(
+                        &mut input,
+                        format_args!("delete {}\n", follow_ref(r)),
+                    );
                 }
             }
         }
@@ -139,7 +144,7 @@ pub async fn fetch_refs<S: ::std::hash::BuildHasher>(
             let mut stdin = child
                 .stdin
                 .take()
-                .ok_or_else(|| GitError::Io(std::io::Error::other("git update-ref stdin")))?;
+                .ok_or_else(|| std::io::Error::other("git stdin unavailable"))?;
             stdin
                 .write_all(input.as_bytes())
                 .await

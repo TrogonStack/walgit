@@ -1,3 +1,6 @@
+// Test fixtures use panics to fail the test, including shared helper functions.
+#![allow(clippy::indexing_slicing, clippy::unwrap_used)]
+
 //! `upstream.lfs` read-through (per-repo D24 setting): a mock upstream LFS
 //! server holds one object; walgit's store has none.
 //! - batch `upload`: the object is reported present with **no actions** (git-lfs
@@ -7,21 +10,10 @@
 //!   the upstream and persists them into the store (second GET served locally).
 //! - upstream lacks it: 404 on download, upload action on upload.
 
-#![allow(
-    clippy::unwrap_used,
-    clippy::expect_used,
-    clippy::panic,
-    clippy::indexing_slicing,
-    clippy::many_single_char_names
-)]
-// clippy.toml exempts #[test] functions from the panic-path lints, but not the plain
-// helper functions beside them in the same file. A panic in a fixture builder is how
-// that fixture reports it could not be built, exactly as in the tests it serves.
-
 mod harness;
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
 use axum::{
@@ -91,7 +83,7 @@ async fn start_mock(body: Vec<u8>) -> Result<(Arc<Mock>, String)> {
         body,
         batches: AtomicUsize::new(0),
         downloads: AtomicUsize::new(0),
-        base: std::sync::Mutex::default(),
+        base: Mutex::default(),
     });
     let app = Router::new()
         .route("/lfs/objects/batch", post(mock_batch))

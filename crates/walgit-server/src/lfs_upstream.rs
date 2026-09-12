@@ -79,10 +79,6 @@ impl Default for Upstream {
 }
 
 impl Upstream {
-    #[allow(
-        clippy::expect_used,
-        reason = "the client builds unless the TLS backend is unavailable, and then the process cannot serve at all"
-    )]
     pub fn new() -> Self {
         Self {
             client: reqwest::Client::builder()
@@ -145,7 +141,7 @@ impl Upstream {
             .header("Content-Type", "application/vnd.git-lfs+json")
             .json(&body);
         if let Some(secret) = token_env {
-            let token = self.secret(secret)?;
+            let token = self.secret(secret).await?;
             let basic =
                 base64::engine::general_purpose::STANDARD.encode(format!("x-access-token:{token}"));
             req = req.header("Authorization", format!("Basic {basic}"));
@@ -160,13 +156,17 @@ impl Upstream {
             let Some(dl) = o.actions.and_then(|a| a.download) else {
                 continue;
             };
-            let Some(asked_size) = asked.get(o.oid.as_str()).copied() else {
+            if !asked.contains_key(o.oid.as_str()) {
                 continue;
-            };
+            }
             out.insert(
                 o.oid.clone(),
                 UpstreamObject {
-                    size: if o.size > 0 { o.size } else { asked_size },
+                    size: if o.size > 0 {
+                        o.size
+                    } else {
+                        asked[o.oid.as_str()]
+                    },
                     oid: o.oid,
                     href: dl.href,
                     header: dl.header,
@@ -211,7 +211,7 @@ impl Upstream {
     }
 
     /// The upstream token: the value of the environment variable `upstream.token_env` names.
-    pub fn secret(&self, env_name: &str) -> anyhow::Result<String> {
+    pub async fn secret(&self, env_name: &str) -> anyhow::Result<String> {
         let v = std::env::var(env_name).map_err(|_| {
             anyhow::anyhow!("upstream.token_env {env_name:?} is not set in this host's environment")
         })?;

@@ -10,9 +10,8 @@
 //!   **m** — 2 000 commits, 5 000 files, binary blobs, 20 branches, 50 tags
 //!   **l** — 50 000 commits, 50 000 files
 
-use std::fmt::Write as _;
 use std::io::Write;
-use std::path::Path;
+use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
 use anyhow::{Context, Result, bail};
@@ -33,8 +32,8 @@ fn size_params(
     (commits.unwrap_or(c), files.unwrap_or(f), br, tg, bin)
 }
 
-pub fn run(
-    out: &Path,
+pub async fn run(
+    out: PathBuf,
     size: SynthSize,
     commits: Option<u64>,
     files: Option<u64>,
@@ -43,16 +42,16 @@ pub fn run(
     let (n_commits, n_files, n_branches, n_tags, binary) = size_params(size, commits, files);
     let seed = seed.unwrap_or(42);
 
-    if out.exists() && std::fs::read_dir(out)?.next().is_some() {
+    if out.exists() && std::fs::read_dir(&out)?.next().is_some() {
         bail!("output directory {} is not empty", out.display());
     }
-    std::fs::create_dir_all(out)?;
+    std::fs::create_dir_all(&out)?;
 
     // git init
     let _git_dir = out.join(".git");
     let status = Command::new("git")
         .args(["init", "--quiet"])
-        .current_dir(out)
+        .current_dir(&out)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::inherit())
@@ -71,7 +70,7 @@ pub fn run(
     ] {
         Command::new("git")
             .args(["config", key, val])
-            .current_dir(out)
+            .current_dir(&out)
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status()?;
@@ -91,7 +90,7 @@ pub fn run(
     // Pipe the stream to `git fast-import`.
     let mut child = Command::new("git")
         .args(["fast-import", "--quiet", "--done"])
-        .current_dir(out)
+        .current_dir(&out)
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::inherit())
@@ -112,7 +111,7 @@ pub fn run(
     // Checkout the main branch so it's a working tree.
     Command::new("git")
         .args(["checkout", "-f", "main"])
-        .current_dir(out)
+        .current_dir(&out)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status()?;
@@ -120,7 +119,7 @@ pub fn run(
     // Verify with git fsck.
     let fsck = Command::new("git")
         .args(["fsck", "--full", "--strict"])
-        .current_dir(out)
+        .current_dir(&out)
         .output()
         .context("running git fsck")?;
     if !fsck.status.success() {
@@ -133,7 +132,7 @@ pub fn run(
     // Print the HEAD commit for verification.
     let head = Command::new("git")
         .args(["rev-parse", "HEAD"])
-        .current_dir(out)
+        .current_dir(&out)
         .output()?;
     let head = String::from_utf8_lossy(&head.stdout).trim().to_string();
     println!("synth OK: {n_commits} commits, {n_files} files, HEAD={head}");
@@ -158,7 +157,7 @@ impl Rng {
         x ^= x << 25;
         x ^= x >> 27;
         self.0 = x;
-        x.wrapping_mul(0x2545_F491_4F6C_DD1D)
+        x.wrapping_mul(0x2545F4914F6CDD1D)
     }
     /// [0, n)
     fn below(&mut self, n: u64) -> u64 {
@@ -166,12 +165,16 @@ impl Rng {
     }
     /// Fills `buf` with deterministic pseudo-random bytes.
     fn fill_bytes(&mut self, buf: &mut [u8]) {
-        for chunk in buf.chunks_mut(8) {
+        let mut i = 0;
+        while i + 8 <= buf.len() {
             let v = self.next_u64().to_le_bytes();
-            let n = chunk.len();
-            if let Some(src) = v.get(..n) {
-                chunk.copy_from_slice(src);
-            }
+            buf[i..i + 8].copy_from_slice(&v);
+            i += 8;
+        }
+        if i < buf.len() {
+            let v = self.next_u64().to_le_bytes();
+            let rem = buf.len() - i;
+            buf[i..i + rem].copy_from_slice(&v[..rem]);
         }
     }
 }
@@ -235,8 +238,7 @@ fn generate_stream(
 
         // How many files to touch in this commit (1..=8, but capped by n_files).
         let touch = 1 + rng.below(8).min(n_files.max(1));
-        let mut file_changes: Vec<(String, Vec<u8>)> =
-            Vec::with_capacity(usize::try_from(touch).unwrap_or(usize::MAX));
+        let mut file_changes: Vec<(String, Vec<u8>)> = Vec::with_capacity(touch as usize);
 
         for _ in 0..touch {
             let file_idx = rng.below(n_files);
@@ -257,7 +259,7 @@ fn generate_stream(
         let commit_mark = next_mark;
         next_mark += 1;
 
-        let ts = 1_262_304_000 + commit_num * 60; // 2020-01-01 + 1min per commit
+        let ts = 1262304000 + commit_num * 60; // 2020-01-01 + 1min per commit
         let ts_str = format!("{ts} +0000");
 
         w.write_str(&format!("commit {main}\n"));
@@ -331,7 +333,7 @@ fn generate_file(rng: &mut Rng, file_idx: u64, binary: bool, commit_num: u64) ->
 
     let content = if is_binary {
         // Binary blob: 256..4096 random bytes.
-        let len = 256 + usize::try_from(rng.below(3840)).unwrap_or(usize::MAX);
+        let len = 256 + rng.below(3840) as usize;
         let mut buf = vec![0u8; len];
         rng.fill_bytes(&mut buf);
         buf
@@ -340,11 +342,15 @@ fn generate_file(rng: &mut Rng, file_idx: u64, binary: bool, commit_num: u64) ->
         let lines = 3 + (rng.next_u64() % 20) as usize;
         let mut s = String::with_capacity(lines * 40);
         for i in 0..lines {
-            let _ = writeln!(
-                s,
-                "line {i} of file {file_idx} at commit {commit_num}: {:016x}",
-                rng.next_u64()
-            );
+            {
+                let _ = std::fmt::Write::write_fmt(
+                    &mut s,
+                    format_args!(
+                        "line {i} of file {file_idx} at commit {commit_num}: {:016x}\n",
+                        rng.next_u64()
+                    ),
+                );
+            };
         }
         s.into_bytes()
     };
@@ -415,12 +421,16 @@ mod tests {
     async fn synth_s_produces_valid_repo() {
         let tmp = tempfile::tempdir().unwrap();
         let out = tmp.path().join("repo");
-        run(out.as_path(), SynthSize::S, None, None, Some(999)).unwrap();
+        run(out.clone(), SynthSize::S, None, None, Some(999))
+            .await
+            .unwrap();
 
         // Same seed → same HEAD.
         let tmp2 = tempfile::tempdir().unwrap();
         let out2 = tmp2.path().join("repo");
-        run(&out2, SynthSize::S, None, None, Some(999)).unwrap();
+        run(out2, SynthSize::S, None, None, Some(999))
+            .await
+            .unwrap();
 
         let head1 = git_head(&out).unwrap();
         let head2 = git_head2(&tmp2).unwrap();

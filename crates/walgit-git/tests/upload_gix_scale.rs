@@ -1,3 +1,12 @@
+// Test fixtures use panics to fail the test, including shared helper functions.
+#![allow(
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::unwrap_used,
+    clippy::cast_possible_truncation,
+    clippy::format_push_string
+)]
+
 //! Reproducer for AGENTS §6 "gix large-fetch object-id corruption and 178 GB OOM" (2026-08-21
 //! 05:4xZ: a remainder pack carried an entry under another object's id; 07:0xZ: the same shape
 //! replayed over a large repository was OOM-killed at 178 GB anon RSS after `Enumerating objects: 113683`).
@@ -16,21 +25,9 @@
 //! `cargo test -p walgit-git --test upload_gix_scale` runs the ~30 k-object variant (< 60 s);
 //! `-- --ignored` runs the ~300 k-object one (`just test-slow`).
 
-#![allow(
-    clippy::unwrap_used,
-    clippy::expect_used,
-    clippy::panic,
-    clippy::indexing_slicing,
-    clippy::many_single_char_names
-)]
-// clippy.toml exempts #[test] functions from the panic-path lints, but not the plain
-// helper functions beside them in the same file. A panic in a fixture builder is how
-// that fixture reports it could not be built, exactly as in the tests it serves.
-
 mod common;
 
 use std::collections::BTreeSet;
-use std::fmt::Write as _;
 use std::io::Write;
 use std::process::{Command, Stdio};
 
@@ -40,19 +37,26 @@ mod cm {
     pub use super::common::*;
 }
 
-#[allow(unsafe_code)]
 fn max_rss_kb() -> u64 {
-    // SAFETY: rusage is a plain C struct of integers, so all-zero is a valid value.
+    // SAFETY: rusage contains C numeric fields whose all-zero values are valid.
+    #[allow(unsafe_code)]
     let mut ru: libc::rusage = unsafe { std::mem::zeroed() };
-    // SAFETY: `ru` is a live, correctly typed rusage that getrusage only writes into.
-    unsafe { libc::getrusage(libc::RUSAGE_SELF, &raw mut ru) };
+    // SAFETY: ru is aligned writable storage; RUSAGE_SELF is a supported selector.
+    #[allow(unsafe_code)]
+    let result = unsafe { libc::getrusage(libc::RUSAGE_SELF, &raw mut ru) };
+    assert_eq!(
+        result,
+        0,
+        "getrusage failed: {}",
+        std::io::Error::last_os_error()
+    );
     // getrusage reports ru_maxrss in KB on Linux but in BYTES on macOS/BSD.
     // Without this, the memory-bound assertion reads 1024x high on macOS and
     // fails a passing result (a 16 MB delta shown as "16832 MB").
     #[cfg(any(target_os = "macos", target_os = "ios"))]
-    let kb = (u64::try_from(ru.ru_maxrss).unwrap_or(0)) / 1024;
+    let kb = (u64::try_from(ru.ru_maxrss).expect("nonnegative peak RSS")) / 1024;
     #[cfg(not(any(target_os = "macos", target_os = "ios")))]
-    let kb = u64::try_from(ru.ru_maxrss).unwrap_or(0);
+    let kb = u64::try_from(ru.ru_maxrss).expect("nonnegative peak RSS");
     kb
 }
 
@@ -88,7 +92,12 @@ fn synth(commits: usize, files: usize, files_per_commit: usize, dirs: usize) -> 
                 let mut c = format!("file {f}\n");
                 let words = 200 + (next() % 6000) as usize;
                 for _ in 0..words {
-                    let _ = write!(c, "{:06x} ", next() & 0x00ff_ffff);
+                    {
+                        let _ = std::fmt::Write::write_fmt(
+                            &mut c,
+                            format_args!("{:06x} ", next() & 0x00ff_ffff),
+                        );
+                    };
                 }
                 c.push('\n');
                 c
@@ -109,12 +118,12 @@ fn synth(commits: usize, files: usize, files_per_commit: usize, dirs: usize) -> 
                 writeln!(w, "from :{}", c - 1).unwrap();
             }
             for _ in 0..files_per_commit {
-                let f = (usize::try_from(next()).unwrap_or(usize::MAX)) % files;
+                let f = (next() as usize) % files;
                 // Mostly appends (small deltas), sometimes a rewrite (a new base in the chain).
                 if next() % 17 == 0 {
                     contents[f] = format!("file {f} rewritten at {c} {:016x}\n", next());
                 } else {
-                    let _ = writeln!(contents[f], "line {c} {:016x}", next());
+                    contents[f].push_str(&format!("line {c} {:016x}\n", next()));
                 }
                 let path = format!("d{}/s{}/f{f}.txt", f % dirs, (f / dirs) % 7);
                 writeln!(w, "M 100644 inline {path}").unwrap();
@@ -264,7 +273,7 @@ fn count_ref_deltas(pack: &[u8]) -> usize {
         let mut d = flate2::read::ZlibDecoder::new(&pack[pos..]);
         let mut sink = Vec::new();
         d.read_to_end(&mut sink).unwrap();
-        pos += usize::try_from(d.total_in()).unwrap_or(usize::MAX);
+        pos += d.total_in() as usize;
     }
     refs
 }
@@ -471,7 +480,7 @@ async fn run_shapes(commits: usize, files: usize, per_commit: usize, dirs: usize
                 took.as_secs_f64()
             );
             assert_eq!(
-                usize::try_from(stats.objects).unwrap_or(usize::MAX),
+                stats.objects as usize,
                 ids.len(),
                 "{name}: stats vs indexed entries"
             );
@@ -523,7 +532,7 @@ async fn gix_engine_packs_are_strict_valid_and_bounded_in_memory_30k() {
 
 /// ~300 k objects with long delta chains across two packs: `just test-slow`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "~300k objects; run with `just test-slow`"]
+#[ignore = "large stress test; run in test-slow tier"]
 async fn gix_engine_packs_are_strict_valid_and_bounded_in_memory_300k() {
     run_shapes(12_000, 1_500, 10, 40, 10_000).await;
 }

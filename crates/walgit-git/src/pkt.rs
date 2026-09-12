@@ -101,11 +101,15 @@ async fn read_exact_or_eof<R: AsyncRead + Unpin>(
     buf: &mut [u8],
 ) -> Result<usize, GitError> {
     let mut filled = 0;
-    while let Some(dst) = buf.get_mut(filled..).filter(|d| !d.is_empty()) {
-        let n = r.read(dst).await.map_err(io_to_git)?;
+    let mut remaining = buf;
+    while !remaining.is_empty() {
+        let n = r.read(remaining).await.map_err(io_to_git)?;
         if n == 0 {
             break;
         }
+        remaining = remaining
+            .get_mut(n..)
+            .ok_or_else(|| GitError::Protocol("reader exceeded buffer".into()))?;
         filled += n;
     }
     Ok(filled)
@@ -240,7 +244,7 @@ pub struct V2Command {
 
 impl V2Command {
     pub fn cap(&self, key: &str) -> Option<&str> {
-        self.caps.get(key).map(String::as_str)
+        self.caps.get(key).map(std::string::String::as_str)
     }
     pub fn has_cap(&self, key: &str) -> bool {
         self.caps.contains_key(key)
@@ -373,11 +377,19 @@ fn io_to_git(e: std::io::Error) -> GitError {
 
 /// Encode a literal data pkt-line into a buffer (sync helper for building
 /// advertisement/section bytes).
+#[expect(
+    clippy::indexing_slicing,
+    reason = "Each index is masked to 0..16 for the 16-byte hex table"
+)]
 pub fn encode_data(buf: &mut Vec<u8>, data: &[u8]) {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let total = data.len() + 4;
-    let nib = |shift: usize| HEX.get((total >> shift) & 0xf).copied().unwrap_or(b'0');
-    buf.extend_from_slice(&[nib(12), nib(8), nib(4), nib(0)]);
+    buf.extend_from_slice(&[
+        HEX[(total >> 12) & 0xf],
+        HEX[(total >> 8) & 0xf],
+        HEX[(total >> 4) & 0xf],
+        HEX[total & 0xf],
+    ]);
     buf.extend_from_slice(data);
 }
 pub fn encode_flush(buf: &mut Vec<u8>) {

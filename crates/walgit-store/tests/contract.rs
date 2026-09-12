@@ -1,3 +1,14 @@
+// Test fixtures use panics to fail the test, including shared helper functions.
+#![allow(
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::panic,
+    clippy::unwrap_used,
+    clippy::cast_possible_truncation,
+    clippy::cast_precision_loss,
+    clippy::match_wildcard_for_single_variants
+)]
+
 //! Backend-agnostic contract suite for `ObjectStore`.
 //!
 //! `run_contract(store, prefix)` exercises every observable guarantee of the
@@ -9,17 +20,6 @@
 //! The suite is executed against `MemoryStore` always, and against `S3Store`
 //! when `WALGIT_TEST_S3_ENDPOINT` is set. `GcsStore` is tested when
 //! `WALGIT_TEST_GCS_BUCKET` is set (`StoreGcs` adds that wrapper).
-
-#![allow(
-    clippy::unwrap_used,
-    clippy::expect_used,
-    clippy::panic,
-    clippy::indexing_slicing,
-    clippy::many_single_char_names
-)]
-// clippy.toml exempts #[test] functions from the panic-path lints, but not the plain
-// helper functions beside them in the same file. A panic in a fixture builder is how
-// that fixture reports it could not be built, exactly as in the tests it serves.
 
 use std::ops::Range;
 use std::sync::Arc;
@@ -67,7 +67,7 @@ async fn test_compose(store: &DynStore, key: &str) {
     let header = Bytes::from_static(b"# v3 git bundle\n@object-format=sha1\n\n");
     let mut body = vec![0u8; 6 * 1024 * 1024 + 12345];
     for (i, b) in body.iter_mut().enumerate() {
-        *b = u8::try_from(i % 251).unwrap_or(0);
+        *b = (i % 251) as u8;
     }
     let body = Bytes::from(body);
     let h = format!("{key}.hdr");
@@ -132,10 +132,9 @@ async fn test_compose(store: &DynStore, key: &str) {
 async fn collect_body(r: GetResult) -> (walgit_store::ObjectMeta, Bytes) {
     match r {
         GetResult::Object { meta, body } => {
-            let collected =
-                walgit_store::util::collect(body, usize::try_from(meta.size).unwrap_or(usize::MAX))
-                    .await
-                    .expect("body collect");
+            let collected = walgit_store::util::collect(body, meta.size as usize)
+                .await
+                .expect("body collect");
             (meta, collected)
         }
         GetResult::NotModified { .. } => panic!("expected Object, got NotModified"),
@@ -568,6 +567,7 @@ async fn test_list(store: &DynStore, base: &str) {
 /// 8 MiB streamed put/get roundtrip with checksum.
 async fn test_large_streamed_roundtrip(store: &DynStore, key: &str) {
     use sha1::{Digest, Sha1};
+
     let _ = store.delete(key, None).await;
 
     // 8 MiB of pseudo-random but deterministic data.
@@ -781,6 +781,7 @@ async fn gcs_contract() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn gcs_control_plane_not_starved_by_bulk() {
     const CHUNK: u64 = 32 * 1024 * 1024;
+
     let (Ok(bucket), Ok(big_key)) = (
         std::env::var("WALGIT_TEST_GCS_BUCKET"),
         std::env::var("WALGIT_TEST_GCS_BIG_KEY"),
@@ -825,14 +826,13 @@ async fn gcs_control_plane_not_starved_by_bulk() {
         .await;
     eprintln!("baseline probe {:?}", t.elapsed());
     let total = (1u64 << 30).min(size);
+
     let bulk = {
         let store = store.clone();
         let big_key = big_key.clone();
         tokio::spawn(async move {
             let t = std::time::Instant::now();
-            let starts: Vec<u64> = (0..total)
-                .step_by(usize::try_from(CHUNK).unwrap_or(usize::MAX))
-                .collect();
+            let starts: Vec<u64> = (0..total).step_by(CHUNK as usize).collect();
             let n = futures::stream::iter(starts)
                 .map(|start| {
                     let store = store.clone();
@@ -849,14 +849,13 @@ async fn gcs_control_plane_not_starved_by_bulk() {
                             .await
                             .unwrap();
                         match r {
-                            GetResult::Object { body, .. } => walgit_store::util::collect(
-                                body,
-                                usize::try_from(CHUNK).unwrap_or(usize::MAX),
-                            )
-                            .await
-                            .unwrap()
-                            .len(),
-                            GetResult::NotModified { .. } => 0,
+                            GetResult::Object { body, .. } => {
+                                walgit_store::util::collect(body, CHUNK as usize)
+                                    .await
+                                    .unwrap()
+                                    .len()
+                            }
+                            _ => 0,
                         }
                     }
                 })

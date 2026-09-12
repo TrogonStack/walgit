@@ -110,7 +110,7 @@ impl FaultPlan {
     }
     #[must_use]
     pub fn with_only(mut self, keys: &[&str]) -> Self {
-        self.only_keys = Some(keys.iter().map(ToString::to_string).collect());
+        self.only_keys = Some(keys.iter().map(std::string::ToString::to_string).collect());
         self
     }
 }
@@ -169,6 +169,10 @@ impl Rng {
         self.0 = x;
         x.wrapping_mul(0x2545_F491_4F6C_DD1D)
     }
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "The shifted numerator has 53 bits and the denominator is exactly 2^53"
+    )]
     fn f64(&mut self) -> f64 {
         (self.next_u64() >> 11) as f64 / (1u64 << 53) as f64
     }
@@ -258,9 +262,13 @@ impl FaultStore {
 
     /// Roll the dice for one op. `mutation`: put/delete/compose; `conditional`:
     /// CAS put/delete or if-none-match get; `body_len`: for truncation.
-    #[allow(
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "The truncation offset is sampled below 2^20 and fits usize"
+    )]
+    #[expect(
         clippy::panic,
-        reason = "injecting a crash is what this wrapper is for"
+        reason = "Explicit crash injection is the purpose of the fault-store test adapter"
     )]
     async fn decide(
         &self,
@@ -306,7 +314,7 @@ impl FaultStore {
         }
         if let Some((lo, hi)) = plan.delay {
             let span = u64::try_from(hi.saturating_sub(lo).as_micros()).unwrap_or(u64::MAX);
-            let extra = self.rng.lock().below(span + 1);
+            let extra = self.rng.lock().below(span.saturating_add(1));
             tokio::time::sleep(lo + Duration::from_micros(extra)).await;
         }
         if !Self::in_scope(&plan, key) {
@@ -316,7 +324,7 @@ impl FaultStore {
             let mut r = self.rng.lock();
             (
                 [r.f64(), r.f64(), r.f64(), r.f64(), r.f64(), r.f64()],
-                usize::try_from(r.below(1 << 20)).unwrap_or(usize::MAX),
+                r.below(1 << 20) as usize,
             )
         };
         let d = if roll[0] < plan.p_hang {
@@ -555,14 +563,15 @@ impl FaultStore {
             Decision::ErrBefore => Err(self.retryable("get", key, "before")),
             Decision::Denied => Err(StoreError::NotFound { key: key.into() }),
             Decision::Stale => Ok(GetResult::NotModified {
-                version: opts
-                    .if_none_match
-                    .clone()
-                    .unwrap_or_else(|| Version::new("")),
+                version: opts.if_none_match.clone().ok_or_else(|| {
+                    StoreError::other(anyhow::anyhow!(
+                        "stale response needs a conditional version"
+                    ))
+                })?,
             }),
             Decision::Truncate(at) => match self.inner.get(key, opts).await? {
                 GetResult::Object { meta, body } => {
-                    let size = usize::try_from(meta.size).unwrap_or(usize::MAX);
+                    let size = usize::try_from(meta.size).map_err(StoreError::other)?;
                     let at = if size == 0 { 0 } else { at % size };
                     let msg = format!(
                         "fault-store[{}]: injected truncation of {key} at {at}/{size}",

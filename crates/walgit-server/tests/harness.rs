@@ -1,13 +1,5 @@
-#![allow(
-    clippy::unwrap_used,
-    clippy::expect_used,
-    clippy::panic,
-    clippy::indexing_slicing,
-    clippy::many_single_char_names
-)]
-// clippy.toml exempts #[test] functions from the panic-path lints, but not the plain
-// helper functions beside them in the same file. A panic in a fixture builder is how
-// that fixture reports it could not be built, exactly as in the tests it serves.
+// Test fixtures use panics to fail the test, including shared helper functions.
+#![allow(clippy::unwrap_used)]
 #![allow(dead_code)]
 //! Test harness: spin up walgit-server on a random port backed by the in-memory
 //! store + a tempdir cache, and drive real upstream `git` against it.
@@ -121,12 +113,12 @@ impl Server {
         cfg.validate().context("config validate")?;
 
         let dyn_store: DynStore = store.clone();
-        let state = AppState::new(&Arc::new(cfg), dyn_store)?;
+        let state = AppState::new(Arc::new(cfg), dyn_store).await?;
 
         let registry = state.registry.clone();
         let bundles = state.bundles.clone();
         // Events bridge sweep timer (no-op unless the bridge is enabled).
-        walgit_server::bridge::spawn_sweeper(&state);
+        walgit_server::bridge::spawn_sweeper(state.clone());
 
         let app = router(state.clone());
         let (tx, rx) = tokio::sync::oneshot::channel::<()>();
@@ -223,12 +215,11 @@ impl Server {
         Ok(())
     }
 
-    // Callers wrap this in the suite's `with_timeout!`, which needs a future.
-    #[allow(clippy::unused_async)]
     pub async fn ls_remote(&self, owner: &str, repo: &str) -> Result<String> {
-        let out = Command::new("git")
+        let out = tokio::process::Command::new("git")
             .args(["ls-remote", &self.repo_url(owner, repo)])
-            .output()?;
+            .output()
+            .await?;
         assert!(
             out.status.success(),
             "ls-remote failed: {}",

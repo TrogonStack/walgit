@@ -39,7 +39,7 @@ pub async fn run(action: WalAction, cfg: &Arc<Config>) -> Result<()> {
                 let pack = e
                     .pack
                     .as_ref()
-                    .map(|p| p.checksum.get(..12).unwrap_or(&p.checksum).to_string())
+                    .map(|p| p.checksum[..12].to_string())
                     .unwrap_or_default();
                 let supersedes = e.supersedes.len();
                 let ref_count = e.txn.as_ref().map_or(0, |t| t.updates.len());
@@ -114,7 +114,7 @@ pub async fn run(action: WalAction, cfg: &Arc<Config>) -> Result<()> {
             if let Some(g) = &commit_graph {
                 let head = std::fs::read(g)?;
                 anyhow::ensure!(
-                    head.len() > 8 && head.starts_with(b"CGPH"),
+                    head.len() > 8 && &head[..4] == b"CGPH",
                     "{} is not a commit-graph file",
                     g.display()
                 );
@@ -213,8 +213,10 @@ pub async fn materialize_at(
     at_seq: u64,
     out: &std::path::Path,
 ) -> Result<()> {
-    use walgit_proto::prost::Message;
     use walgit_store::ObjectStoreExt;
+
+    use walgit_proto::prost::Message;
+
     let handle = registry.open(id).await?;
 
     // Read log entries up to at_seq and replay into a fresh LocalRepo.
@@ -314,8 +316,8 @@ pub async fn materialize_at(
         if src.is_file() && !src.is_symlink() {
             for ext in ["pack", "idx", "rev", "bitmap", "commit-graph"] {
                 let f = src.with_extension(ext);
-                if let (true, Some(name)) = (f.is_file(), f.file_name()) {
-                    std::fs::copy(&f, tmp.join(name))?;
+                if f.is_file() {
+                    std::fs::copy(&f, tmp.join(f.file_name().unwrap()))?;
                 }
             }
             println!("pack {}: copied from the local copy", p.checksum);
