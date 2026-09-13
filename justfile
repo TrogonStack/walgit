@@ -9,8 +9,8 @@ t10 := `if command -v timeout >/dev/null 2>&1; then echo "timeout 600"; elif com
 t15 := `if command -v timeout >/dev/null 2>&1; then echo "timeout 900"; elif command -v gtimeout >/dev/null 2>&1; then echo "gtimeout 900"; else echo ""; fi`
 
 # The fast tier's package selections, shared by the build and the run of each line.
-fast_pkgs := "-p walgit-store -p walgit-git -p walgit-wal -p walgit-bundle"
-server_fast := "-p walgit-server --test web_api --test web_ui --test api_v1 --test static_http --test maintain --test routing_prefix --test lfs_upstream --test drain --test events --test follow --test policy"
+fast_pkgs := "-p walgit-store -p walgit-git -p walgit-wal"
+server_fast := "-p walgit-server --test web_api --test web_ui --test api_v1 --test static_http --test packfile_uri --test forward --test maintain --test routing_prefix --test lfs_upstream --test drain --test events --test follow --test policy"
 
 # Default: show available targets.
 default:
@@ -141,7 +141,16 @@ clippy:
     {{t15}} cargo clippy --workspace --all-targets -- -D warnings
 
 # Everything that must be green before a merge (what CI runs).
-ci: warnings clippy test e2e
+ci: warnings clippy test e2e sim smoke
+
+# Fault injection and recovery share process-wide test hooks; run serially.
+sim:
+    {{t15}} cargo test -p walgit-server --test sim -- --test-threads=1
+
+# Standalone CLI/server against memory; add WALGIT_TEST_S3_ENDPOINT for the local rig.
+smoke:
+    {{t15}} cargo build -p walgit-cli
+    WALGIT="$(realpath "${CARGO_TARGET_DIR:-target}/debug/walgit")" {{t15}} tests/e2e.sh
 
 # Slow tier: #[ignore]d benches/soaks (20k-ref push, 466k-ref render, ...).
 test-slow:
@@ -169,3 +178,13 @@ store-test-s3:
 # Run all walgit-store tests (memory + S3 if env set).
 store-test-all:
     cargo test -p walgit-store
+
+# Bounded contract checks and exact negative controls (Java 11+).
+spec:
+    scripts/run-spec.sh fast
+
+spec-fragments:
+    scripts/run-spec.sh fragments
+
+spec-full:
+    scripts/run-spec.sh full
