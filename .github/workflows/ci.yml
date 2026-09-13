@@ -88,6 +88,33 @@ jobs:
       - name: Build the SPA and the SDK
         run: just web-build
       - run: just e2e
+      - run: just sim
+      - run: just smoke
+
+  # publish-canary needs this job, so its verdict decides whether a main commit is published:
+  # a moving tag here could pass a contract that did not hold. Pinned like the publishing job,
+  # for the same reason, even though this job itself holds nothing but a read token.
+  spec:
+    name: bounded contract checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - name: Install spec runner dependencies
+        run: sudo apt-get update && sudo apt-get install -y ripgrep
+      - uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3 # v4.9.1
+        with:
+          distribution: temurin
+          java-version: 21
+      - uses: taiki-e/install-action@e67fa11c4b9316fa714ddf0abed07a0c3143b95b # v2.87.4
+        with:
+          tool: just
+      - run: just spec
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: always()
+        with:
+          name: spec-evidence
+          path: target/test-logs/spec-*
 
   # Canary image publish. Lives in this workflow, not a separate one, so `needs` gates it on the
   # same green run that just tested the commit: a red main never produces a canary tag, and there
@@ -101,7 +128,7 @@ jobs:
   # at a digest nobody chose. A re-run moves `canary` only; the sha- tag is written once, ever.
   publish-canary:
     name: publish canary image
-    needs: [build-test, e2e]
+    needs: [build-test, e2e, spec]
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     permissions:
