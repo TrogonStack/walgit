@@ -667,6 +667,21 @@ pub struct TelemetryConfig {
     /// incident (a queued writer starving readers for 60–680 s) is what this makes visible.
     #[serde(with = "humantime_serde")]
     pub lock_wait_warn: Duration,
+    /// OTLP collector endpoint for spans and log records. Unset (and no
+    /// `OTEL_EXPORTER_OTLP_ENDPOINT` in the environment) installs no exporter
+    /// at all: `log_format` and the Cloud Logging layer behave exactly as they
+    /// did before this key existed. This is the whole switch.
+    pub otlp_endpoint: Option<String>,
+    /// Export the existing `tracing` spans (`http.request`, `git.upload_pack`,
+    /// `wal.sync`, `store.get`, ...) as OTLP spans. Ignored without an endpoint.
+    pub otlp_traces: bool,
+    /// Export `tracing` events as OTLP log records. Ignored without an endpoint.
+    /// Independent of `log_format`: stdout keeps whatever it was doing, so a
+    /// host that already ships stdout can leave this off.
+    pub otlp_logs: bool,
+    /// `service.name` on exported telemetry. `OTEL_SERVICE_NAME` wins over it;
+    /// unset on both means `walgit`.
+    pub service_name: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -944,6 +959,10 @@ impl Default for TelemetryConfig {
             metrics: true,
             trace_project: None,
             lock_wait_warn: Duration::from_secs(1),
+            otlp_endpoint: None,
+            otlp_traces: true,
+            otlp_logs: true,
+            service_name: None,
         }
     }
 }
@@ -1240,6 +1259,12 @@ impl Config {
             anyhow::ensure!(
                 u.starts_with("http://") || u.starts_with("https://"),
                 "events.webhook_url must be an http(s) URL"
+            );
+        }
+        if let Some(u) = &self.telemetry.otlp_endpoint {
+            anyhow::ensure!(
+                u.starts_with("http://") || u.starts_with("https://"),
+                "telemetry.otlp_endpoint must be an http(s) URL"
             );
         }
         Ok(())
@@ -1680,6 +1705,32 @@ webhook_secret = "s"
         assert_eq!(c.events.webhook_secret.as_deref(), Some("s"));
         let err = Config::parse("[events]\nwebhook_url = \"ftp://x\"\n").unwrap_err();
         assert!(err.to_string().contains("webhook_url"), "{err}");
+    }
+
+    #[test]
+    fn telemetry_otlp_parses_and_validates() {
+        let c = Config::parse(
+            r#"
+[telemetry]
+otlp_endpoint = "http://otel-collector:4318"
+otlp_logs = false
+service_name = "walgit-front"
+"#,
+        )
+        .unwrap();
+        assert_eq!(
+            c.telemetry.otlp_endpoint.as_deref(),
+            Some("http://otel-collector:4318")
+        );
+        assert!(c.telemetry.otlp_traces);
+        assert!(!c.telemetry.otlp_logs);
+        assert_eq!(c.telemetry.service_name.as_deref(), Some("walgit-front"));
+
+        let off = Config::parse("").unwrap();
+        assert!(off.telemetry.otlp_endpoint.is_none());
+
+        let err = Config::parse("[telemetry]\notlp_endpoint = \"grpc://x\"\n").unwrap_err();
+        assert!(err.to_string().contains("otlp_endpoint"), "{err}");
     }
 }
 
