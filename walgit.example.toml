@@ -197,6 +197,11 @@ metrics = true                    # Prometheus on /metrics
 # trace_project = ""              # GCP project for trace-id correlation in JSON logs (optional)
 lock_wait_warn = "1s"             # WARN "lock wait" (lock, repo, wait_ms, request_id) when a request waits longer than this on
                                   # rw/sync_mutex/pack_mutex/bulk permits; histogram walgit_lock_wait_seconds{lock}
+# otlp_endpoint = "http://otel-collector:4318"  # OTLP/HTTP base URL for spans and log records; unset (and no
+                                  # OTEL_EXPORTER_OTLP_ENDPOINT) exports nothing and leaves log_format untouched
+# otlp_traces = true              # export the existing tracing spans; ignored without an endpoint
+# otlp_logs = true                # export tracing events as OTel log records; independent of log_format
+# service_name = "walgit"         # service.name on exported telemetry; OTEL_SERVICE_NAME wins over it
 
 [events]                          # docs/EVENTS.md — read only by the bridge (roles ∋ "events"); never gates a push
 # webhook_url = "https://hooks.example.com/walgit"   # each batch of ref events is POSTed as a JSON array

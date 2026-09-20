@@ -623,6 +623,7 @@ pub async fn serve(
             tracing::warn!(?bound, "shutdown: in-flight requests still open past server.drain_timeout; exiting");
         }
     }
+    telemetry::shutdown();
     Ok(())
 }
 

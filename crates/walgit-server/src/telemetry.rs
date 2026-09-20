@@ -26,6 +26,14 @@
 //! Performance spans (INFO and above) emit a log line on span *close* so they
 //! are queryable in Cloud Logging:
 //!   `jsonPayload.span.name="git.upload_pack" AND jsonPayload.elapsed_ms > 1000`
+//!
+//! OTLP (`telemetry.otlp_endpoint`) is the second, independent destination.
+//! When it is set, the same span tree that feeds the lines above is also
+//! exported to a collector, and `tracing` events become `OTel` log records. It
+//! is additive on purpose: with no endpoint configured nothing here changes,
+//! so a Cloud Logging host is unaffected. Both exporters use OTLP over HTTP
+//! with a blocking client because `tracing_init` runs before the tokio runtime
+//! exists and the SDK batch processors own a dedicated thread.
 
 use std::collections::HashMap;
 use std::io::{self, Write};
@@ -491,6 +499,65 @@ pub fn extract_trace_id(headers: &axum::http::HeaderMap) -> Option<String> {
 }
 
 // ---------------------------------------------------------------------------
+// OTLP
+// ---------------------------------------------------------------------------
+
+/// Providers kept alive for the life of the process so [`shutdown`] can flush
+/// them. Batch processors drop telemetry that has not been exported yet, so a
+/// process that exits without flushing loses its last spans.
+static OTLP_TRACES: OnceLock<opentelemetry_sdk::trace::SdkTracerProvider> = OnceLock::new();
+static OTLP_LOGS: OnceLock<opentelemetry_sdk::logs::SdkLoggerProvider> = OnceLock::new();
+
+/// The collector base URL: `telemetry.otlp_endpoint`, else the conventional
+/// `OTEL_EXPORTER_OTLP_ENDPOINT`. `None` disables every OTLP exporter.
+fn otlp_endpoint(cfg: &Config) -> Option<String> {
+    cfg.telemetry
+        .otlp_endpoint
+        .clone()
+        .or_else(|| std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT").ok())
+        .map(|e| e.trim_end_matches('/').to_string())
+        .filter(|e| !e.is_empty())
+}
+
+/// `service.name`: `OTEL_SERVICE_NAME`, else `telemetry.service_name`, else `walgit`.
+fn service_name(cfg: &Config) -> String {
+    std::env::var("OTEL_SERVICE_NAME")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .or_else(|| cfg.telemetry.service_name.clone())
+        .unwrap_or_else(|| "walgit".to_string())
+}
+
+/// Resource attributes on every exported span and log record. The SDK reads
+/// `OTEL_RESOURCE_ATTRIBUTES` itself, so operators keep the conventional knob.
+fn otlp_resource(cfg: &Config) -> opentelemetry_sdk::Resource {
+    opentelemetry_sdk::Resource::builder()
+        .with_service_name(service_name(cfg))
+        .with_attribute(opentelemetry::KeyValue::new(
+            opentelemetry_semantic_conventions::resource::SERVICE_VERSION,
+            crate::health::BUILD_SHA,
+        ))
+        .build()
+}
+
+/// Flush and stop the OTLP exporters. Called on the way out of `serve` so the
+/// spans that describe the shutdown itself are not the ones that get dropped.
+pub fn shutdown() {
+    if let Some(Err(e)) = OTLP_TRACES
+        .get()
+        .map(opentelemetry_sdk::trace::SdkTracerProvider::shutdown)
+    {
+        tracing::warn!(error = %e, "otlp: tracer provider shutdown");
+    }
+    if let Some(Err(e)) = OTLP_LOGS
+        .get()
+        .map(opentelemetry_sdk::logs::SdkLoggerProvider::shutdown)
+    {
+        tracing::warn!(error = %e, "otlp: logger provider shutdown");
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Init
 // ---------------------------------------------------------------------------
 
@@ -515,7 +582,12 @@ pub fn tracing_init(cfg: &Config) {
 
     let project_id = PROJECT_ID.get_or_init(|| resolve_project_id(cfg));
 
-    let registry = tracing_subscriber::registry().with(filter);
+    let (otlp_trace_layer, otlp_log_layer) = otlp_layers(cfg);
+
+    let registry = tracing_subscriber::registry()
+        .with(filter)
+        .with(otlp_trace_layer)
+        .with(otlp_log_layer);
 
     match cfg.telemetry.log_format {
         LogFormat::Json => {
@@ -528,6 +600,87 @@ pub fn tracing_init(cfg: &Config) {
                 .init();
         }
     }
+}
+
+/// The OTLP span and log layers, both `None` when no endpoint is configured.
+/// An exporter that fails to build is a warning, never fatal: losing telemetry
+/// must not stop the server from serving git.
+#[allow(clippy::type_complexity)]
+fn otlp_layers<S>(
+    cfg: &Config,
+) -> (
+    Option<tracing_opentelemetry::OpenTelemetryLayer<S, opentelemetry_sdk::trace::SdkTracer>>,
+    Option<
+        opentelemetry_appender_tracing::layer::OpenTelemetryTracingBridge<
+            opentelemetry_sdk::logs::SdkLoggerProvider,
+            opentelemetry_sdk::logs::SdkLogger,
+        >,
+    >,
+)
+where
+    S: tracing::Subscriber + for<'a> LookupSpan<'a>,
+{
+    use opentelemetry::trace::TracerProvider as _;
+    use opentelemetry_otlp::WithExportConfig;
+
+    let Some(base) = otlp_endpoint(cfg) else {
+        return (None, None);
+    };
+    let resource = otlp_resource(cfg);
+
+    let traces = if cfg.telemetry.otlp_traces {
+        match opentelemetry_otlp::SpanExporter::builder()
+            .with_http()
+            .with_endpoint(format!("{base}/v1/traces"))
+            .with_protocol(opentelemetry_otlp::Protocol::HttpBinary)
+            .build()
+        {
+            Ok(exporter) => {
+                let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
+                    .with_resource(resource.clone())
+                    .with_batch_exporter(exporter)
+                    .build();
+                let tracer = provider.tracer("walgit");
+                let _ = OTLP_TRACES.set(provider);
+                Some(tracing_opentelemetry::layer().with_tracer(tracer))
+            }
+            Err(e) => {
+                eprintln!("otlp: span exporter disabled: {e}");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    let logs = if cfg.telemetry.otlp_logs {
+        match opentelemetry_otlp::LogExporter::builder()
+            .with_http()
+            .with_endpoint(format!("{base}/v1/logs"))
+            .with_protocol(opentelemetry_otlp::Protocol::HttpBinary)
+            .build()
+        {
+            Ok(exporter) => {
+                let provider = opentelemetry_sdk::logs::SdkLoggerProvider::builder()
+                    .with_resource(resource)
+                    .with_batch_exporter(exporter)
+                    .build();
+                let bridge = opentelemetry_appender_tracing::layer::OpenTelemetryTracingBridge::new(
+                    &provider,
+                );
+                let _ = OTLP_LOGS.set(provider);
+                Some(bridge)
+            }
+            Err(e) => {
+                eprintln!("otlp: log exporter disabled: {e}");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    (traces, logs)
 }
 
 // ---------------------------------------------------------------------------
