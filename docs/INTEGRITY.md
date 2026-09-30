@@ -33,7 +33,7 @@ Due right after checkpoint when `fsck.pb` lists missing objects, `repaired_seq =
 **`upstream.git`** (D24 setting, `[upstream] git = "https://github.com/acme/monorepo.git"`, `token_env` shared with
 `upstream.lfs`, `docs/LFS.md`). Steps (`walgit_git::repair::fetch_objects_as_pack`): scratch bare repo under
 `cache.dir/repair/`, `git fetch --depth=1 <upstream> <oid>…` in batches of 500 (GitHub serves commit, tree **and
-blob** wants by SHA — verified 2026-08-21; walgit does with `git.allow_any_sha1_in_want`), `pack-objects` of exactly
+blob** wants by SHA — verified 2026-08-21; walgit enables arbitrary object wants for partial-clone lazy fetches), `pack-objects` of exactly
 the requested oids, verify every oid is in the resulting idx (a refused want is an error, never a silent hole),
 then `RepoHandle::add_pack(tier 0)` → one **COMPACT entry superseding nothing** (what `walgit wal add-pack … --tier
 0` did by hand for a large repository, seq 11). `fsck.pb.repaired_seq` is set so the next pass re-audits instead of repairing
