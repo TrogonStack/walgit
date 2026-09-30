@@ -1,5 +1,5 @@
-//! Prometheus metrics exporter. Installs a recorder up front (once per process)
-//! and exposes the rendered scrape via `/metrics`.
+//! Prometheus metrics exporter. When enabled, installs a recorder once per
+//! process and exposes the rendered scrape via `/metrics`.
 
 use std::sync::{Arc, OnceLock};
 
@@ -33,12 +33,15 @@ pub fn install() -> anyhow::Result<Arc<PrometheusHandle>> {
 
 /// `GET /metrics`
 pub async fn metrics_route(State(st): State<Arc<AppState>>) -> impl IntoResponse {
-    let body = st.metrics_handle.render();
+    let Some(handle) = &st.metrics_handle else {
+        return axum::http::StatusCode::NOT_FOUND.into_response();
+    };
     (
         [(
             axum::http::header::CONTENT_TYPE,
             "text/plain; version=0.0.4",
         )],
-        body,
+        handle.render(),
     )
+        .into_response()
 }
