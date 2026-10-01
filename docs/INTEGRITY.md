@@ -41,6 +41,10 @@ again. Counter `walgit_repair_objects_total{repo}`. Test: `tests/maintain.rs
 fsck_unit_records_missing_objects_and_repair_unit_fetches_them_from_upstream` (hole → audit → repair over HTTP from
 a second repository → re-audit clean → idle).
 
+This does not widen repository access: a principal with read access can already fetch any stored object by ID,
+including objects unreachable from an advertised ref. Removing `git.allow_any_sha1_in_want` only removes a
+non-functional configuration switch.
+
 ## 4. Runbook (what was done for a large repository, 2026-08-21 03:40Z)
 1. Enumerate: `git rev-list --objects --missing=print <advertised tips> --not <known-good tip>` on the complete copy
    (or read `fsck.pb` / `/var/lib/walgit/monorepo-fsck.out`) → 1,952 blobs, 70 MB.
