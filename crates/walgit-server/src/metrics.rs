@@ -3,11 +3,9 @@
 
 use std::sync::{Arc, OnceLock};
 
-use axum::extract::State;
+use axum::Extension;
 use axum::response::IntoResponse;
 use metrics_exporter_prometheus::PrometheusHandle;
-
-use crate::AppState;
 
 static HANDLE: OnceLock<Arc<PrometheusHandle>> = OnceLock::new();
 
@@ -32,10 +30,9 @@ pub fn install() -> anyhow::Result<Arc<PrometheusHandle>> {
 }
 
 /// `GET /metrics`
-pub async fn metrics_route(State(st): State<Arc<AppState>>) -> impl IntoResponse {
-    let Some(handle) = &st.metrics_handle else {
-        return axum::http::StatusCode::NOT_FOUND.into_response();
-    };
+pub async fn metrics_route(
+    Extension(handle): Extension<Arc<PrometheusHandle>>,
+) -> impl IntoResponse {
     (
         [(
             axum::http::header::CONTENT_TYPE,

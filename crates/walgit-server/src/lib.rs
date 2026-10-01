@@ -66,12 +66,12 @@ use std::future::Future;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use axum::Router;
 use axum::body::{Body, to_bytes};
 use axum::extract::ConnectInfo;
 use axum::http::{Method, Request};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
+use axum::{Extension, Router};
 use bytes::Bytes;
 use metrics_exporter_prometheus::PrometheusHandle;
 use walgit_store::DynStore;
@@ -171,9 +171,10 @@ pub fn router(state: Arc<AppState>) -> Router {
             state.clone(),
             web::require_auth,
         ));
-    let metrics = if state.cfg.telemetry.metrics {
+    let metrics = if let Some(metrics_handle) = &state.metrics_handle {
         Router::new()
             .route("/metrics", get(metrics::metrics_route))
+            .layer(Extension(metrics_handle.clone()))
             .layer(axum::middleware::from_fn_with_state(
                 state.clone(),
                 web::require_auth,
