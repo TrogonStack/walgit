@@ -1538,19 +1538,38 @@ pub(crate) fn auth_help_message(
         .trim_start_matches("https://")
         .trim_start_matches("http://")
         .to_string();
-    let why = match e {
-        crate::auth::AuthError::Forbidden => "your identity is not allowed to access this host",
-        crate::auth::AuthError::Unavailable => {
-            "the token verifier is temporarily unavailable; retry"
-        }
-        _ => "a valid bearer token is required; refresh or replace an expired token",
+    let auth = &st.cfg.server.auth;
+    let provider = if auth.mode == walgit_config::AuthMode::Oidc {
+        let name = auth
+            .provider_name
+            .as_deref()
+            .map_or(auth.issuer.as_str(), str::trim);
+        format!("Identity provider: {name}.\n")
+    } else {
+        String::new()
     };
-    format!(
-        "walgit: authentication failed: {why}.\n\
-         To authenticate git for {host} (Google Identity-Aware Proxy):\n\
-         \n{}",
-        client_setup(st, &base)
-    )
+    match e {
+        crate::auth::AuthError::Forbidden => format!(
+            "walgit: permission denied for {host}. Your identity is not allowed to perform this operation.\n\
+             Contact the server administrator.\n{provider}"
+        ),
+        crate::auth::AuthError::Unavailable => format!(
+            "walgit: authentication is temporarily unavailable for {host}. Try again shortly.\n{provider}"
+        ),
+        _ => {
+            let sign_in = match (auth.mode, auth.provider_name.as_deref()) {
+                (walgit_config::AuthMode::Oidc, Some(name)) => {
+                    format!("Sign in to {host} using {}.\n", name.trim())
+                }
+                _ => format!("To authenticate Git for {host}:\n{provider}"),
+            };
+            format!(
+                "walgit: a valid bearer token is required; refresh or replace an expired token.\n\
+                 {sign_in}\n{}",
+                client_setup(st, &base)
+            )
+        }
+    }
 }
 
 /// Message for a repository whose pack set cannot live on this instance.
