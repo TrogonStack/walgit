@@ -2477,6 +2477,49 @@ async fn auth_help_gives_error_specific_guidance() -> TestResult {
     Ok(())
 }
 
+/// A correctly signed access token still obeys the OIDC email allowlist.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn auth_help_identifies_provider_for_disallowed_oidc_email() -> TestResult {
+    for provider_name in [None, Some("  Acme SSO  ")] {
+        let server = auth_help_server(walgit_config::AuthMode::Oidc, true, provider_name).await?;
+        let token = server
+            .state
+            .auth
+            .access_token("reader@other.example")
+            .unwrap();
+        assert!(token.starts_with("wgt_"));
+        assert!(server.state.auth.access_token_claims(&token).is_some());
+        let url = format!(
+            "{}/info/refs?service=git-upload-pack",
+            server.repo_url("t", "r")
+        );
+        let client = reqwest::Client::new();
+        // A non-Git client confirms this is authorization failure, not an invalid token.
+        assert_eq!(
+            client.get(&url).bearer_auth(&token).send().await?.status(),
+            403
+        );
+        let response = client
+            .get(&url)
+            .header("User-Agent", "git/2.54.0")
+            .bearer_auth(&token)
+            .send()
+            .await?;
+        assert_eq!(response.status(), 200);
+        let body = response.text().await?;
+        assert!(body.contains("ERR walgit: permission denied for"), "{body}");
+        assert!(body.contains("Contact the server administrator."), "{body}");
+        let provider = provider_name.map_or("https://login.example.com", str::trim);
+        assert!(
+            body.contains(&format!("Identity provider: {provider}.")),
+            "{body}"
+        );
+        assert!(!body.contains("Sign in"), "{body}");
+        assert!(!body.contains("install.sh"), "{body}");
+    }
+    Ok(())
+}
+
 /// A verifier outage calls for retrying, not replacing credentials or repeating setup.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn auth_help_verifier_outage_asks_for_retry() -> TestResult {
