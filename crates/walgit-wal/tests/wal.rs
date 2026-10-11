@@ -3026,6 +3026,97 @@ async fn a_landed_cas_answered_412_keeps_the_commit() {
     );
 }
 
+/// The manifest as the bucket holds it, read past every link.
+async fn truth_manifest(truth: &MemoryStore, id: &RepoId) -> walgit_proto::v1::Manifest {
+    use walgit_store::ObjectStoreExt;
+    let key = format!("{}{}", id.store_prefix(), walgit_proto::keys::MANIFEST);
+    let (_, bytes) = truth.get_bytes(&key).await.unwrap().unwrap();
+    <walgit_proto::v1::Manifest as prost::Message>::decode(bytes.as_ref()).unwrap()
+}
+
+/// A landed CAS answered 412, and before the writer reads the manifest back another instance
+/// commits on top and a checkpoint folds the log past the writer's entry, dropping its segment
+/// descriptor. The manifest then cannot show whether the push landed: the writer must keep the
+/// segment and answer "commit unknown", not delete it and report its own durable push as a
+/// conflict.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_landed_cas_folded_before_the_412_is_resolved_stays_unknown() {
+    use walgit_store::ObjectStoreExt;
+    use walgit_store::fault::{FaultPlan, FaultStore};
+    let truth = MemoryStore::shared();
+    let id = repo_id("o", "folded");
+    let writer_cache = tempfile::tempdir().unwrap();
+    let link = FaultStore::new(truth.clone(), "landed-412-folded", 1);
+    let writer = Registry::new(link.clone(), Arc::new(make_config(writer_cache.path(), 0)))
+        .create(&id, ObjectFormat::Sha1)
+        .await
+        .unwrap();
+
+    let work = WorkRepo::new();
+    let first = work.commit("first", "content");
+    let pack = ingest_pack_data(&writer, work.create_pack()).await.unwrap();
+    link.set(FaultPlan {
+        p_cas_fail_after: 1.0,
+        only_keys: Some(vec!["manifest.pb".into()]),
+        ..Default::default()
+    });
+    // The first manifest read after the CAS is the writer's evidence check: hold it.
+    let gate = link.gate_next("get", "manifest.pb");
+    let push = {
+        let writer = writer.clone();
+        let txn = make_txn(vec![("refs/heads/main", "", &first)]);
+        tokio::spawn(async move {
+            writer
+                .publish_push_synced(Some(pack), txn, HashMap::new())
+                .await
+        })
+    };
+    gate.entered().await;
+    link.heal();
+    let landed = truth_manifest(&truth, &id).await;
+    assert_eq!(landed.head_seq, 1, "the writer's CAS landed");
+    let segment = format!("{}{}", id.store_prefix(), landed.log_segments[0].key);
+
+    // Meanwhile another instance commits on top and folds the log past seq 1.
+    let other_cache = tempfile::tempdir().unwrap();
+    let other = Registry::new(truth.clone(), Arc::new(make_config(other_cache.path(), 0)))
+        .open(&id)
+        .await
+        .unwrap();
+    other
+        .publish_push(
+            None,
+            make_txn(vec![("refs/heads/other", "", &first)]),
+            HashMap::new(),
+        )
+        .await
+        .unwrap();
+    let cp = other.write_checkpoint().await.unwrap();
+    assert_eq!(cp.seq, 2);
+    assert!(
+        truth_manifest(&truth, &id).await.log_segments.is_empty(),
+        "the fold dropped every segment descriptor"
+    );
+    gate.release();
+
+    let outcome = push.await.unwrap();
+    assert!(
+        matches!(outcome, Err(walgit_wal::WalError::CommitUnknown(_))),
+        "an unprovable outcome is unknown, never a conflict: {:?}",
+        outcome.map(|r| r.per_ref)
+    );
+    assert!(
+        truth.get_bytes(&segment).await.unwrap().is_some(),
+        "the writer deleted its committed (folded) segment"
+    );
+    // The push is durable, and the writer itself converges on it.
+    drop(writer.sync_refs().await.unwrap());
+    assert_eq!(
+        writer.local().ref_view().unwrap().get("refs/heads/main"),
+        Some(first)
+    );
+}
+
 #[tokio::test]
 async fn readiness_carries_only_proven_inventory_and_rechecks_revision_only_restart() {
     let writer_cache = tempfile::tempdir().unwrap();
