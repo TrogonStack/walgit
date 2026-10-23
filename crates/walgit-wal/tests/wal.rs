@@ -350,6 +350,44 @@ async fn create_of_an_existing_repository_is_already_exists_warm_or_cold() {
 /// directory is reset, and anything it starts afterwards fails instead of
 /// writing into the new repository.
 #[tokio::test]
+async fn an_open_racing_a_delete_sees_the_repository_gone() {
+    let cache = tempfile::tempdir().unwrap();
+    let store = MemoryStore::shared();
+    let registry = Registry::new(
+        store.clone(),
+        Arc::new(make_config(&cache.path().join("a"), 0)),
+    );
+    let id = repo_id("test", "racing");
+    let handle = registry.create(&id, ObjectFormat::Sha1).await.unwrap();
+
+    let in_flight = handle.sync_refs().await.unwrap();
+    let delete = tokio::spawn({
+        let registry = registry.clone();
+        let id = id.clone();
+        async move { registry.delete(&id).await }
+    });
+    loop {
+        match handle.sync_refs().await {
+            Err(WalError::NotFound) => break,
+            Ok(guard) => drop(guard),
+            Err(e) => panic!("unexpected {e}"),
+        }
+        tokio::task::yield_now().await;
+    }
+    let open = tokio::spawn({
+        let registry = registry.clone();
+        let id = id.clone();
+        async move { registry.open(&id).await.map(|_| ()) }
+    });
+    tokio::task::yield_now().await;
+    drop(in_flight);
+
+    delete.await.unwrap().unwrap();
+    assert!(matches!(open.await.unwrap(), Err(WalError::NotFound)));
+    assert!(matches!(registry.open(&id).await, Err(WalError::NotFound)));
+}
+
+#[tokio::test]
 async fn open_rebuilds_a_copy_whose_create_landed_without_its_reset() {
     let cache = tempfile::tempdir().unwrap();
     let store = MemoryStore::shared();
@@ -385,6 +423,44 @@ async fn open_rebuilds_a_copy_whose_create_landed_without_its_reset() {
     reopened.sync_refs().await.unwrap();
     assert!(reopened.local().refs().unwrap().refs.is_empty());
     assert!(!local_dir.join("walgit-reset-pending").exists());
+}
+
+#[tokio::test]
+async fn a_refused_create_keeps_a_marker_an_earlier_create_left() {
+    let cache = tempfile::tempdir().unwrap();
+    let store = MemoryStore::shared();
+    let cfg = Arc::new(make_config(&cache.path().join("a"), 0));
+    let id = repo_id("test", "remarked");
+
+    let registry = Registry::new(store.clone(), cfg.clone());
+    let handle = registry.create(&id, ObjectFormat::Sha1).await.unwrap();
+    let work = WorkRepo::new();
+    let c1 = work.commit("init", "data");
+    let ingested = ingest_pack_data(&handle, work.create_pack()).await.unwrap();
+    handle
+        .publish_push(
+            Some(ingested),
+            make_txn(vec![("refs/heads/main", "", &c1)]),
+            HashMap::new(),
+        )
+        .await
+        .unwrap();
+    let local_dir = handle.local().path().to_path_buf();
+    let marker = local_dir.join("walgit-reset-pending");
+    std::fs::write(&marker, b"").unwrap();
+
+    assert!(matches!(
+        registry.create(&id, ObjectFormat::Sha1).await,
+        Err(WalError::AlreadyExists)
+    ));
+    assert!(marker.exists());
+    drop(handle);
+    drop(registry);
+
+    let reopened = Registry::new(store.clone(), cfg).open(&id).await.unwrap();
+    assert!(!marker.exists());
+    reopened.sync_refs().await.unwrap();
+    assert_eq!(reopened.local().refs().unwrap().refs.len(), 1);
 }
 
 #[tokio::test]

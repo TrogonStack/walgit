@@ -85,12 +85,12 @@ impl Registry {
         // Every request that touches a repo goes through here: tag the
         // enclosing `http.request` span (no-op outside one).
         tracing::Span::current().record("repo", tracing::field::display(id));
-        if let Some(h) = self.repos.get(id) {
+        if let Some(h) = self.repos.get(id).filter(|h| h.ensure_live().is_ok()) {
             return Ok(h.clone());
         }
         let gate = self.opening.entry(id.clone()).or_default().clone();
         let _g = gate.lock().await;
-        if let Some(h) = self.repos.get(id) {
+        if let Some(h) = self.repos.get(id).filter(|h| h.ensure_live().is_ok()) {
             return Ok(h.clone());
         }
 
@@ -173,6 +173,10 @@ impl Registry {
     /// handle and the local copy. Err(NotFound) if the manifest does not exist.
     /// Other instances notice on their next freshness check (manifest GET -> 404).
     pub async fn delete(&self, id: &RepoId) -> Result<(), WalError> {
+        // Held to the end: an `open` racing the drain would cache a handle on a
+        // manifest and directory that are about to disappear.
+        let gate = self.opening.entry(id.clone()).or_default().clone();
+        let _g = gate.lock().await;
         let prefixed = Prefixed::new(self.store.clone(), id.store_prefix());
         if get_message::<Manifest>(&prefixed, keys::MANIFEST)
             .await?
@@ -248,11 +252,17 @@ impl Registry {
         // Marked before the Create, so a reset that fails or never runs after the Create
         // lands (crash, lost reply) leaves `open` to rebuild instead of serving the old copy.
         let marker = id.local_dir(&self.cache_root).join(RESET_MARKER);
+        // A marker left by an earlier attempt stays: that Create may have landed.
         let marked = marker.clone();
-        tokio::task::spawn_blocking(move || match std::fs::write(&marked, b"") {
-            Ok(()) => Ok(()),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(e) => Err(WalError::Io(e)),
+        let marked_here = tokio::task::spawn_blocking(move || {
+            if marked.exists() {
+                return Ok(false);
+            }
+            match std::fs::write(&marked, b"") {
+                Ok(()) => Ok(true),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+                Err(e) => Err(WalError::Io(e)),
+            }
         })
         .await
         .map_err(|e| WalError::Corrupt(format!("local copy task: {e}")))??;
@@ -326,7 +336,9 @@ impl Registry {
                 Ok(handle)
             }
             Err(StoreError::PreconditionFailed { .. }) => {
-                let _ = tokio::fs::remove_file(&marker).await;
+                if marked_here {
+                    let _ = tokio::fs::remove_file(&marker).await;
+                }
                 Err(WalError::AlreadyExists)
             }
             Err(e) => Err(WalError::Store(e)),
@@ -505,6 +517,12 @@ impl Registry {
             // excludes leaked/long-lived request ReadGuards. The old code only
             // probed sync_mutex and immediately dropped it, so it could delete
             // packs underneath an active reader.
+            // The opening gate keeps `open` from rebuilding on this directory, or
+            // caching a handle on it, until it is gone.
+            let gate = self.opening.entry(id.clone()).or_default().clone();
+            let Ok(_opening) = gate.try_lock() else {
+                continue;
+            };
             let Ok(_sync) = handle.sync_mutex.try_lock() else {
                 continue;
             };
@@ -514,9 +532,9 @@ impl Registry {
             if handle.ensure_live().is_err() {
                 continue;
             }
-            handle.retire();
             let path = handle.local.path().to_path_buf();
             let bytes = dir_size(&path);
+            handle.retire();
             self.repos.remove(id);
             let _ = std::fs::remove_dir_all(&path);
             total_bytes = total_bytes.saturating_sub(bytes);
@@ -623,5 +641,31 @@ mod tests {
             .await
             .expect("drain completes once the holder is gone")
             .unwrap();
+    }
+
+    /// An `open` in progress owns the directory it is building on; eviction must
+    /// neither remove it nor drop the handle that `open` is about to cache.
+    #[tokio::test]
+    async fn eviction_skips_a_repository_an_open_is_building() {
+        let cache = tempfile::tempdir().unwrap();
+        let mut cfg = walgit_config::Config::default();
+        cfg.cache.dir = cache.path().to_path_buf();
+        cfg.cache.max_bytes = walgit_config::ByteSize::b(0);
+        cfg.cache.evict_idle_after = Duration::ZERO;
+        let registry = Registry::new(MemoryStore::shared(), Arc::new(cfg));
+        let id = RepoId::new("test", "building").unwrap();
+        let handle = registry.create(&id, ObjectFormat::Sha1).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(5)).await;
+
+        let gate = registry.opening.entry(id.clone()).or_default().clone();
+        let opening = gate.lock().await;
+        let report = registry.evict_idle().await.unwrap();
+        assert_eq!(report.evicted, 0);
+        assert!(handle.ensure_live().is_ok());
+        assert!(handle.local().path().join("HEAD").exists());
+
+        drop(opening);
+        assert_eq!(registry.evict_idle().await.unwrap().evicted, 1);
+        assert!(handle.ensure_live().is_err());
     }
 }
