@@ -423,6 +423,52 @@ async fn create_after_a_foreign_delete_starts_from_an_empty_local_copy() {
     assert!(!Arc::ptr_eq(&opened, &handle));
 }
 
+/// A reset that died after invalidating the directory leaves refs and packs behind;
+/// `open` must rebuild from empty instead of serving them under the new manifest.
+#[tokio::test]
+async fn open_discards_a_directory_whose_reset_was_interrupted() {
+    let cache = tempfile::tempdir().unwrap();
+    let store = MemoryStore::shared();
+    let registry = Registry::new(
+        store.clone(),
+        Arc::new(make_config(&cache.path().join("a"), 0)),
+    );
+    let id = repo_id("test", "interrupted");
+
+    let handle = registry.create(&id, ObjectFormat::Sha1).await.unwrap();
+    let work = WorkRepo::new();
+    let c1 = work.commit("init", "data");
+    let ingested = ingest_pack_data(&handle, work.create_pack()).await.unwrap();
+    handle
+        .publish_push(
+            Some(ingested),
+            make_txn(vec![("refs/heads/main", "", &c1)]),
+            HashMap::new(),
+        )
+        .await
+        .unwrap();
+    let dir = handle.local().path().to_path_buf();
+    drop(handle);
+
+    store
+        .delete(
+            &format!("{}{}", id.store_prefix(), walgit_proto::keys::MANIFEST),
+            None,
+        )
+        .await
+        .unwrap();
+    let other = Registry::new(
+        store.clone(),
+        Arc::new(make_config(&cache.path().join("b"), 0)),
+    );
+    other.create(&id, ObjectFormat::Sha1).await.unwrap();
+    std::fs::remove_file(dir.join("HEAD")).unwrap();
+
+    let fresh = Registry::new(store, Arc::new(make_config(&cache.path().join("a"), 0)));
+    let opened = fresh.open(&id).await.unwrap();
+    assert!(opened.local().refs().unwrap().refs.is_empty());
+}
+
 /// Concurrent creates of one name — on one registry and across two — have
 /// exactly one winner; `open_or_create` (auto-create on push) treats losing
 /// that race as success and opens the winner's repository.

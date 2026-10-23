@@ -1466,25 +1466,28 @@ pub(crate) async fn add_pack_impl(
     let checksum = gix_hash::ObjectId::from_hex(hex.as_bytes())
         .map_err(|e| WalError::Corrupt(format!("bad pack name {name}: {e}")))?;
     let dest = handle.local.pack_path(&checksum);
-    std::fs::create_dir_all(
-        dest.parent()
-            .ok_or_else(|| WalError::Corrupt("destination has no parent".into()))?,
-    )?;
-    for (src, dst) in [(pack, dest.clone()), (idx, dest.with_extension("idx"))] {
-        if !dst.exists() && std::fs::hard_link(src, &dst).is_err() {
-            std::fs::copy(src, &dst)?;
+    let info = {
+        let _pin = handle.pin_local_objects().await?;
+        std::fs::create_dir_all(
+            dest.parent()
+                .ok_or_else(|| WalError::Corrupt("destination has no parent".into()))?,
+        )?;
+        for (src, dst) in [(pack, dest.clone()), (idx, dest.with_extension("idx"))] {
+            if !dst.exists() && std::fs::hard_link(src, &dst).is_err() {
+                std::fs::copy(src, &dst)?;
+            }
         }
-    }
-    if let Some(base) = &history_of {
-        handle.local.mark_history_pack(&checksum, base).await?;
-    }
-    handle.local.refresh_async().await?;
-    let info = handle
-        .local
-        .packs()?
-        .into_iter()
-        .find(|p| p.checksum == checksum)
-        .ok_or_else(|| WalError::Corrupt(format!("pack {hex} not visible after install")))?;
+        if let Some(base) = &history_of {
+            handle.local.mark_history_pack(&checksum, base).await?;
+        }
+        handle.local.refresh_async().await?;
+        handle
+            .local
+            .packs()?
+            .into_iter()
+            .find(|p| p.checksum == checksum)
+            .ok_or_else(|| WalError::Corrupt(format!("pack {hex} not visible after install")))?
+    };
     publish_compact_impl(handle, info, Vec::new(), tier).await
 }
 

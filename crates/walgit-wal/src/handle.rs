@@ -373,20 +373,16 @@ impl RepoHandle {
         crate::state::save_state(self.local.path(), &self.state.lock().clone())
     }
 
-    /// Retire the handle, then wait for every holder of its locks. Requests that start
-    /// later fail `ensure_live`, so once the guards are held nothing touches the directory.
-    pub(crate) async fn retire_and_drain(
-        &self,
-    ) -> (
-        tokio::sync::OwnedRwLockWriteGuard<()>,
-        tokio::sync::MutexGuard<'_, ()>,
-        tokio::sync::MutexGuard<'_, ()>,
-    ) {
+    /// Retire the handle, then wait out every holder that began before it. Each lock is
+    /// taken and released in turn, never held while waiting for the next, so the drain adds
+    /// no lock-order edge (a queued `rw` writer behind a holder of `pack_mutex`/`sync_mutex`
+    /// that wants `rw.read` would deadlock). Every acquirer checks `ensure_live` after it
+    /// holds its lock, so anything that starts later bails before touching the directory.
+    pub(crate) async fn retire_and_drain(&self) {
         self.retired.store(true, Ordering::Release);
-        let write = self.rw.clone().write_owned().await;
-        let sync = self.sync_mutex.lock().await;
-        let pack = self.pack_mutex.lock().await;
-        (write, sync, pack)
+        drop(self.pack_mutex.lock().await);
+        drop(self.sync_mutex.lock().await);
+        drop(self.rw.write().await);
     }
 
     pub fn store(&self) -> &Prefixed {
@@ -549,6 +545,7 @@ impl RepoHandle {
                     arc.pack_mutex.lock(),
                 )
                 .await;
+                arc.ensure_live()?;
                 let manifest = arc.manifest();
                 let task = match arc.begin_task("history-pack", HashMap::new()) {
                     Begin::Started(t) => Some(t),
@@ -679,6 +676,7 @@ impl RepoHandle {
             self.sync_mutex.lock(),
         )
         .await;
+        self.ensure_live()?;
         if self.freshness_ttl_active() {
             return Ok(());
         }

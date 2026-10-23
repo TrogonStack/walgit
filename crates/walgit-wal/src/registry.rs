@@ -107,8 +107,21 @@ impl Registry {
         let local = if let Some(l) = LocalRepo::open(&self.cache_root, id)? {
             l
         } else {
+            // A directory without HEAD is an unfinished init or an interrupted reset:
+            // whatever it still holds is not this repository's.
+            let cache_root = self.cache_root.clone();
+            let owned_id = id.clone();
             let format = parse_object_format(&manifest.object_format);
-            LocalRepo::init(&self.cache_root, id, format)?
+            tokio::task::spawn_blocking(move || {
+                match std::fs::remove_dir_all(owned_id.local_dir(&cache_root)) {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => return Err(WalError::Io(e)),
+                }
+                Ok::<_, WalError>(LocalRepo::init(&cache_root, &owned_id, format)?)
+            })
+            .await
+            .map_err(|e| WalError::Corrupt(format!("local copy task: {e}")))??
         };
 
         // Load state
@@ -243,17 +256,24 @@ impl Registry {
                 // below leaves `open` to rebuild from the manifest.
                 let stale = self.repos.remove(id).map(|(_, handle)| handle);
                 self.invalidate_listing();
-                let _drained = match &stale {
-                    Some(handle) => Some(handle.retire_and_drain().await),
-                    None => None,
-                };
+                if let Some(handle) = &stale {
+                    handle.retire_and_drain().await;
+                }
                 let cache_root = self.cache_root.clone();
                 let owned_id = id.clone();
                 let local = tokio::task::spawn_blocking(move || {
-                    match std::fs::remove_dir_all(owned_id.local_dir(&cache_root)) {
-                        Ok(()) => {}
-                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                        Err(e) => return Err(WalError::Io(e)),
+                    // Without HEAD `LocalRepo::open` rejects the directory, so a removal that
+                    // fails midway cannot be mistaken for the old repository: `open` rebuilds.
+                    let dir = owned_id.local_dir(&cache_root);
+                    for result in [
+                        std::fs::remove_file(dir.join("HEAD")),
+                        std::fs::remove_dir_all(&dir),
+                    ] {
+                        match result {
+                            Ok(()) => {}
+                            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                            Err(e) => return Err(WalError::Io(e)),
+                        }
                     }
                     Ok::<_, WalError>(LocalRepo::init(&cache_root, &owned_id, format)?)
                 })
@@ -469,6 +489,9 @@ impl Registry {
             let Ok(_write) = handle.rw.try_write() else {
                 continue;
             };
+            if handle.ensure_live().is_err() {
+                continue;
+            }
             let path = handle.local.path().to_path_buf();
             let bytes = dir_size(&path);
             self.repos.remove(id);
@@ -536,4 +559,46 @@ fn disk_usage(path: &std::path::Path) -> Option<(u64, u64)> {
     let total = st.f_blocks as u64 * st.f_frsize as u64;
     let avail = st.f_bavail as u64 * st.f_frsize as u64;
     Some((total.saturating_sub(avail), total))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use walgit_store::memory::MemoryStore;
+
+    use super::*;
+
+    /// A holder of `pack_mutex` that then wants `rw.read` (segmented MIDX
+    /// reconciliation) must not be stuck behind the drain's `rw` writer.
+    #[tokio::test]
+    async fn retire_and_drain_does_not_queue_a_writer_behind_a_pack_mutex_holder() {
+        let cache = tempfile::tempdir().unwrap();
+        let mut cfg = walgit_config::Config::default();
+        cfg.cache.dir = cache.path().to_path_buf();
+        let registry = Registry::new(MemoryStore::shared(), Arc::new(cfg));
+        let id = RepoId::new("test", "drain").unwrap();
+        let handle = registry.create(&id, ObjectFormat::Sha1).await.unwrap();
+
+        let pack = handle.pack_mutex.lock().await;
+        let drain = tokio::spawn({
+            let handle = handle.clone();
+            async move { handle.retire_and_drain().await }
+        });
+        while handle.ensure_live().is_ok() {
+            tokio::task::yield_now().await;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let pin = tokio::time::timeout(Duration::from_secs(5), handle.pin_local_objects())
+            .await
+            .expect("rw.read must not wait behind the drain");
+        assert!(matches!(pin, Err(WalError::NotFound)));
+
+        drop(pack);
+        tokio::time::timeout(Duration::from_secs(5), drain)
+            .await
+            .expect("drain completes once the holder is gone")
+            .unwrap();
+    }
 }
