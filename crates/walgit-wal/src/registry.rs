@@ -19,6 +19,8 @@ use crate::handle::RepoHandle;
 use crate::state::{RepoState, load_state, save_state};
 use crate::store_proto::get_message;
 
+const RESET_MARKER: &str = "walgit-reset-pending";
+
 pub struct Registry {
     store: DynStore,
     cfg: Arc<walgit_config::Config>,
@@ -104,25 +106,27 @@ impl Registry {
         crate::validate_manifest(&manifest)?;
 
         // Open or init local repo (LocalRepo joins owner/name.git onto the root).
-        let local = if let Some(l) = LocalRepo::open(&self.cache_root, id)? {
-            l
-        } else {
-            // A directory without HEAD is an unfinished init or an interrupted reset:
-            // whatever it still holds is not this repository's.
-            let cache_root = self.cache_root.clone();
-            let owned_id = id.clone();
-            let format = parse_object_format(&manifest.object_format);
-            tokio::task::spawn_blocking(move || {
-                match std::fs::remove_dir_all(owned_id.local_dir(&cache_root)) {
-                    Ok(()) => {}
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                    Err(e) => return Err(WalError::Io(e)),
-                }
-                Ok::<_, WalError>(LocalRepo::init(&cache_root, &owned_id, format)?)
-            })
-            .await
-            .map_err(|e| WalError::Corrupt(format!("local copy task: {e}")))??
-        };
+        let reset_pending = id.local_dir(&self.cache_root).join(RESET_MARKER).exists();
+        let local =
+            if let Some(l) = LocalRepo::open(&self.cache_root, id)?.filter(|_| !reset_pending) {
+                l
+            } else {
+                // A directory without HEAD, or still marked by a create, is an unfinished init
+                // or an interrupted reset: whatever it still holds is not this repository's.
+                let cache_root = self.cache_root.clone();
+                let owned_id = id.clone();
+                let format = parse_object_format(&manifest.object_format);
+                tokio::task::spawn_blocking(move || {
+                    match std::fs::remove_dir_all(owned_id.local_dir(&cache_root)) {
+                        Ok(()) => {}
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(e) => return Err(WalError::Io(e)),
+                    }
+                    Ok::<_, WalError>(LocalRepo::init(&cache_root, &owned_id, format)?)
+                })
+                .await
+                .map_err(|e| WalError::Corrupt(format!("local copy task: {e}")))??
+            };
 
         // Load state
         let mut state = load_state(local.path());
@@ -176,10 +180,13 @@ impl Registry {
         {
             return Err(WalError::NotFound);
         }
-        // Drop the handle first so no request on this instance publishes into a
-        // prefix that is being removed; in-flight requests hold their own Arc.
-        self.repos.remove(id);
+        // Drop and retire the handle first so no request on this instance publishes
+        // into a prefix that is being removed or touches a later generation's directory.
+        let stale = self.repos.remove(id).map(|(_, handle)| handle);
         self.invalidate_listing();
+        if let Some(handle) = &stale {
+            handle.retire_and_drain().await;
+        }
         // Manifest first: it is the linearization point, so the repo disappears
         // atomically for readers; remaining objects are unreferenced garbage.
         prefixed.delete(keys::MANIFEST, None).await?;
@@ -237,6 +244,18 @@ impl Registry {
             settings: None,
             retired_packs: Vec::new(),
         };
+
+        // Marked before the Create, so a reset that fails or never runs after the Create
+        // lands (crash, lost reply) leaves `open` to rebuild instead of serving the old copy.
+        let marker = id.local_dir(&self.cache_root).join(RESET_MARKER);
+        let marked = marker.clone();
+        tokio::task::spawn_blocking(move || match std::fs::write(&marked, b"") {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(WalError::Io(e)),
+        })
+        .await
+        .map_err(|e| WalError::Corrupt(format!("local copy task: {e}")))??;
 
         let buf = manifest.encode_to_vec();
         match prefixed
@@ -306,7 +325,10 @@ impl Registry {
                 self.invalidate_listing();
                 Ok(handle)
             }
-            Err(StoreError::PreconditionFailed { .. }) => Err(WalError::AlreadyExists),
+            Err(StoreError::PreconditionFailed { .. }) => {
+                let _ = tokio::fs::remove_file(&marker).await;
+                Err(WalError::AlreadyExists)
+            }
             Err(e) => Err(WalError::Store(e)),
         }
     }
@@ -492,6 +514,7 @@ impl Registry {
             if handle.ensure_live().is_err() {
                 continue;
             }
+            handle.retire();
             let path = handle.local.path().to_path_buf();
             let bytes = dir_size(&path);
             self.repos.remove(id);

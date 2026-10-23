@@ -350,6 +350,77 @@ async fn create_of_an_existing_repository_is_already_exists_warm_or_cold() {
 /// directory is reset, and anything it starts afterwards fails instead of
 /// writing into the new repository.
 #[tokio::test]
+async fn open_rebuilds_a_copy_whose_create_landed_without_its_reset() {
+    let cache = tempfile::tempdir().unwrap();
+    let store = MemoryStore::shared();
+    let cfg = Arc::new(make_config(&cache.path().join("a"), 0));
+    let id = repo_id("test", "crashed");
+
+    let registry = Registry::new(store.clone(), cfg.clone());
+    let handle = registry.create(&id, ObjectFormat::Sha1).await.unwrap();
+    let work = WorkRepo::new();
+    let c1 = work.commit("init", "data");
+    let ingested = ingest_pack_data(&handle, work.create_pack()).await.unwrap();
+    handle
+        .publish_push(
+            Some(ingested),
+            make_txn(vec![("refs/heads/main", "", &c1)]),
+            HashMap::new(),
+        )
+        .await
+        .unwrap();
+    let local_dir = handle.local().path().to_path_buf();
+    drop(handle);
+    drop(registry);
+
+    // Another host deletes and recreates; this host's own Create would have marked the
+    // copy and then died before resetting it.
+    let other = tempfile::tempdir().unwrap();
+    let foreign = Registry::new(store.clone(), Arc::new(make_config(other.path(), 0)));
+    foreign.delete(&id).await.unwrap();
+    foreign.create(&id, ObjectFormat::Sha1).await.unwrap();
+    std::fs::write(local_dir.join("walgit-reset-pending"), b"").unwrap();
+
+    let reopened = Registry::new(store.clone(), cfg).open(&id).await.unwrap();
+    reopened.sync_refs().await.unwrap();
+    assert!(reopened.local().refs().unwrap().refs.is_empty());
+    assert!(!local_dir.join("walgit-reset-pending").exists());
+}
+
+#[tokio::test]
+async fn a_refused_create_keeps_the_existing_local_copy() {
+    let cache = tempfile::tempdir().unwrap();
+    let store = MemoryStore::shared();
+    let cfg = Arc::new(make_config(&cache.path().join("a"), 0));
+    let id = repo_id("test", "kept");
+
+    let registry = Registry::new(store.clone(), cfg.clone());
+    let handle = registry.create(&id, ObjectFormat::Sha1).await.unwrap();
+    let work = WorkRepo::new();
+    let c1 = work.commit("init", "data");
+    let ingested = ingest_pack_data(&handle, work.create_pack()).await.unwrap();
+    handle
+        .publish_push(
+            Some(ingested),
+            make_txn(vec![("refs/heads/main", "", &c1)]),
+            HashMap::new(),
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        registry.create(&id, ObjectFormat::Sha1).await,
+        Err(WalError::AlreadyExists)
+    ));
+    let local_dir = handle.local().path().to_path_buf();
+    assert!(!local_dir.join("walgit-reset-pending").exists());
+    drop(handle);
+    drop(registry);
+
+    let reopened = Registry::new(store.clone(), cfg).open(&id).await.unwrap();
+    assert_eq!(reopened.local().refs().unwrap().refs.len(), 1);
+}
+
+#[tokio::test]
 async fn create_after_a_foreign_delete_starts_from_an_empty_local_copy() {
     let cache = tempfile::tempdir().unwrap();
     let store = MemoryStore::shared();
@@ -421,6 +492,46 @@ async fn create_after_a_foreign_delete_starts_from_an_empty_local_copy() {
     let opened = registry.open(&id).await.unwrap();
     assert!(Arc::ptr_eq(&opened, &recreated));
     assert!(!Arc::ptr_eq(&opened, &handle));
+}
+
+/// A handle dropped by `delete` is retired too, so a holder that outlives the delete
+/// cannot write into the directory of a repository created afterwards.
+#[tokio::test]
+async fn a_handle_held_across_delete_and_create_cannot_touch_the_new_repository() {
+    let cache = tempfile::tempdir().unwrap();
+    let store = MemoryStore::shared();
+    let registry = Registry::new(
+        store.clone(),
+        Arc::new(make_config(&cache.path().join("a"), 0)),
+    );
+    let id = repo_id("test", "deleted");
+
+    let handle = registry.create(&id, ObjectFormat::Sha1).await.unwrap();
+    let work = WorkRepo::new();
+    let c1 = work.commit("init", "data");
+    let ingested = ingest_pack_data(&handle, work.create_pack()).await.unwrap();
+    handle
+        .publish_push(
+            Some(ingested),
+            make_txn(vec![("refs/heads/main", "", &c1)]),
+            HashMap::new(),
+        )
+        .await
+        .unwrap();
+
+    registry.delete(&id).await.unwrap();
+    let recreated = registry.create(&id, ObjectFormat::Sha1).await.unwrap();
+
+    assert!(matches!(handle.sync().await, Err(WalError::NotFound)));
+    let late = handle
+        .publish_push(
+            None,
+            make_txn(vec![("refs/heads/late", "", &c1)]),
+            HashMap::new(),
+        )
+        .await;
+    assert!(late.is_err());
+    assert!(recreated.local().refs().unwrap().refs.is_empty());
 }
 
 /// A reset that died after invalidating the directory leaves refs and packs behind;

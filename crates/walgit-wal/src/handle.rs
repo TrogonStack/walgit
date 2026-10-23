@@ -379,10 +379,14 @@ impl RepoHandle {
     /// that wants `rw.read` would deadlock). Every acquirer checks `ensure_live` after it
     /// holds its lock, so anything that starts later bails before touching the directory.
     pub(crate) async fn retire_and_drain(&self) {
-        self.retired.store(true, Ordering::Release);
+        self.retire();
         drop(self.pack_mutex.lock().await);
         drop(self.sync_mutex.lock().await);
         drop(self.rw.write().await);
+    }
+
+    pub(crate) fn retire(&self) {
+        self.retired.store(true, Ordering::Release);
     }
 
     pub fn store(&self) -> &Prefixed {
