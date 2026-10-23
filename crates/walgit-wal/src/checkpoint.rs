@@ -259,7 +259,7 @@ async fn write_checkpoint_inner(handle: &RepoHandle) -> Result<CheckpointRef, Wa
                         state.packs_revision = updated.revision;
                     }
                 }
-                crate::state::save_state(handle.local.path(), &handle.state.lock().clone())?;
+                handle.persist_state()?;
                 return Ok(cp_ref);
             }
             Err(StoreError::PreconditionFailed { .. }) => {

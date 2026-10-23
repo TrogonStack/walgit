@@ -473,6 +473,7 @@ pub(crate) async fn apply_delta(
     new_manifest: &Manifest,
     new_version: &Version,
 ) -> Result<(), WalError> {
+    handle.ensure_live()?;
     let local = &handle.local;
     let current_state = handle.state.lock().clone();
 
@@ -517,7 +518,7 @@ pub(crate) async fn apply_delta(
             state.packs_revision = new_manifest.revision;
         }
     }
-    crate::state::save_state(local.path(), &handle.state.lock().clone())?;
+    handle.persist_state()?;
     local.refresh_async().await?;
     Ok(())
 }
@@ -829,7 +830,7 @@ pub(crate) async fn reconcile_packs_inner(
                         .map_err(|e| WalError::Corrupt(format!("pack checksum: {e}")))
                 })
                 .collect::<Result<Vec<_>, _>>()?;
-            let pin = handle.pin_local_objects().await;
+            let pin = handle.pin_local_objects().await?;
             let repo = local.clone();
             let (refs, pin) = tokio::task::spawn_blocking(move || {
                 let refs = repo.refs();
@@ -861,7 +862,7 @@ pub(crate) async fn reconcile_packs_inner(
         let mut state = handle.state.lock();
         state.packs_revision = manifest.revision;
     }
-    crate::state::save_state(local.path(), &handle.state.lock().clone())?;
+    handle.persist_state()?;
     Ok(())
 }
 

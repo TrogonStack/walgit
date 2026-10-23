@@ -19,47 +19,6 @@ use crate::handle::RepoHandle;
 use crate::state::{RepoState, load_state, save_state};
 use crate::store_proto::get_message;
 
-/// Cache-root scratch directory for local copies superseded by a recreated
-/// repository. Entries never end in `.git`, so no `RepoId::local_dir` can name one.
-const STALE_COPIES_DIR: &str = "_stale";
-
-/// Move a leftover local copy out of the way with an atomic rename to a unique
-/// name, then reclaim it best-effort in the background. Holders of the old
-/// handle keep working on the moved copy, isolated from the new repository.
-/// If the rename fails, a best-effort in-place removal is the last resort so a
-/// later `open` never inherits the stale refs.
-fn set_stale_copy_aside(cache_root: &std::path::Path, id: &RepoId) -> Result<(), WalError> {
-    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let local_dir = id.local_dir(cache_root);
-    if !local_dir.exists() {
-        return Ok(());
-    }
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_nanos());
-    let aside = cache_root.join(STALE_COPIES_DIR).join(format!(
-        "{}.{}.{}-{}-{nanos}",
-        id.owner(),
-        id.name(),
-        std::process::id(),
-        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
-    ));
-    let moved = std::fs::create_dir_all(cache_root.join(STALE_COPIES_DIR))
-        .and_then(|()| std::fs::rename(&local_dir, &aside));
-    match moved {
-        Ok(()) => {
-            std::thread::spawn(move || {
-                let _ = std::fs::remove_dir_all(aside);
-            });
-            Ok(())
-        }
-        Err(e) => {
-            tracing::warn!(repo = %id, error = %e, "could not move the stale local copy aside");
-            std::fs::remove_dir_all(&local_dir).map_err(WalError::Io)
-        }
-    }
-}
-
 pub struct Registry {
     store: DynStore,
     cfg: Arc<walgit_config::Config>,
@@ -277,16 +236,25 @@ impl Registry {
         {
             Ok(meta) => {
                 // The Create landed, so nothing cached or on disk belongs to this
-                // manifest. Evict the stale handle first so `open` cannot hand it
-                // out; in-flight holders keep their own Arc on the moved copy.
+                // manifest. Evict the stale handle so `open` cannot hand it out, then
+                // wait for its in-flight work before the directory is reset in place:
+                // holders keep the path, so the handle is retired and drained first.
                 // Nothing is cached until the new copy is fully built, so a failure
                 // below leaves `open` to rebuild from the manifest.
-                self.repos.remove(id);
+                let stale = self.repos.remove(id).map(|(_, handle)| handle);
                 self.invalidate_listing();
+                let _drained = match &stale {
+                    Some(handle) => Some(handle.retire_and_drain().await),
+                    None => None,
+                };
                 let cache_root = self.cache_root.clone();
                 let owned_id = id.clone();
                 let local = tokio::task::spawn_blocking(move || {
-                    set_stale_copy_aside(&cache_root, &owned_id)?;
+                    match std::fs::remove_dir_all(owned_id.local_dir(&cache_root)) {
+                        Ok(()) => {}
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(e) => return Err(WalError::Io(e)),
+                    }
                     Ok::<_, WalError>(LocalRepo::init(&cache_root, &owned_id, format)?)
                 })
                 .await

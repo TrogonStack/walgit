@@ -154,6 +154,7 @@ pub(crate) async fn checkpoint_snapshot(
 impl RepoHandle {
     pub async fn fetch_view(&self) -> Result<FetchView, WalError> {
         let _sync = self.sync_mutex.lock().await;
+        self.ensure_live()?;
         let manifest = self.manifest();
         let local = self.local.clone();
         let refs = tokio::task::spawn_blocking(move || local.ref_view())

@@ -22,7 +22,7 @@ use walgit_git::{IngestOptions, ObjectFormat, RepoId};
 use walgit_proto::v1::{EntryKind, RefTransaction, RefUpdate};
 use walgit_store::ObjectStore;
 use walgit_store::memory::MemoryStore;
-use walgit_wal::Registry;
+use walgit_wal::{Registry, WalError};
 
 use std::io::Write;
 
@@ -346,9 +346,9 @@ async fn create_of_an_existing_repository_is_already_exists_warm_or_cold() {
 
 /// A create that lands proves nothing cached or on disk belongs to the new
 /// manifest: the copy left by a repository another host deleted must not leak
-/// into it, and a request still working on the old copy must not stop the
-/// create. A thread keeps writing into the old copy's object directory the whole
-/// time, as an in-flight holder or its background work would.
+/// into it. The old handle is retired, its in-flight work finishes before the
+/// directory is reset, and anything it starts afterwards fails instead of
+/// writing into the new repository.
 #[tokio::test]
 async fn create_after_a_foreign_delete_starts_from_an_empty_local_copy() {
     let cache = tempfile::tempdir().unwrap();
@@ -381,23 +381,42 @@ async fn create_after_a_foreign_delete_starts_from_an_empty_local_copy() {
         .await
         .unwrap();
 
-    let stale_objects = handle.local().path().join("objects");
-    let running = Arc::new(std::sync::atomic::AtomicBool::new(true));
-    let writer = {
-        let running = running.clone();
-        std::thread::spawn(move || {
-            let mut n = 0u64;
-            while running.load(std::sync::atomic::Ordering::Relaxed) {
-                let _ = std::fs::write(stale_objects.join(format!("busy-{n}")), b"x");
-                n += 1;
-            }
-        })
-    };
-    let recreated = registry.create(&id, ObjectFormat::Sha1).await;
-    running.store(false, std::sync::atomic::Ordering::Relaxed);
-    writer.join().unwrap();
-    let recreated = recreated.unwrap();
+    let in_flight = handle.sync_refs().await.unwrap();
+    let mut create = tokio::spawn({
+        let registry = registry.clone();
+        let id = id.clone();
+        async move { registry.create(&id, ObjectFormat::Sha1).await }
+    });
 
+    // The create retires the handle before it waits; a request started now is refused.
+    loop {
+        match handle.sync_refs().await {
+            Err(WalError::NotFound) => break,
+            Ok(guard) => drop(guard),
+            Err(e) => panic!("unexpected {e}"),
+        }
+        tokio::task::yield_now().await;
+    }
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(100), &mut create)
+            .await
+            .is_err(),
+        "create must wait for the request still holding the old handle"
+    );
+    assert_eq!(handle.local().refs().unwrap().refs.len(), 1);
+
+    drop(in_flight);
+    let recreated = create.await.unwrap().unwrap();
+
+    assert!(matches!(handle.sync().await, Err(WalError::NotFound)));
+    let late = handle
+        .publish_push(
+            None,
+            make_txn(vec![("refs/heads/late", "", &c1)]),
+            HashMap::new(),
+        )
+        .await;
+    assert!(late.is_err());
     assert!(recreated.local().refs().unwrap().refs.is_empty());
     let opened = registry.open(&id).await.unwrap();
     assert!(Arc::ptr_eq(&opened, &recreated));
