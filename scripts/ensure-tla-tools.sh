@@ -6,10 +6,10 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 JAR="$ROOT/target/tla2tools.jar"
 VERSION="v1.8.0"
 # v1.8.0 is a rolling upstream asset, not an immutable release. This pin
-# identifies 606dfa48298a1b36c4ee4625c705041c35bd7393 (2026-10-23). A mismatch fails closed: inspect
+# identifies 2ef2af8c767b76e5db5cba2878f027ac07aad36c (2026-10-23). A mismatch fails closed: inspect
 # MANIFEST.MF, upstream commit history and the release asset digest before
 # changing it. Never accept an unverified replacement automatically.
-SHA256="dae639a1f51a9e13ce60c369b15f32124cf1a78017aca366b6de0ae2b5169439"
+SHA256="d4a12081bb7acd49d6d6158e818d8d69f8eb3f9a1f140cb39d20d50c4ce77f44"
 URL="https://github.com/tlaplus/tlaplus/releases/download/$VERSION/tla2tools.jar"
 
 command -v java >/dev/null || { echo "TLA+: Java 11+ is required" >&2; exit 2; }
