@@ -344,8 +344,11 @@ async fn create_of_an_existing_repository_is_already_exists_warm_or_cold() {
     assert_eq!(cold.open(&id).await.unwrap().manifest().revision, 1);
 }
 
-/// A create that lands proves nothing on disk belongs to the new manifest: the
-/// copy left by a repository another host deleted must not leak into it.
+/// A create that lands proves nothing cached or on disk belongs to the new
+/// manifest: the copy left by a repository another host deleted must not leak
+/// into it, and a request still working on the old copy must not stop the
+/// create. A thread keeps writing into the old copy's object directory the whole
+/// time, as an in-flight holder or its background work would.
 #[tokio::test]
 async fn create_after_a_foreign_delete_starts_from_an_empty_local_copy() {
     let cache = tempfile::tempdir().unwrap();
@@ -378,8 +381,27 @@ async fn create_after_a_foreign_delete_starts_from_an_empty_local_copy() {
         .await
         .unwrap();
 
-    let recreated = registry.create(&id, ObjectFormat::Sha1).await.unwrap();
+    let stale_objects = handle.local().path().join("objects");
+    let running = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let writer = {
+        let running = running.clone();
+        std::thread::spawn(move || {
+            let mut n = 0u64;
+            while running.load(std::sync::atomic::Ordering::Relaxed) {
+                let _ = std::fs::write(stale_objects.join(format!("busy-{n}")), b"x");
+                n += 1;
+            }
+        })
+    };
+    let recreated = registry.create(&id, ObjectFormat::Sha1).await;
+    running.store(false, std::sync::atomic::Ordering::Relaxed);
+    writer.join().unwrap();
+    let recreated = recreated.unwrap();
+
     assert!(recreated.local().refs().unwrap().refs.is_empty());
+    let opened = registry.open(&id).await.unwrap();
+    assert!(Arc::ptr_eq(&opened, &recreated));
+    assert!(!Arc::ptr_eq(&opened, &handle));
 }
 
 /// Concurrent creates of one name — on one registry and across two — have
