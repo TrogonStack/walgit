@@ -425,6 +425,34 @@ async fn open_rebuilds_a_copy_whose_create_landed_without_its_reset() {
     assert!(!local_dir.join("walgit-reset-pending").exists());
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn an_interrupted_rebuild_is_rebuilt_again() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let cache = tempfile::tempdir().unwrap();
+    let store = MemoryStore::shared();
+    let cfg = Arc::new(make_config(&cache.path().join("a"), 0));
+    let id = repo_id("test", "rewiped");
+
+    let registry = Registry::new(store.clone(), cfg.clone());
+    let handle = registry.create(&id, ObjectFormat::Sha1).await.unwrap();
+    let local_dir = handle.local().path().to_path_buf();
+    drop(handle);
+    drop(registry);
+
+    std::fs::write(local_dir.join("walgit-reset-pending"), b"").unwrap();
+    let stuck = local_dir.join("stuck");
+    std::fs::create_dir(&stuck).unwrap();
+    std::fs::write(stuck.join("file"), b"").unwrap();
+    std::fs::set_permissions(&stuck, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+    let failed = Registry::new(store.clone(), cfg.clone()).open(&id).await;
+    std::fs::set_permissions(&stuck, std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(failed.is_err());
+    assert!(!local_dir.join("HEAD").exists());
+}
+
 #[tokio::test]
 async fn a_refused_create_keeps_a_marker_an_earlier_create_left() {
     let cache = tempfile::tempdir().unwrap();

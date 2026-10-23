@@ -107,26 +107,20 @@ impl Registry {
 
         // Open or init local repo (LocalRepo joins owner/name.git onto the root).
         let reset_pending = id.local_dir(&self.cache_root).join(RESET_MARKER).exists();
-        let local =
-            if let Some(l) = LocalRepo::open(&self.cache_root, id)?.filter(|_| !reset_pending) {
-                l
-            } else {
-                // A directory without HEAD, or still marked by a create, is an unfinished init
-                // or an interrupted reset: whatever it still holds is not this repository's.
-                let cache_root = self.cache_root.clone();
-                let owned_id = id.clone();
-                let format = parse_object_format(&manifest.object_format);
-                tokio::task::spawn_blocking(move || {
-                    match std::fs::remove_dir_all(owned_id.local_dir(&cache_root)) {
-                        Ok(()) => {}
-                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                        Err(e) => return Err(WalError::Io(e)),
-                    }
-                    Ok::<_, WalError>(LocalRepo::init(&cache_root, &owned_id, format)?)
-                })
+        let local = if let Some(l) =
+            LocalRepo::open(&self.cache_root, id)?.filter(|_| !reset_pending)
+        {
+            l
+        } else {
+            // A directory without HEAD, or still marked by a create, is an unfinished init
+            // or an interrupted reset: whatever it still holds is not this repository's.
+            let cache_root = self.cache_root.clone();
+            let owned_id = id.clone();
+            let format = parse_object_format(&manifest.object_format);
+            tokio::task::spawn_blocking(move || reset_local_copy(&cache_root, &owned_id, format))
                 .await
                 .map_err(|e| WalError::Corrupt(format!("local copy task: {e}")))??
-            };
+        };
 
         // Load state
         let mut state = load_state(local.path());
@@ -291,20 +285,7 @@ impl Registry {
                 let cache_root = self.cache_root.clone();
                 let owned_id = id.clone();
                 let local = tokio::task::spawn_blocking(move || {
-                    // Without HEAD `LocalRepo::open` rejects the directory, so a removal that
-                    // fails midway cannot be mistaken for the old repository: `open` rebuilds.
-                    let dir = owned_id.local_dir(&cache_root);
-                    for result in [
-                        std::fs::remove_file(dir.join("HEAD")),
-                        std::fs::remove_dir_all(&dir),
-                    ] {
-                        match result {
-                            Ok(()) => {}
-                            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                            Err(e) => return Err(WalError::Io(e)),
-                        }
-                    }
-                    Ok::<_, WalError>(LocalRepo::init(&cache_root, &owned_id, format)?)
+                    reset_local_copy(&cache_root, &owned_id, format)
                 })
                 .await
                 .map_err(|e| WalError::Corrupt(format!("local copy task: {e}")))??;
@@ -546,6 +527,23 @@ impl Registry {
             remaining_bytes: total_bytes,
         })
     }
+}
+
+/// HEAD goes first: without it `LocalRepo::open` rejects the directory, so a wipe that
+/// stops midway is rebuilt by the next `open` instead of served as a repository.
+fn reset_local_copy(
+    cache_root: &std::path::Path,
+    id: &RepoId,
+    format: ObjectFormat,
+) -> Result<LocalRepo, WalError> {
+    let dir = id.local_dir(cache_root);
+    let ignore_missing = |result: std::io::Result<()>| match result {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(WalError::Io(e)),
+        _ => Ok(()),
+    };
+    ignore_missing(std::fs::remove_file(dir.join("HEAD")))?;
+    ignore_missing(std::fs::remove_dir_all(&dir))?;
+    Ok(LocalRepo::init(cache_root, id, format)?)
 }
 
 fn parse_object_format(s: &str) -> ObjectFormat {
