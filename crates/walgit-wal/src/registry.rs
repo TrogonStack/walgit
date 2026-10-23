@@ -235,7 +235,14 @@ impl Registry {
             .await
         {
             Ok(meta) => {
-                // Init local repo
+                // The Create landed, so nothing on disk belongs to this manifest:
+                // a copy left by a repository deleted elsewhere must not leak in.
+                let local_dir = id.local_dir(&self.cache_root);
+                if local_dir.exists() {
+                    tokio::fs::remove_dir_all(&local_dir)
+                        .await
+                        .map_err(WalError::Io)?;
+                }
                 let local = LocalRepo::init(&self.cache_root, id, format)?;
 
                 let state = RepoState {

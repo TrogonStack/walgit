@@ -344,6 +344,44 @@ async fn create_of_an_existing_repository_is_already_exists_warm_or_cold() {
     assert_eq!(cold.open(&id).await.unwrap().manifest().revision, 1);
 }
 
+/// A create that lands proves nothing on disk belongs to the new manifest: the
+/// copy left by a repository another host deleted must not leak into it.
+#[tokio::test]
+async fn create_after_a_foreign_delete_starts_from_an_empty_local_copy() {
+    let cache = tempfile::tempdir().unwrap();
+    let store = MemoryStore::shared();
+    let registry = Registry::new(
+        store.clone(),
+        Arc::new(make_config(&cache.path().join("a"), 0)),
+    );
+    let id = repo_id("test", "recreated");
+
+    let handle = registry.create(&id, ObjectFormat::Sha1).await.unwrap();
+    let work = WorkRepo::new();
+    let c1 = work.commit("init", "data");
+    let ingested = ingest_pack_data(&handle, work.create_pack()).await.unwrap();
+    handle
+        .publish_push(
+            Some(ingested),
+            make_txn(vec![("refs/heads/main", "", &c1)]),
+            HashMap::new(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(handle.local().refs().unwrap().refs.len(), 1);
+
+    store
+        .delete(
+            &format!("{}{}", id.store_prefix(), walgit_proto::keys::MANIFEST),
+            None,
+        )
+        .await
+        .unwrap();
+
+    let recreated = registry.create(&id, ObjectFormat::Sha1).await.unwrap();
+    assert!(recreated.local().refs().unwrap().refs.is_empty());
+}
+
 /// Concurrent creates of one name — on one registry and across two — have
 /// exactly one winner; `open_or_create` (auto-create on push) treats losing
 /// that race as success and opens the winner's repository.
