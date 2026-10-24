@@ -322,7 +322,15 @@ impl Registry {
                 }
                 Err(WalError::AlreadyExists)
             }
-            Err(e) => Err(WalError::Store(e)),
+            Err(e) => {
+                // The Create may have landed behind a lost reply: the marker stays, and
+                // no cached handle may keep serving the copy the marker condemns.
+                if let Some((_, stale)) = self.repos.remove(id) {
+                    self.invalidate_listing();
+                    stale.retire_and_drain().await;
+                }
+                Err(WalError::Store(e))
+            }
         }
     }
 

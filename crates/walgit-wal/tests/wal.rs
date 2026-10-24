@@ -446,11 +446,21 @@ async fn an_interrupted_rebuild_is_rebuilt_again() {
     std::fs::create_dir(&stuck).unwrap();
     std::fs::write(stuck.join("file"), b"").unwrap();
     std::fs::set_permissions(&stuck, std::fs::Permissions::from_mode(0o555)).unwrap();
+    if std::fs::write(stuck.join("probe"), b"").is_ok() {
+        // Root ignores directory permissions, so the interrupted wipe cannot be staged.
+        std::fs::set_permissions(&stuck, std::fs::Permissions::from_mode(0o755)).unwrap();
+        return;
+    }
 
     let failed = Registry::new(store.clone(), cfg.clone()).open(&id).await;
     std::fs::set_permissions(&stuck, std::fs::Permissions::from_mode(0o755)).unwrap();
     assert!(failed.is_err());
     assert!(!local_dir.join("HEAD").exists());
+
+    let reopened = Registry::new(store.clone(), cfg).open(&id).await.unwrap();
+    assert!(reopened.local().path().join("HEAD").exists());
+    assert!(!local_dir.join("walgit-reset-pending").exists());
+    assert!(!stuck.exists());
 }
 
 #[tokio::test]
@@ -636,6 +646,54 @@ async fn a_handle_held_across_delete_and_create_cannot_touch_the_new_repository(
         .await;
     assert!(late.is_err());
     assert!(recreated.local().refs().unwrap().refs.is_empty());
+}
+
+/// A Create whose reply was lost may have landed, so the warm copy of a repository another
+/// host deleted must not keep serving its refs under the new manifest.
+#[tokio::test]
+async fn a_create_with_a_lost_reply_stops_serving_the_cached_copy() {
+    use walgit_store::fault::{FaultPlan, FaultStore};
+    let cache = tempfile::tempdir().unwrap();
+    let truth = MemoryStore::shared();
+    let link = FaultStore::new(truth.clone(), "lost-create", 1);
+    let registry = Registry::new(
+        link.clone(),
+        Arc::new(make_config(&cache.path().join("a"), 0)),
+    );
+    let id = repo_id("test", "lost-create");
+
+    let handle = registry.create(&id, ObjectFormat::Sha1).await.unwrap();
+    let work = WorkRepo::new();
+    let c1 = work.commit("init", "data");
+    let ingested = ingest_pack_data(&handle, work.create_pack()).await.unwrap();
+    handle
+        .publish_push(
+            Some(ingested),
+            make_txn(vec![("refs/heads/main", "", &c1)]),
+            HashMap::new(),
+        )
+        .await
+        .unwrap();
+
+    Registry::new(
+        truth.clone(),
+        Arc::new(make_config(&cache.path().join("b"), 0)),
+    )
+    .delete(&id)
+    .await
+    .unwrap();
+
+    link.set(FaultPlan {
+        p_err_after: 1.0,
+        only_keys: Some(vec!["manifest.pb".into()]),
+        ..Default::default()
+    });
+    assert!(registry.create(&id, ObjectFormat::Sha1).await.is_err());
+    link.heal();
+
+    assert!(matches!(handle.sync().await, Err(WalError::NotFound)));
+    let reopened = registry.open(&id).await.unwrap();
+    assert!(reopened.local().refs().unwrap().refs.is_empty());
 }
 
 /// A reset that died after invalidating the directory leaves refs and packs behind;
