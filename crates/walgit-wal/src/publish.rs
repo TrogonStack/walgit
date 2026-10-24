@@ -582,6 +582,9 @@ async fn process_batch(handle: &RepoHandle, batch: Vec<PublishRequest>) -> Resul
         // lock that applies refs. Release it before any store or bulk work.
         let (manifest, known_version, mut working_refs) = {
             let _sync = handle.sync_mutex.lock().await;
+            if let Err(e) = handle.ensure_live() {
+                return finish_all_errors(batch, e);
+            }
             let (manifest, version) = handle.manifest_pair();
             let refs = match handle.local.ref_view() {
                 Ok(v) => v,
@@ -865,7 +868,6 @@ async fn process_batch(handle: &RepoHandle, batch: Vec<PublishRequest>) -> Resul
             // every waiter is answered `ok`. A failed apply leaves the version unadvertised, so the next
             // sync sees a change and replays the entry — the copy repairs itself. (Answering an error
             // here produced a durable push that git reported as failed — "0 winners", commit fetchable.)
-            let mut local_ok = true;
             {
                 let _sync_guard = crate::lockwait::timed(
                     "sync_mutex",
@@ -875,6 +877,8 @@ async fn process_batch(handle: &RepoHandle, batch: Vec<PublishRequest>) -> Resul
                     handle.sync_mutex.lock(),
                 )
                 .await;
+                let live = handle.ensure_live().is_ok();
+                let mut local_ok = live;
                 let applied_seq = handle.state.lock().applied_seq;
                 let already_applied = applied_seq >= last_seq;
                 if applied_seq < committed.head_seq
@@ -884,11 +888,9 @@ async fn process_batch(handle: &RepoHandle, batch: Vec<PublishRequest>) -> Resul
                     tracing::warn!(error = %e, "landed push catch-up failed; next sync repairs it");
                     local_ok = false;
                 }
-                for (req, _) in batch
-                    .iter()
-                    .zip(&verified)
-                    .filter(|(_, v)| v.valid && !already_applied && committed.head_seq == last_seq)
-                {
+                for (req, _) in batch.iter().zip(&verified).filter(|(_, v)| {
+                    live && v.valid && !already_applied && committed.head_seq == last_seq
+                }) {
                     if let Err(e) = handle.local.apply_ref_txn(&req.txn, false) {
                         tracing::warn!(repo = %handle.id, seq = last_seq, error = %e, "published (CAS ok), but applying the ref txn to the local copy failed; the next sync replays it");
                         metrics::counter!("walgit_publish_local_apply_failed_total").increment(1);
@@ -921,9 +923,7 @@ async fn process_batch(handle: &RepoHandle, batch: Vec<PublishRequest>) -> Resul
                             state.packs_revision = committed.revision;
                         }
                     }
-                    if let Err(e) =
-                        crate::state::save_state(handle.local.path(), &handle.state.lock().clone())
-                    {
+                    if let Err(e) = handle.persist_state() {
                         tracing::warn!(repo = %handle.id, error = %e, "published (CAS ok), but saving local state failed; the next sync repairs it");
                     }
                 } else if !local_ok {
@@ -1320,7 +1320,7 @@ pub(crate) async fn publish_compact_classified(
                     state.packs_revision = committed.revision;
                 }
             }
-            crate::state::save_state(handle.local.path(), &handle.state.lock().clone())?;
+            handle.persist_state()?;
             sweep_burned(&handle.store, &slot).await;
             return Ok(seq);
         }
@@ -1428,7 +1428,7 @@ pub(crate) async fn annotate_pack_impl(
                     state.manifest_version = Some(meta.version.as_str().to_string());
                     state.revision = updated.revision;
                 }
-                crate::state::save_state(handle.local.path(), &handle.state.lock().clone())?;
+                handle.persist_state()?;
                 return Ok(pack_ref);
             }
             Err(StoreError::PreconditionFailed { .. }) => {
@@ -1466,25 +1466,28 @@ pub(crate) async fn add_pack_impl(
     let checksum = gix_hash::ObjectId::from_hex(hex.as_bytes())
         .map_err(|e| WalError::Corrupt(format!("bad pack name {name}: {e}")))?;
     let dest = handle.local.pack_path(&checksum);
-    std::fs::create_dir_all(
-        dest.parent()
-            .ok_or_else(|| WalError::Corrupt("destination has no parent".into()))?,
-    )?;
-    for (src, dst) in [(pack, dest.clone()), (idx, dest.with_extension("idx"))] {
-        if !dst.exists() && std::fs::hard_link(src, &dst).is_err() {
-            std::fs::copy(src, &dst)?;
+    let info = {
+        let _pin = handle.pin_local_objects().await?;
+        std::fs::create_dir_all(
+            dest.parent()
+                .ok_or_else(|| WalError::Corrupt("destination has no parent".into()))?,
+        )?;
+        for (src, dst) in [(pack, dest.clone()), (idx, dest.with_extension("idx"))] {
+            if !dst.exists() && std::fs::hard_link(src, &dst).is_err() {
+                std::fs::copy(src, &dst)?;
+            }
         }
-    }
-    if let Some(base) = &history_of {
-        handle.local.mark_history_pack(&checksum, base).await?;
-    }
-    handle.local.refresh_async().await?;
-    let info = handle
-        .local
-        .packs()?
-        .into_iter()
-        .find(|p| p.checksum == checksum)
-        .ok_or_else(|| WalError::Corrupt(format!("pack {hex} not visible after install")))?;
+        if let Some(base) = &history_of {
+            handle.local.mark_history_pack(&checksum, base).await?;
+        }
+        handle.local.refresh_async().await?;
+        handle
+            .local
+            .packs()?
+            .into_iter()
+            .find(|p| p.checksum == checksum)
+            .ok_or_else(|| WalError::Corrupt(format!("pack {hex} not visible after install")))?
+    };
     publish_compact_impl(handle, info, Vec::new(), tier).await
 }
 
@@ -1590,7 +1593,7 @@ pub(crate) async fn publish_settings_impl(
                         state.packs_revision = updated.revision;
                     }
                 }
-                crate::state::save_state(handle.local.path(), &handle.state.lock().clone())?;
+                handle.persist_state()?;
                 *handle.effective.lock() = None;
                 sweep_burned(&handle.store, &slot).await;
                 tracing::info!(repo = %handle.id, seq, revision, author, "settings published");

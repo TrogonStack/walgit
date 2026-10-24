@@ -10,7 +10,7 @@ t15 := `if command -v timeout >/dev/null 2>&1; then echo "timeout 900"; elif com
 
 # The fast tier's package selections, shared by the build and the run of each line.
 fast_pkgs := "-p walgit-store -p walgit-git -p walgit-wal"
-server_fast := "-p walgit-server --test web_api --test web_ui --test api_v1 --test static_http --test packfile_uri --test forward --test maintain --test routing_prefix --test lfs_upstream --test drain --test events --test follow --test policy"
+server_fast := "-p walgit-server --test web_api --test web_ui --test api_v1 --test static_http --test packfile_uri --test forward --test maintain --test routing_prefix --test metrics --test lfs_upstream --test drain --test events --test follow --test policy"
 
 # Default: show available targets.
 default:

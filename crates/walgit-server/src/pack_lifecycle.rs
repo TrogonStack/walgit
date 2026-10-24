@@ -495,7 +495,7 @@ pub async fn run(
             _ => 2,
         };
         let global = matches!(work, Work::FirstFreeze | Work::Resegment);
-        let pin = handle.pin_local_objects().await;
+        let pin = handle.pin_local_objects().await?;
         let mut input = maintenance_input::prepare(
             handle.local().path().to_path_buf(),
             root,
@@ -701,7 +701,7 @@ pub async fn run(
     {
         let oid = gix_hash::ObjectId::from_hex(commit.oid.as_bytes())?;
         handle.local().set_segmented_midx_mode(true);
-        let pin = handle.pin_local_objects().await;
+        let pin = handle.pin_local_objects().await?;
         handle
             .local()
             .write_verified_midx(&final_ids, oid, pin)

@@ -19,6 +19,8 @@ use crate::handle::RepoHandle;
 use crate::state::{RepoState, load_state, save_state};
 use crate::store_proto::get_message;
 
+const RESET_MARKER: &str = "walgit-reset-pending";
+
 pub struct Registry {
     store: DynStore,
     cfg: Arc<walgit_config::Config>,
@@ -83,12 +85,12 @@ impl Registry {
         // Every request that touches a repo goes through here: tag the
         // enclosing `http.request` span (no-op outside one).
         tracing::Span::current().record("repo", tracing::field::display(id));
-        if let Some(h) = self.repos.get(id) {
+        if let Some(h) = self.repos.get(id).filter(|h| h.ensure_live().is_ok()) {
             return Ok(h.clone());
         }
         let gate = self.opening.entry(id.clone()).or_default().clone();
         let _g = gate.lock().await;
-        if let Some(h) = self.repos.get(id) {
+        if let Some(h) = self.repos.get(id).filter(|h| h.ensure_live().is_ok()) {
             return Ok(h.clone());
         }
 
@@ -104,11 +106,20 @@ impl Registry {
         crate::validate_manifest(&manifest)?;
 
         // Open or init local repo (LocalRepo joins owner/name.git onto the root).
-        let local = if let Some(l) = LocalRepo::open(&self.cache_root, id)? {
+        let reset_pending = id.local_dir(&self.cache_root).join(RESET_MARKER).exists();
+        let local = if let Some(l) =
+            LocalRepo::open(&self.cache_root, id)?.filter(|_| !reset_pending)
+        {
             l
         } else {
+            // A directory without HEAD, or still marked by a create, is an unfinished init
+            // or an interrupted reset: whatever it still holds is not this repository's.
+            let cache_root = self.cache_root.clone();
+            let owned_id = id.clone();
             let format = parse_object_format(&manifest.object_format);
-            LocalRepo::init(&self.cache_root, id, format)?
+            tokio::task::spawn_blocking(move || reset_local_copy(&cache_root, &owned_id, format))
+                .await
+                .map_err(|e| WalError::Corrupt(format!("local copy task: {e}")))??
         };
 
         // Load state
@@ -156,6 +167,10 @@ impl Registry {
     /// handle and the local copy. Err(NotFound) if the manifest does not exist.
     /// Other instances notice on their next freshness check (manifest GET -> 404).
     pub async fn delete(&self, id: &RepoId) -> Result<(), WalError> {
+        // Held to the end: an `open` racing the drain would cache a handle on a
+        // manifest and directory that are about to disappear.
+        let gate = self.opening.entry(id.clone()).or_default().clone();
+        let _g = gate.lock().await;
         let prefixed = Prefixed::new(self.store.clone(), id.store_prefix());
         if get_message::<Manifest>(&prefixed, keys::MANIFEST)
             .await?
@@ -163,10 +178,13 @@ impl Registry {
         {
             return Err(WalError::NotFound);
         }
-        // Drop the handle first so no request on this instance publishes into a
-        // prefix that is being removed; in-flight requests hold their own Arc.
-        self.repos.remove(id);
+        // Drop and retire the handle first so no request on this instance publishes
+        // into a prefix that is being removed or touches a later generation's directory.
+        let stale = self.repos.remove(id).map(|(_, handle)| handle);
         self.invalidate_listing();
+        if let Some(handle) = &stale {
+            handle.retire_and_drain().await;
+        }
         // Manifest first: it is the linearization point, so the repo disappears
         // atomically for readers; remaining objects are unreferenced garbage.
         prefixed.delete(keys::MANIFEST, None).await?;
@@ -194,19 +212,16 @@ impl Registry {
     }
 
     /// CAS-create manifest.pb (`PutMode::Create`). Err(AlreadyExists) on 412.
+    /// The Create PUT is the only authority, warm handle or not: a cached handle
+    /// is not evidence the manifest still exists (another host may have deleted
+    /// it) and must not turn a second create into a success.
     pub async fn create(
         &self,
         id: &RepoId,
         format: ObjectFormat,
     ) -> Result<Arc<RepoHandle>, WalError> {
-        if let Some(h) = self.repos.get(id) {
-            return Ok(h.clone());
-        }
         let gate = self.opening.entry(id.clone()).or_default().clone();
         let _g = gate.lock().await;
-        if let Some(h) = self.repos.get(id) {
-            return Ok(h.clone());
-        }
 
         let prefix = id.store_prefix();
         let prefixed = Prefixed::new(self.store.clone(), prefix);
@@ -228,6 +243,24 @@ impl Registry {
             retired_packs: Vec::new(),
         };
 
+        // Marked before the Create, so a reset that fails or never runs after the Create
+        // lands (crash, lost reply) leaves `open` to rebuild instead of serving the old copy.
+        let marker = id.local_dir(&self.cache_root).join(RESET_MARKER);
+        // A marker left by an earlier attempt stays: that Create may have landed.
+        let marked = marker.clone();
+        let marked_here = tokio::task::spawn_blocking(move || {
+            if marked.exists() {
+                return Ok(false);
+            }
+            match std::fs::write(&marked, b"") {
+                Ok(()) => Ok(true),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+                Err(e) => Err(WalError::Io(e)),
+            }
+        })
+        .await
+        .map_err(|e| WalError::Corrupt(format!("local copy task: {e}")))??;
+
         let buf = manifest.encode_to_vec();
         match prefixed
             .put(
@@ -238,8 +271,24 @@ impl Registry {
             .await
         {
             Ok(meta) => {
-                // Init local repo
-                let local = LocalRepo::init(&self.cache_root, id, format)?;
+                // The Create landed, so nothing cached or on disk belongs to this
+                // manifest. Evict the stale handle so `open` cannot hand it out, then
+                // wait for its in-flight work before the directory is reset in place:
+                // holders keep the path, so the handle is retired and drained first.
+                // Nothing is cached until the new copy is fully built, so a failure
+                // below leaves `open` to rebuild from the manifest.
+                let stale = self.repos.remove(id).map(|(_, handle)| handle);
+                self.invalidate_listing();
+                if let Some(handle) = &stale {
+                    handle.retire_and_drain().await;
+                }
+                let cache_root = self.cache_root.clone();
+                let owned_id = id.clone();
+                let local = tokio::task::spawn_blocking(move || {
+                    reset_local_copy(&cache_root, &owned_id, format)
+                })
+                .await
+                .map_err(|e| WalError::Corrupt(format!("local copy task: {e}")))??;
 
                 let state = RepoState {
                     manifest_version: Some(meta.version.as_str().to_string()),
@@ -267,12 +316,26 @@ impl Registry {
                 self.invalidate_listing();
                 Ok(handle)
             }
-            Err(StoreError::PreconditionFailed { .. }) => Err(WalError::AlreadyExists),
-            Err(e) => Err(WalError::Store(e)),
+            Err(StoreError::PreconditionFailed { .. }) => {
+                if marked_here {
+                    let _ = tokio::fs::remove_file(&marker).await;
+                }
+                Err(WalError::AlreadyExists)
+            }
+            Err(e) => {
+                // The Create may have landed behind a lost reply: the marker stays, and
+                // no cached handle may keep serving the copy the marker condemns.
+                if let Some((_, stale)) = self.repos.remove(id) {
+                    self.invalidate_listing();
+                    stale.retire_and_drain().await;
+                }
+                Err(WalError::Store(e))
+            }
         }
     }
 
-    /// Open or create.
+    /// Open or create. Losing a create race (another request or host created it
+    /// between our 404 and our Create) is success: open what the winner made.
     pub async fn open_or_create(
         &self,
         id: &RepoId,
@@ -280,7 +343,10 @@ impl Registry {
     ) -> Result<Arc<RepoHandle>, WalError> {
         match self.open(id).await {
             Ok(h) => Ok(h),
-            Err(WalError::NotFound) => self.create(id, format).await,
+            Err(WalError::NotFound) => match self.create(id, format).await {
+                Err(WalError::AlreadyExists) => self.open(id).await,
+                other => other,
+            },
             Err(e) => Err(e),
         }
     }
@@ -440,14 +506,24 @@ impl Registry {
             // excludes leaked/long-lived request ReadGuards. The old code only
             // probed sync_mutex and immediately dropped it, so it could delete
             // packs underneath an active reader.
+            // The opening gate keeps `open` from rebuilding on this directory, or
+            // caching a handle on it, until it is gone.
+            let gate = self.opening.entry(id.clone()).or_default().clone();
+            let Ok(_opening) = gate.try_lock() else {
+                continue;
+            };
             let Ok(_sync) = handle.sync_mutex.try_lock() else {
                 continue;
             };
             let Ok(_write) = handle.rw.try_write() else {
                 continue;
             };
+            if handle.ensure_live().is_err() {
+                continue;
+            }
             let path = handle.local.path().to_path_buf();
             let bytes = dir_size(&path);
+            handle.retire();
             self.repos.remove(id);
             let _ = std::fs::remove_dir_all(&path);
             total_bytes = total_bytes.saturating_sub(bytes);
@@ -459,6 +535,23 @@ impl Registry {
             remaining_bytes: total_bytes,
         })
     }
+}
+
+/// HEAD goes first: without it `LocalRepo::open` rejects the directory, so a wipe that
+/// stops midway is rebuilt by the next `open` instead of served as a repository.
+fn reset_local_copy(
+    cache_root: &std::path::Path,
+    id: &RepoId,
+    format: ObjectFormat,
+) -> Result<LocalRepo, WalError> {
+    let dir = id.local_dir(cache_root);
+    let ignore_missing = |result: std::io::Result<()>| match result {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(WalError::Io(e)),
+        _ => Ok(()),
+    };
+    ignore_missing(std::fs::remove_file(dir.join("HEAD")))?;
+    ignore_missing(std::fs::remove_dir_all(&dir))?;
+    Ok(LocalRepo::init(cache_root, id, format)?)
 }
 
 fn parse_object_format(s: &str) -> ObjectFormat {
@@ -513,4 +606,72 @@ fn disk_usage(path: &std::path::Path) -> Option<(u64, u64)> {
     let total = st.f_blocks as u64 * st.f_frsize as u64;
     let avail = st.f_bavail as u64 * st.f_frsize as u64;
     Some((total.saturating_sub(avail), total))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use walgit_store::memory::MemoryStore;
+
+    use super::*;
+
+    /// A holder of `pack_mutex` that then wants `rw.read` (segmented MIDX
+    /// reconciliation) must not be stuck behind the drain's `rw` writer.
+    #[tokio::test]
+    async fn retire_and_drain_does_not_queue_a_writer_behind_a_pack_mutex_holder() {
+        let cache = tempfile::tempdir().unwrap();
+        let mut cfg = walgit_config::Config::default();
+        cfg.cache.dir = cache.path().to_path_buf();
+        let registry = Registry::new(MemoryStore::shared(), Arc::new(cfg));
+        let id = RepoId::new("test", "drain").unwrap();
+        let handle = registry.create(&id, ObjectFormat::Sha1).await.unwrap();
+
+        let pack = handle.pack_mutex.lock().await;
+        let drain = tokio::spawn({
+            let handle = handle.clone();
+            async move { handle.retire_and_drain().await }
+        });
+        while handle.ensure_live().is_ok() {
+            tokio::task::yield_now().await;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let pin = tokio::time::timeout(Duration::from_secs(5), handle.pin_local_objects())
+            .await
+            .expect("rw.read must not wait behind the drain");
+        assert!(matches!(pin, Err(WalError::NotFound)));
+
+        drop(pack);
+        tokio::time::timeout(Duration::from_secs(5), drain)
+            .await
+            .expect("drain completes once the holder is gone")
+            .unwrap();
+    }
+
+    /// An `open` in progress owns the directory it is building on; eviction must
+    /// neither remove it nor drop the handle that `open` is about to cache.
+    #[tokio::test]
+    async fn eviction_skips_a_repository_an_open_is_building() {
+        let cache = tempfile::tempdir().unwrap();
+        let mut cfg = walgit_config::Config::default();
+        cfg.cache.dir = cache.path().to_path_buf();
+        cfg.cache.max_bytes = walgit_config::ByteSize::b(0);
+        cfg.cache.evict_idle_after = Duration::ZERO;
+        let registry = Registry::new(MemoryStore::shared(), Arc::new(cfg));
+        let id = RepoId::new("test", "building").unwrap();
+        let handle = registry.create(&id, ObjectFormat::Sha1).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(5)).await;
+
+        let gate = registry.opening.entry(id.clone()).or_default().clone();
+        let opening = gate.lock().await;
+        let report = registry.evict_idle().await.unwrap();
+        assert_eq!(report.evicted, 0);
+        assert!(handle.ensure_live().is_ok());
+        assert!(handle.local().path().join("HEAD").exists());
+
+        drop(opening);
+        assert_eq!(registry.evict_idle().await.unwrap().evicted, 1);
+        assert!(handle.ensure_live().is_err());
+    }
 }

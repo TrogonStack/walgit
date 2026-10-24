@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 use std::sync::{
     Arc,
-    atomic::{AtomicUsize, Ordering},
+    atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 use std::time::Instant;
 
@@ -54,6 +54,9 @@ pub struct RepoHandle {
     /// stuck behind a multi-GB materialization (only removals take the write
     /// lock, briefly).
     pub(crate) pack_mutex: TokioMutex<()>,
+    /// Set when `Registry::create` replaces this repository's local copy: the
+    /// path now belongs to the next generation, so nothing here may touch it.
+    retired: AtomicBool,
 
     // Current manifest (last known). Short critical sections, no await.
     pub(crate) manifest: PLRwLock<Arc<Manifest>>,
@@ -152,6 +155,7 @@ impl RepoHandle {
             rw: Arc::new(TokioRwLock::new(())),
             sync_mutex: TokioMutex::new(()),
             pack_mutex: TokioMutex::new(()),
+            retired: AtomicBool::new(false),
             manifest: PLRwLock::new(Arc::new(manifest)),
             manifest_version: PLMutex::new(version),
             state: PLMutex::new(state),
@@ -356,6 +360,35 @@ impl RepoHandle {
         &self.local
     }
 
+    /// Fails once the local copy was handed to a newer generation of this repository.
+    pub(crate) fn ensure_live(&self) -> Result<(), WalError> {
+        if self.retired.load(Ordering::Acquire) {
+            return Err(WalError::NotFound);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn persist_state(&self) -> Result<(), WalError> {
+        self.ensure_live()?;
+        crate::state::save_state(self.local.path(), &self.state.lock().clone())
+    }
+
+    /// Retire the handle, then wait out every holder that began before it. Each lock is
+    /// taken and released in turn, never held while waiting for the next, so the drain adds
+    /// no lock-order edge (a queued `rw` writer behind a holder of `pack_mutex`/`sync_mutex`
+    /// that wants `rw.read` would deadlock). Every acquirer checks `ensure_live` after it
+    /// holds its lock, so anything that starts later bails before touching the directory.
+    pub(crate) async fn retire_and_drain(&self) {
+        self.retire();
+        drop(self.pack_mutex.lock().await);
+        drop(self.sync_mutex.lock().await);
+        drop(self.rw.write().await);
+    }
+
+    pub(crate) fn retire(&self) {
+        self.retired.store(true, Ordering::Release);
+    }
+
     pub fn store(&self) -> &Prefixed {
         &self.store
     }
@@ -423,8 +456,12 @@ impl RepoHandle {
     /// Pin installed object files across an owned blocking maintenance task.
     /// Unlike a borrowed request guard, cancellation of its caller cannot release
     /// this pin while a detached blocking worker still copies the input files.
-    pub async fn pin_local_objects(&self) -> tokio::sync::OwnedRwLockReadGuard<()> {
-        self.rw.clone().read_owned().await
+    pub async fn pin_local_objects(
+        &self,
+    ) -> Result<tokio::sync::OwnedRwLockReadGuard<()>, WalError> {
+        let pin = self.rw.clone().read_owned().await;
+        self.ensure_live()?;
+        Ok(pin)
     }
 
     pub async fn sync_full(&self) -> Result<crate::sync::ReadGuard<'_>, WalError> {
@@ -512,6 +549,7 @@ impl RepoHandle {
                     arc.pack_mutex.lock(),
                 )
                 .await;
+                arc.ensure_live()?;
                 let manifest = arc.manifest();
                 let task = match arc.begin_task("history-pack", HashMap::new()) {
                     Begin::Started(t) => Some(t),
@@ -595,6 +633,7 @@ impl RepoHandle {
             changed = false,
             entries_applied = 0u64,
         );
+        self.ensure_live()?;
         self.touch();
         // Phase 1 — refs (manifest freshness + ref state), under sync_mutex
         // only; sub-second. Phase 2 — packs, under pack_mutex only. Neither
@@ -619,6 +658,7 @@ impl RepoHandle {
             self.rw.read().instrument(span.clone()),
         )
         .await;
+        self.ensure_live()?;
         Ok(crate::sync::ReadGuard {
             _guard: read_guard,
             handle: self,
@@ -628,6 +668,7 @@ impl RepoHandle {
     /// Manifest freshness check + ref state apply (never packs, never
     /// `rw.write()`: ref files and the gix handle are replaced atomically).
     async fn sync_refs_phase(&self, span: &tracing::Span) -> Result<(), WalError> {
+        self.ensure_live()?;
         if self.freshness_ttl_active() {
             return Ok(());
         }
@@ -639,6 +680,7 @@ impl RepoHandle {
             self.sync_mutex.lock(),
         )
         .await;
+        self.ensure_live()?;
         if self.freshness_ttl_active() {
             return Ok(());
         }
@@ -666,6 +708,7 @@ impl RepoHandle {
             self.pack_mutex.lock(),
         )
         .await;
+        self.ensure_live()?;
         if self.level_satisfied(level) {
             return Ok(());
         }
@@ -824,6 +867,7 @@ impl RepoHandle {
     /// Freshness check + refs apply, with `sync_mutex` and the write lock held
     /// by the caller. Packs are never touched here (see `sync_packs_phase`).
     pub(crate) async fn sync_locked_inner(&self, span: &tracing::Span) -> Result<(), WalError> {
+        self.ensure_live()?;
         let known = self.manifest_version.lock().clone();
         let outcome = crate::sync::freshness_check(&self.store, known.as_ref()).await?;
         match outcome {
@@ -931,6 +975,7 @@ impl RepoHandle {
             self.pack_mutex.lock(),
         )
         .await;
+        self.ensure_live()?;
 
         // Read manifest fresh
         let Some((meta, manifest)) =
