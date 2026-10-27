@@ -152,6 +152,10 @@ smoke:
     {{t15}} cargo build -p walgit-cli -p walgit-nats
     WALGIT="$(realpath "${CARGO_TARGET_DIR:-target}/debug/walgit")" WALGIT_NATS="$(realpath "${CARGO_TARGET_DIR:-target}/debug/walgit-nats")" {{t15}} tests/e2e.sh
 
+# Build the OCI image of one binary (walgit or walgit-nats) with podman; the Containerfile has a target per binary.
+image target="walgit":
+    podman build --target {{target}} -t {{target}} -f Containerfile .
+
 # Slow tier: #[ignore]d benches/soaks (20k-ref push, 466k-ref render, ...).
 test-slow:
     cargo test --workspace -- --ignored --nocapture

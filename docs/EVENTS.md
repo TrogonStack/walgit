@@ -237,8 +237,27 @@ Each behaviour above has a test against a real `nats-server -js` (`crates/walgit
 | The publisher never shares local copies with `walgit serve` | `the_publisher_never_shares_local_copies_with_serve` |
 | SIGTERM exits 0 | `tests/e2e.sh` phase 3 |
 
-Not covered: Prometheus metrics (the service stats are the only counters), multi-node JetStream clusters, and
-the Containerfile / flake packaging.
+Not covered: Prometheus metrics (the service stats are the only counters) and multi-node JetStream clusters.
+
+### Building and running the binary and its image
+
+`walgit-nats` has no listener, so its image exposes no port and has no HTTP healthcheck; liveness is the process
+and the NATS micro service (`$SRV.PING`). Its build does not need the web stage:
+
+```sh
+cargo build --release -p walgit-nats                      # ./target/release/walgit-nats
+nix build .#walgit-nats                                   # or .#image-nats for the OCI image
+just image walgit-nats                                    # podman build --target walgit-nats
+podman run --rm \
+    -e AWS_ACCESS_KEY_ID -e AWS_SECRET_ACCESS_KEY -e NATS_URL \
+    -v ./walgit.toml:/etc/walgit/walgit.toml:ro walgit-nats
+```
+
+The final stage of the `Containerfile` named `walgit-nats` is a slim Debian base with git, CA certificates, a
+non-root user and the one binary. Its only subprocesses are `git init --bare` and `git config` when it creates a repository's local
+refs copy (`RepoHandle::sync_refs` writes `packed-refs` there), so the image carries git and no git-lfs or coreutils. The image sets
+`WALGIT_CONFIG=/etc/walgit/walgit.toml` and `WALGIT__CACHE__DIR=/var/lib/walgit-nats`, and sets no
+`WALGIT__SERVER__LISTEN`. The default `Containerfile` target stays `walgit`, which is what CI publishes.
 
 ```toml
 [events]
