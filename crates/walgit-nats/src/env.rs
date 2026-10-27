@@ -69,12 +69,27 @@ pub struct ClientTls {
 }
 
 /// Everything the `NATS_*` variables say about the connection.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Default)]
 pub struct NatsEnv {
     pub servers: Option<Vec<String>>,
     pub identity: Option<Identity>,
     pub token: Option<Secret>,
     pub tls: ClientTls,
+}
+
+impl fmt::Debug for NatsEnv {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let servers = self
+            .servers
+            .as_ref()
+            .map(|urls| urls.iter().map(|url| redacted(url)).collect::<Vec<_>>());
+        f.debug_struct("NatsEnv")
+            .field("servers", &servers)
+            .field("identity", &self.identity)
+            .field("token", &self.token)
+            .field("tls", &self.tls)
+            .finish()
+    }
 }
 
 impl NatsEnv {
@@ -624,5 +639,9 @@ mod tests {
         assert!(!shown.contains("super-secret"), "{shown}");
         let env = resolve(&[("NATS_JWT", "secret-jwt"), ("NATS_SEED", "secret-seed")]).unwrap();
         assert!(!format!("{env:?}").contains("secret-"));
+        let env = resolve(&[("NATS_URL", "nats://bob:secret-pass@a:4222,nats://secret-token@b:4222")]).unwrap();
+        let shown = format!("{env:?}");
+        assert!(shown.contains("a:4222") && shown.contains("b:4222"), "{shown}");
+        assert!(!shown.contains("secret-") && !shown.contains("bob"), "{shown}");
     }
 }
