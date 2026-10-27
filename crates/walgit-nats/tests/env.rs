@@ -207,3 +207,46 @@ async fn a_failed_connection_never_shows_the_credentials_in_the_url() {
     assert!(msg.contains("auth: URL token"), "{msg}");
     assert!(!msg.contains("leaked-if-printed"), "{msg}");
 }
+
+/// A CA and a server certificate for 127.0.0.1 it signed, as PEM files in `dir`.
+#[allow(clippy::expect_used)]
+fn tls_files(dir: &std::path::Path) -> (String, String, String) {
+    let ca_key = rcgen::KeyPair::generate().expect("ca key");
+    let mut ca_params = rcgen::CertificateParams::new(Vec::<String>::new()).expect("ca params");
+    ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+    let ca = ca_params.self_signed(&ca_key).expect("ca");
+    let issuer = rcgen::Issuer::new(ca_params, ca_key);
+    let key = rcgen::KeyPair::generate().expect("server key");
+    let cert = rcgen::CertificateParams::new(vec!["127.0.0.1".to_owned()])
+        .expect("server params")
+        .signed_by(&key, &issuer)
+        .expect("server certificate");
+    let write = |name: &str, pem: String| {
+        let path = dir.join(name);
+        std::fs::write(&path, pem).expect("write pem");
+        path.to_string_lossy().into_owned()
+    };
+    (
+        write("ca.pem", ca.pem()),
+        write("server.pem", cert.pem()),
+        write("server-key.pem", key.serialize_pem()),
+    )
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_ca_requires_tls_as_in_the_nats_cli() {
+    let dir = tempfile::tempdir().unwrap();
+    let (ca, cert, key) = tls_files(dir.path());
+    let Some(plain) = start_nats_with(&[]).await else {
+        return;
+    };
+    assert!(connects(&plain, &env(&[])).await);
+    assert!(
+        !connects(&plain, &env(&[("NATS_CA", &ca)])).await,
+        "a plaintext server is refused, never used without TLS"
+    );
+    let Some(tls) = start_nats_with(&["--tls", "--tlscert", &cert, "--tlskey", &key]).await else {
+        return;
+    };
+    assert!(connects(&tls, &env(&[("NATS_CA", &ca)])).await, "the CA verifies the server");
+}

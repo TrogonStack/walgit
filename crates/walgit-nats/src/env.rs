@@ -248,6 +248,9 @@ impl NatsEnv {
         if let Some(ca) = &self.tls.ca {
             opts = opts.add_root_certificates(ca.clone());
         }
+        if self.tls.certificate.is_some() || self.tls.ca.is_some() {
+            opts = opts.require_tls(true);
+        }
         Ok(opts)
     }
 }

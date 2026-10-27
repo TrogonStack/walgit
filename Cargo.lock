@@ -6006,6 +6006,7 @@ dependencies = [
  "bytes",
  "nkeys",
  "percent-encoding",
+ "rcgen",
  "serde_json",
  "tempfile",
  "thiserror",
