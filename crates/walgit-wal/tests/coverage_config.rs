@@ -1,7 +1,7 @@
 //! Coverage producers must never broaden a saved policy after a host config change.
 use std::sync::Arc;
 
-use walgit_config::{Config, PackGroupConfig, PackGroupKind};
+use walgit_config::{Config, PackGroupConfig, PackGroupKind, Settings};
 use walgit_git::{ObjectFormat, RepoId};
 use walgit_wal::Registry;
 
