@@ -141,6 +141,7 @@ moka = { version = "0.12", features = ["sync"] }
 mimalloc = "0.1"
 tempfile = "3"
 nkeys = "0.4"
+percent-encoding = "2"
 flate2 = "1"
 async-compression = { version = "0.4", features = ["tokio", "gzip"] }
 pin-project-lite = "0.2"

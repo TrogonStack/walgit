@@ -208,6 +208,7 @@ lock_wait_warn = "1s"             # WARN "lock wait" (lock, repo, wait_ms, reque
 #   the connection reads the `nats` CLI's variables the way it does (empty = unset): NATS_URL replaces urls;
 #   identity is the first of NATS_USER + NATS_PASSWORD, NATS_CREDS (file), NATS_NKEY (seed file),
 #   NATS_JWT + NATS_SEED, NATS_JWT; NATS_TOKEN (or NATS_USER without a password) is sent with it;
+#   user:password@ or token@ in a server URL replaces the user, password and token;
 #   NATS_CERT + NATS_KEY, NATS_CA for TLS; NATS_CONTEXT and NATS_SOCKS_PROXY are refused; secrets are never logged
 # stream = "WALGIT_EVENTS"        # the JetStream stream holding the events (subjects "<subject_prefix>.ref.>"); it is the resume cursor
 # ensure_stream = true            # create the stream when missing (file storage); an existing stream is used as is

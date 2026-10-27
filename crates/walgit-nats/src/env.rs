@@ -2,8 +2,10 @@
 //! reads and combined the way it combines them, so one shell environment drives both and secrets
 //! never sit in `walgit.toml`.
 
+use std::borrow::Cow;
 use std::fmt;
 use std::path::PathBuf;
+use std::str::FromStr;
 use std::sync::Arc;
 
 use anyhow::Context;
@@ -130,7 +132,7 @@ impl NatsEnv {
             match seed {
                 Some(seed) => Some(Identity::JwtAndSeed {
                     jwt,
-                    seed: Secret(literal(ENV_NATS_SEED, &seed, home.as_deref())?),
+                    seed: Secret(seed_value(literal(ENV_NATS_SEED, &seed, home.as_deref())?)),
                 }),
                 None => Some(Identity::BearerJwt(jwt)),
             }
@@ -153,10 +155,19 @@ impl NatsEnv {
         })
     }
 
+    /// The identity that still applies once a server URL's credentials took the user and password.
+    fn identity_beside(&self, url: Option<&UrlCredentials>) -> Option<&Identity> {
+        match (&self.identity, url) {
+            (Some(Identity::UserPassword { .. }), Some(_)) => None,
+            (identity, _) => identity.as_ref(),
+        }
+    }
+
     /// The methods in use, for logs and errors. Never contains a secret.
-    pub fn description(&self) -> String {
-        let mut parts: Vec<&str> = self.identity.iter().map(Identity::description).collect();
-        if self.token.is_some() {
+    pub fn description(&self, url: Option<&UrlCredentials>) -> String {
+        let mut parts: Vec<&str> = url.iter().map(|c| c.description()).collect();
+        parts.extend(self.identity_beside(url).map(Identity::description));
+        if url.is_none() && self.token.is_some() {
             parts.push("token");
         }
         if self.tls.certificate.is_some() {
@@ -169,9 +180,13 @@ impl NatsEnv {
         }
     }
 
-    pub(crate) async fn connect_options(&self) -> anyhow::Result<async_nats::ConnectOptions> {
+    /// As `nats` does, credentials in a server URL replace the user, password and token.
+    pub(crate) async fn connect_options(
+        &self,
+        url: Option<&UrlCredentials>,
+    ) -> anyhow::Result<async_nats::ConnectOptions> {
         let mut opts = async_nats::ConnectOptions::new();
-        opts = match &self.identity {
+        opts = match self.identity_beside(url) {
             None => opts,
             Some(Identity::UserPassword { user, password }) => {
                 opts.user_and_password(user.clone(), password.expose().to_owned())
@@ -203,9 +218,15 @@ impl NatsEnv {
                 opts.jwt(jwt.expose().to_owned(), |_| async { Ok(Vec::new()) })
             }
         };
-        if let Some(token) = &self.token {
-            opts = opts.token(token.expose().to_owned());
-        }
+        opts = match (url, &self.token) {
+            (Some(UrlCredentials::UserPassword { user, password }), _) => {
+                opts.user_and_password(user.clone(), password.expose().to_owned())
+            }
+            (Some(UrlCredentials::Token(token)), _) | (None, Some(token)) => {
+                opts.token(token.expose().to_owned())
+            }
+            (None, None) => opts,
+        };
         if let Some((cert, key)) = &self.tls.certificate {
             opts = opts.add_client_certificate(cert.clone(), key.clone());
         }
@@ -213,6 +234,97 @@ impl NatsEnv {
             opts = opts.add_root_certificates(ca.clone());
         }
         Ok(opts)
+    }
+}
+
+/// Credentials written into a server URL as `user:password@` or `token@`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum UrlCredentials {
+    UserPassword { user: String, password: Secret },
+    Token(Secret),
+}
+
+impl UrlCredentials {
+    fn description(&self) -> &'static str {
+        match self {
+            Self::UserPassword { .. } => "URL user/password",
+            Self::Token(_) => "URL token",
+        }
+    }
+}
+
+/// The servers to dial, with the credentials taken out of their URLs.
+#[derive(Debug)]
+pub struct Servers {
+    pub addrs: Vec<async_nats::ServerAddr>,
+    pub credentials: Option<UrlCredentials>,
+}
+
+impl Servers {
+    /// Parse `urls` from `source`. Servers that carry credentials must carry the same ones, and
+    /// an error never repeats them.
+    pub fn parse(source: &str, urls: &[String]) -> anyhow::Result<Self> {
+        let mut credentials: Option<UrlCredentials> = None;
+        let mut addrs = Vec::with_capacity(urls.len());
+        for u in urls {
+            let (addr, found) = async_nats::ServerAddr::from_str(u)
+                .map_err(anyhow::Error::from)
+                .and_then(take_credentials)
+                .with_context(|| format!("{source}: {}", redacted(u)))?;
+            if let Some(found) = found {
+                match &credentials {
+                    Some(seen) => anyhow::ensure!(
+                        *seen == found,
+                        "{source}: the servers carry different credentials"
+                    ),
+                    None => credentials = Some(found),
+                }
+            }
+            addrs.push(addr);
+        }
+        Ok(Self { addrs, credentials })
+    }
+
+    /// The URLs as dialled, which hold no credentials.
+    pub fn shown(&self) -> Vec<&str> {
+        self.addrs
+            .iter()
+            .map(async_nats::ServerAddr::as_url_str)
+            .collect()
+    }
+}
+
+fn take_credentials(
+    addr: async_nats::ServerAddr,
+) -> anyhow::Result<(async_nats::ServerAddr, Option<UrlCredentials>)> {
+    let decode = |s: &str| {
+        percent_encoding::percent_decode_str(s)
+            .decode_utf8()
+            .map(Cow::into_owned)
+    };
+    let credentials = match (addr.username(), addr.password()) {
+        (None, None) => return Ok((addr, None)),
+        (user, Some(password)) => UrlCredentials::UserPassword {
+            user: decode(user.unwrap_or_default())?,
+            password: Secret(decode(password)?),
+        },
+        (Some(token), None) => UrlCredentials::Token(Secret(decode(token)?)),
+    };
+    let mut url = addr.into_inner();
+    url.set_password(None)
+        .and_then(|()| url.set_username(""))
+        .map_err(|()| anyhow::anyhow!("the URL cannot carry credentials"))?;
+    Ok((async_nats::ServerAddr::from_url(url)?, Some(credentials)))
+}
+
+/// `url` with whatever precedes an `@` in its authority hidden, for a URL that did not parse.
+fn redacted(url: &str) -> String {
+    let (scheme, rest) = url.split_once("://").map_or(("", url), |(s, r)| (s, r));
+    let (authority, tail) = rest.split_at(rest.find(['/', '?', '#']).unwrap_or(rest.len()));
+    match authority.rsplit_once('@') {
+        Some((_, host)) if scheme.is_empty() => format!("<redacted>@{host}{tail}"),
+        Some((_, host)) => format!("{scheme}://<redacted>@{host}{tail}"),
+        None => url.to_owned(),
     }
 }
 
@@ -249,6 +361,12 @@ fn literal(name: &str, value: &str, home: Option<&str>) -> anyhow::Result<String
     Ok(contents.trim_end_matches(['\r', '\n']).to_owned())
 }
 
+/// A seed given bare or in the decorated block `nsc` writes; anything else is left for the key
+/// parser to reject.
+fn seed_value(value: String) -> String {
+    seed_in(&value).unwrap_or(value)
+}
+
 /// The seed in an nkey file, bare or inside the decorated block `nsc` writes.
 fn seed_in(contents: &str) -> Option<String> {
     contents
@@ -281,7 +399,7 @@ mod tests {
     fn no_variables_mean_no_auth_and_the_configured_servers() {
         let env = resolve(&[]).unwrap();
         assert!(env.identity.is_none() && env.token.is_none() && env.servers.is_none());
-        assert_eq!(env.description(), "none");
+        assert_eq!(env.description(None), "none");
     }
 
     #[test]
@@ -343,7 +461,7 @@ mod tests {
         let env = resolve(&[("NATS_CREDS", "/c"), ("NATS_TOKEN", "tok")]).unwrap();
         assert!(matches!(env.identity, Some(Identity::Credentials(_))));
         assert_eq!(env.token.as_ref().unwrap().expose(), "tok");
-        assert_eq!(env.description(), "credentials file + token");
+        assert_eq!(env.description(None), "credentials file + token");
     }
 
     #[test]
@@ -368,6 +486,69 @@ mod tests {
         let uri = format!("file://{}", seed.display());
         let id = identity(&[("NATS_JWT", "j"), ("NATS_SEED", &uri)]);
         assert!(matches!(id, Some(Identity::JwtAndSeed { seed, .. }) if seed.expose() == "SUSEED"));
+    }
+
+    #[test]
+    fn a_seed_file_may_hold_the_decorated_block() {
+        let dir = tempfile::tempdir().unwrap();
+        let seed = nkeys::KeyPair::new_user().seed().unwrap();
+        let path = dir.path().join("user.nk");
+        std::fs::write(
+            &path,
+            format!("-----BEGIN USER NKEY SEED-----\n{seed}\n------END USER NKEY SEED------\n"),
+        )
+        .unwrap();
+        let uri = format!("file://{}", path.display());
+        let id = identity(&[("NATS_JWT", "j"), ("NATS_SEED", &uri)]);
+        assert!(matches!(id, Some(Identity::JwtAndSeed { seed: s, .. }) if s.expose() == seed));
+    }
+
+    fn servers(urls: &[&str]) -> anyhow::Result<Servers> {
+        let urls: Vec<String> = urls.iter().map(|u| (*u).to_owned()).collect();
+        Servers::parse("NATS_URL", &urls)
+    }
+
+    #[test]
+    fn credentials_leave_the_url_and_are_decoded() {
+        let s = servers(&["nats://al%40ce:p%3Ass@a:4222", "nats://b:4222"]).unwrap();
+        assert_eq!(s.shown(), ["nats://a:4222", "nats://b:4222"]);
+        assert!(
+            matches!(&s.credentials, Some(UrlCredentials::UserPassword { user, password })
+            if user == "al@ce" && password.expose() == "p:ss")
+        );
+        let s = servers(&["nats://tok@a:4222"]).unwrap();
+        assert_eq!(s.shown(), ["nats://a:4222"]);
+        assert!(matches!(&s.credentials, Some(UrlCredentials::Token(t)) if t.expose() == "tok"));
+        assert!(servers(&["nats://a:4222"]).unwrap().credentials.is_none());
+    }
+
+    #[test]
+    fn servers_must_agree_on_their_credentials() {
+        let err = servers(&["nats://u:p@a:4222", "nats://u:q@b:4222"]).unwrap_err();
+        assert!(!format!("{err:#}").contains(":p@"), "{err:#}");
+        assert!(servers(&["nats://u:p@a:4222", "nats://b:4222", "nats://u:p@c:4222"]).is_ok());
+    }
+
+    #[test]
+    fn a_url_that_fails_to_parse_is_shown_without_its_credentials() {
+        let err = servers(&["nats://u:hidden@[bad"]).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("NATS_URL: nats://<redacted>@[bad"), "{msg}");
+        assert!(!msg.contains("hidden"), "{msg}");
+    }
+
+    #[test]
+    fn url_credentials_replace_the_user_password_and_token() {
+        let url = UrlCredentials::Token(Secret("t".into()));
+        let env = resolve(&[
+            ("NATS_USER", "u"),
+            ("NATS_PASSWORD", "p"),
+            ("NATS_TOKEN", "x"),
+        ])
+        .unwrap();
+        assert_eq!(env.description(Some(&url)), "URL token");
+        let env = resolve(&[("NATS_CREDS", "/c"), ("NATS_TOKEN", "x")]).unwrap();
+        assert_eq!(env.description(Some(&url)), "URL token + credentials file");
     }
 
     #[test]

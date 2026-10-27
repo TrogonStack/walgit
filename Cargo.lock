@@ -6005,6 +6005,7 @@ dependencies = [
  "async-nats",
  "bytes",
  "nkeys",
+ "percent-encoding",
  "serde_json",
  "tempfile",
  "thiserror",

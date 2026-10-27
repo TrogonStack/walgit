@@ -10,6 +10,7 @@ walgit-config.workspace = true
 walgit-git.workspace = true
 async-nats.workspace = true
 nkeys.workspace = true
+percent-encoding.workspace = true
 anyhow.workspace = true
 thiserror.workspace = true
 bytes.workspace = true

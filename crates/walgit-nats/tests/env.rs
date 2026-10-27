@@ -162,3 +162,48 @@ async fn a_failed_connection_names_the_method_but_never_the_secret() {
     assert!(!msg.contains("leaked-if-printed"), "{msg}");
     assert!(!format!("{auth:?}").contains("leaked-if-printed"));
 }
+
+fn with_userinfo(nats: &NatsServer, userinfo: &str) -> String {
+    nats.url.replacen("://", &format!("://{userinfo}@"), 1)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn credentials_in_nats_url_replace_the_user_password_and_token() {
+    let Some(nats) = start_nats_with(&["--user", "walgit", "--pass", "s3cret-pass"]).await else {
+        return;
+    };
+    let url = with_userinfo(&nats, "walgit:s3cret-pass");
+    let wrong = [("NATS_USER", "walgit"), ("NATS_PASSWORD", "wrong")];
+    assert!(connects(&nats, &env(&[("NATS_URL", &url), wrong[0], wrong[1]])).await);
+    assert!(
+        !connects(
+            &nats,
+            &env(&[("NATS_URL", &with_userinfo(&nats, "walgit:wrong"))])
+        )
+        .await
+    );
+
+    let Some(nats) = start_nats_with(&["--auth", "s3cret-token"]).await else {
+        return;
+    };
+    let url = with_userinfo(&nats, "s3cret-token");
+    assert!(connects(&nats, &env(&[("NATS_URL", &url), ("NATS_TOKEN", "wrong")])).await);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_failed_connection_never_shows_the_credentials_in_the_url() {
+    let Some(nats) = start_nats_with(&["--auth", "s3cret-token"]).await else {
+        return;
+    };
+    let auth = env(&[("NATS_URL", &with_userinfo(&nats, "leaked-if-printed"))]);
+    let err = tokio::time::timeout(
+        Duration::from_secs(5),
+        walgit_nats::connect(&cfg(&nats), &auth),
+    )
+    .await
+    .expect("a rejected credential fails fast")
+    .unwrap_err();
+    let msg = format!("{err:#}");
+    assert!(msg.contains("auth: URL token"), "{msg}");
+    assert!(!msg.contains("leaked-if-printed"), "{msg}");
+}
