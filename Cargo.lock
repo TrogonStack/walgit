@@ -6004,6 +6004,7 @@ dependencies = [
  "anyhow",
  "async-nats",
  "bytes",
+ "futures",
  "nkeys",
  "percent-encoding",
  "rcgen",

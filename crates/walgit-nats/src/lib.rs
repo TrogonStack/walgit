@@ -1,14 +1,16 @@
-//! `walgit nats`: the WAL's `ref` events (`docs/EVENTS.md`) published into NATS `JetStream`,
-//! with the cursor in the stream.
+//! `walgit nats`: the WAL's `ref` events (`docs/EVENTS.md`) published into NATS `JetStream`, with
+//! the cursor in the stream, wake-ups over NATS and a `$SRV` service API instead of HTTP.
 //! The event model is shared with the webhook bridge through `walgit-events`.
 
 pub mod env;
 pub mod message;
 pub mod publisher;
+pub mod service;
 pub mod stream_shape;
 pub mod subject;
 #[cfg(feature = "testing")]
 pub mod testing;
+pub mod wake;
 
 use anyhow::Context;
 use async_nats::jetstream::{self, stream};
