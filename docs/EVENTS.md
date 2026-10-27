@@ -235,9 +235,11 @@ user. An empty variable counts as unset.
 | `NATS_CERT`, `NATS_KEY`, `NATS_CA` | TLS client certificate and key (both needed), and the CA chain |
 
 The identity is the first of user and password, `NATS_CREDS`, `NATS_NKEY`, then `NATS_JWT`, the order `nats`
-uses. `NATS_CONTEXT` and `NATS_SOCKS_PROXY` stop `walgit nats` at startup: it reads no context files and has no
+uses. A server URL written `user:password@host` or `token@host` replaces the user, password and token, as in
+`nats`; servers that carry credentials must carry the same ones. `NATS_CONTEXT` and `NATS_SOCKS_PROXY` stop `walgit nats` at startup: it reads no context files and has no
 SOCKS dialer, and ignoring either would connect differently from `nats`. `NATS_TIMEOUT` and `NATS_COLOR` shape
-the CLI's own requests and output and have no effect here. Only the methods are logged, never a secret.
+the CLI's own requests and output and have no effect here. Only the methods and the URLs without their
+credentials are logged, never a secret.
 
 ## Consumer checklist
 
