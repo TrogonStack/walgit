@@ -120,7 +120,8 @@ sweep_interval = "5m"
 `walgit nats` is a second sink for the same `ref` events, a subcommand of the normal CLI
 (`walgit nats --config walgit.toml`, `[events.nats]`) built on the `walgit-nats` crate, which depends on
 `walgit-events` (the shared event model) and never on `walgit-server`. The webhook bridge is unchanged and the two can run side by side.
-Like the bridge it is a reader of the WAL, never a step of a push (D32).
+Like the bridge it is a reader of the WAL, never a step of a push (D32). It keeps its local copies under
+`<cache.dir>/.nats`, so it can share a `walgit.toml` and a host with `walgit serve` without touching serve's.
 
 - **The stream is the cursor (D50).** For each repository the publisher reads the last message on the
   repository's subject, takes its `Walgit-Seq` header and resumes from that seq, inclusive. Events already in
@@ -153,18 +154,19 @@ Like the bridge it is a reader of the WAL, never a step of a push (D32).
 - **`start = "head"` and restarts.** The first-seen head of a repository without a message is remembered in
   memory only. Pushes made while the publisher is down, before the repository's first event, are skipped for good
   after a restart (pinned by a test).
-- **A foreign message** (no `Walgit-Seq` / `Nats-Msg-Id`) as the last message on a repository's subject makes every
+- **A foreign message** (no `Walgit-Seq` / `Nats-Msg-Id`, or a body without the event's `old`/`new`) as the last message on a repository's subject makes every
   catch-up for that repository fail, naming the subject and stream sequence, until it is removed.
-- **Deleting and recreating a repository.** The manifest has no incarnation id, so the only signal is the stream
-  being ahead of the WAL: when the last message on a subject names a seq above the repository's `head_seq`, the
-  publisher warns, counts it (`rewinds` in the service stats), ignores that message as a cursor (the first seq
+- **Deleting and recreating a repository.** The manifest has no incarnation id, so the signal is the stream
+  disagreeing with the WAL: the last message on a subject names a seq above the repository's `head_seq`, or the
+  entry at its seq does not yield that message's event (same ref, `old` and `new`). The publisher then warns, counts it (`rewinds` in the service stats), ignores that message as a cursor (the first seq
   follows `events.nats.start`; with `"head"` the new incarnation's head at that first sighting is kept while the
   old message still tops the subject, so later pushes are published) and still guards the first publish with the subject's real last stream sequence, so
   it does not conflict. The new incarnation's `Nats-Msg-Id` (`<repo>:<seq>:<ref>`) can equal the old one's: inside
   `duplicate_window` the broker swallows it, the catch-up is not confirmed, the repository stays open and the
-  event lands on the first wake-up after the window (pinned by a test). Limitation: a recreated repository whose
-  head has already reached the old last seq before the publisher wakes is indistinguishable from the old one, and
-  its events up to that seq are never published. Consumers should treat a delete and recreate as a new stream.
+  event lands on the first wake-up after the window (pinned by a test). With `"head"` and nothing on the subject,
+  a repository seen deleted forgets its first-seen head, and a head lower than that mark resets it. Limitation:
+  an entry of the new incarnation identical to the old one's at the same seq (same ref, `old` and `new`) is taken
+  for it. Consumers should treat a delete and recreate as a new stream.
   The webhook bridge has the same ambiguity from the other side: its cursor lives under the repository's prefix and
   is deleted with it, so the new incarnation is published from seq 1 and the dedup key `(repo, seq, ref_name)`
   collides with the old incarnation's events.
@@ -203,7 +205,8 @@ Each behaviour above has a test against a real `nats-server -js` (`crates/walgit
 | A bad server URL fails to connect naming the setting | `an_unparsable_server_url_fails_to_connect_naming_the_setting` |
 | Tags, deletes and non-branch refs carry `ref_type` and zero OIDs | `tags_and_deletes_carry_their_ref_type_and_zero_oids` |
 | Many pushes land in seq order across catch-ups | `many_sequential_pushes_land_in_seq_order_across_catch_ups` |
-| A deleted and recreated repository is detected and published as new; an id collision heals after the dedup window | `a_recreated_repository_is_published_as_a_new_one`, `a_recreated_repository_under_head_start_publishes_pushes_after_its_first_sighting`, `a_recreated_repository_colliding_with_the_old_ids_heals_after_the_dedup_window` |
+| A deleted and recreated repository is detected and published as new; an id collision heals after the dedup window | `a_recreated_repository_is_published_as_a_new_one`, `a_recreated_repository_that_caught_up_with_the_old_seqs_is_still_published_whole`, `a_recreated_repository_under_head_start_publishes_pushes_after_its_first_sighting`, `a_deleted_repository_under_head_start_forgets_its_mark`, `a_recreation_under_head_start_seen_only_as_a_lower_head_resets_the_mark`, `a_recreated_repository_colliding_with_the_old_ids_heals_after_the_dedup_window` |
+| The publisher never shares local copies with `walgit serve` | `the_publisher_never_shares_local_copies_with_serve` |
 | SIGTERM exits 0 | `tests/e2e.sh` phase 3 |
 
 Not covered: Prometheus metrics (the service stats are the only counters), multi-node JetStream clusters, and
