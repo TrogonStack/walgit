@@ -63,7 +63,10 @@ impl Token {
         if out.is_empty() {
             return None;
         }
-        String::from_utf8(out).ok()
+        // One subject per repository: a byte escaped where `encode` keeps it is refused.
+        String::from_utf8(out)
+            .ok()
+            .filter(|raw| Token::encode(raw).0 == encoded)
     }
 
     pub fn as_str(&self) -> &str {
@@ -177,7 +180,7 @@ mod tests {
 
     #[test]
     fn decode_refuses_what_encode_never_emits() {
-        for bad in ["", "a.b", "a%2", "a%zz", "a%2e", "a b", "a*", "%FF"] {
+        for bad in ["", "a.b", "a%2", "a%zz", "a%2e", "a b", "a*", "%FF", "%41cme", "a%5Fb", "a%2Db"] {
             assert_eq!(Token::decode(bad), None, "{bad:?}");
         }
     }
@@ -191,6 +194,7 @@ mod tests {
             "walgit.refs.acme.repo",
             "walgit.ref..repo",
             "walgit.ref.%2E%2E.repo",
+            "walgit.ref.%61cme.repo",
         ] {
             assert!(RepoSubject::parse(&prefix(), bad).is_err(), "{bad}");
         }
