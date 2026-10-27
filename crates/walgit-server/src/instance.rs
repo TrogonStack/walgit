@@ -173,14 +173,8 @@ pub fn info(cfg: &walgit_config::Config) -> InstanceInfo {
                 .collect()
         },
     );
-    let version = match option_env!("WALGIT_BUILD_SHA") {
-        Some(sha) if !sha.is_empty() => format!(
-            "{}+{}",
-            env!("CARGO_PKG_VERSION"),
-            &sha[..sha.len().min(12)]
-        ),
-        _ => env!("CARGO_PKG_VERSION").to_string(),
-    };
+    let sha = walgit_telemetry::BUILD_SHA;
+    let version = format!("{}+{}", env!("CARGO_PKG_VERSION"), &sha[..sha.len().min(12)]);
     let roles = if cfg.server.roles.is_empty() {
         vec!["all".to_string()]
     } else {

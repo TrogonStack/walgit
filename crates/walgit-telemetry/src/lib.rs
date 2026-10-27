@@ -26,6 +26,14 @@
 //! Performance spans (INFO and above) emit a log line on span *close* so they
 //! are queryable in Cloud Logging:
 //!   `jsonPayload.span.name="git.upload_pack" AND jsonPayload.elapsed_ms > 1000`
+#![allow(
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::trivially_copy_pass_by_ref,
+    clippy::type_complexity,
+    clippy::unused_self,
+    clippy::unwrap_used
+)]
 
 use std::collections::HashMap;
 use std::io::{self, Write};
@@ -474,7 +482,7 @@ pub fn parse_traceparent(header: &str) -> Option<String> {
 
 /// Extract a trace id from HTTP headers, trying `X-Cloud-Trace-Context` then
 /// `traceparent`.
-pub fn extract_trace_id(headers: &axum::http::HeaderMap) -> Option<String> {
+pub fn extract_trace_id(headers: &http::HeaderMap) -> Option<String> {
     if let Some(v) = headers
         .get("x-cloud-trace-context")
         .and_then(|v| v.to_str().ok())
@@ -530,6 +538,46 @@ pub fn tracing_init(cfg: &Config) {
     }
 }
 
+/// Build identity for `/healthz` (`version`) and `--version`: the commit the binary was built from
+/// (`WALGIT_BUILD_SHA` at build time, else the checkout's HEAD, else "dev").
+pub const BUILD_SHA: &str = env!("WALGIT_BUILD_SHA");
+
+/// The start every walgit binary shares: load `config` (missing file exits 2, unreadable exits 1,
+/// `--config /dev/null` for defaults + `WALGIT__` env), install the rustls crypto provider and
+/// initialise tracing from `[telemetry]`. `bin` names the running binary in messages.
+pub fn startup(config: &std::path::Path, bin: &str) -> Config {
+    // Install the rustls crypto provider before any TLS code runs (GCS gRPC, reqwest).
+    // Required for rustls 0.23+: multiple providers in the dep tree; select one.
+    rustls::crypto::aws_lc_rs::default_provider()
+        .install_default()
+        .expect("install rustls aws_lc_rs provider");
+
+    let cfg = load_config(config, bin);
+    tracing_init(&cfg);
+    cfg
+}
+
+fn load_config(path: &std::path::Path, bin: &str) -> Config {
+    if path.exists() {
+        match Config::load(path) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("{bin}: error loading config from {}: {e:#}", path.display());
+                std::process::exit(1);
+            }
+        }
+    } else {
+        // Never run against defaults by accident: a typo'd --config would open the
+        // default bucket with whatever credentials are around. Defaults + WALGIT__
+        // env on purpose: `--config /dev/null`.
+        eprintln!(
+            "{bin}: config file {} not found (pass --config PATH or WALGIT_CONFIG; `--config /dev/null` for defaults + WALGIT__ env)",
+            path.display()
+        );
+        std::process::exit(2);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -579,7 +627,7 @@ mod tests {
     /// Verify that `extract_trace_id` works with both header formats.
     #[test]
     fn extract_trace_id_from_headers() {
-        let mut headers = axum::http::HeaderMap::new();
+        let mut headers = http::HeaderMap::new();
         headers.insert(
             "x-cloud-trace-context",
             "abcdef0123456789abcdef0123456789/12345;o=1"
@@ -591,7 +639,7 @@ mod tests {
             Some("abcdef0123456789abcdef0123456789".into())
         );
 
-        let mut headers = axum::http::HeaderMap::new();
+        let mut headers = http::HeaderMap::new();
         headers.insert(
             "traceparent",
             "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
@@ -603,7 +651,7 @@ mod tests {
             Some("4bf92f3577b34da6a3ce929d0e0e4736".into())
         );
 
-        let headers = axum::http::HeaderMap::new();
+        let headers = http::HeaderMap::new();
         assert_eq!(extract_trace_id(&headers), None);
     }
 

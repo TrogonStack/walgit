@@ -36,7 +36,7 @@ impl Server {
             let mut tcfg = walgit_config::Config::default();
             tcfg.telemetry.log_format = walgit_config::LogFormat::Json;
             tcfg.telemetry.log_filter = "warn,walgit=info,walgit_server=debug,walgit_wal=debug,walgit_git=debug,walgit_store=debug".into();
-            walgit_server::telemetry::tracing_init(&tcfg);
+            walgit_telemetry::tracing_init(&tcfg);
         }
         let store = MemoryStore::shared();
         Self::start_with(store, tempfile::tempdir()?).await

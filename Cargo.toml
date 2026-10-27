@@ -8,6 +8,7 @@ members = [
     "crates/walgit-wal",
     "crates/walgit-events",
     "crates/walgit-server",
+    "crates/walgit-telemetry",
     "crates/walgit-nats",
     "crates/walgit-cli",
 ]
@@ -69,6 +70,7 @@ walgit-git = { path = "crates/walgit-git" }
 walgit-wal = { path = "crates/walgit-wal" }
 walgit-events = { path = "crates/walgit-events" }
 walgit-server = { path = "crates/walgit-server" }
+walgit-telemetry = { path = "crates/walgit-telemetry" }
 walgit-nats = { path = "crates/walgit-nats" }
 
 anyhow = "1"
