@@ -24,18 +24,26 @@ pub fn notified_repos(payload: &[u8], store_prefix: &str) -> BTreeSet<RepoId> {
         .collect()
 }
 
-/// Subscribe to `subject` in `queue_group` (instances share the notifications) until the
-/// subscription ends. A failed catch-up is logged, not retried: core NATS does not redeliver, and
-/// the sweep is the backstop.
-pub async fn notify_loop(
-    client: async_nats::Client,
+/// Subscribe to `subject` in `queue_group` (instances share the notifications). Returns once the
+/// server has registered the subscription, so a notification sent afterwards is not dropped.
+pub async fn subscribe(
+    client: &async_nats::Client,
     subject: String,
     queue_group: String,
+) -> anyhow::Result<async_nats::Subscriber> {
+    let sub = client.queue_subscribe(subject.clone(), queue_group).await?;
+    client.flush().await?;
+    tracing::info!(%subject, "listening for bucket notifications");
+    Ok(sub)
+}
+
+/// Consume `sub` until it ends. A failed catch-up is logged, not retried: core NATS does not
+/// redeliver, and the sweep is the backstop.
+pub async fn notify_loop(
+    mut sub: async_nats::Subscriber,
     store_prefix: String,
     publisher: Arc<Publisher>,
 ) -> anyhow::Result<()> {
-    let mut sub = client.queue_subscribe(subject.clone(), queue_group).await?;
-    tracing::info!(%subject, "listening for bucket notifications");
     while let Some(msg) = sub.next().await {
         for id in notified_repos(&msg.payload, &store_prefix) {
             if let Err(e) = publisher.catch_up_if_present(&id).await {

@@ -207,23 +207,29 @@ impl Rig {
         }
     }
 
-    fn spawn_notify(&self, publisher: &Arc<Publisher>) -> tokio::task::JoinHandle<anyhow::Result<()>> {
+    async fn spawn_notify(&self, publisher: &Arc<Publisher>) -> tokio::task::JoinHandle<anyhow::Result<()>> {
         let nats_cfg = &self.cfg.events.nats;
-        tokio::spawn(walgit_nats::wake::notify_loop(
-            self.client.clone(),
+        let sub = walgit_nats::wake::subscribe(
+            &self.client,
             nats_cfg.notify_subject.clone(),
             nats_cfg.queue_group.clone(),
+        )
+        .await
+        .unwrap();
+        tokio::spawn(walgit_nats::wake::notify_loop(
+            sub,
             self.cfg.store_prefix(),
             publisher.clone(),
         ))
     }
 
-    fn spawn_service(&self, publisher: &Arc<Publisher>) -> tokio::task::JoinHandle<anyhow::Result<()>> {
-        let (client, prefix, publisher) = (self.client.clone(), self.prefix.clone(), publisher.clone());
-        let queue_group = self.cfg.events.nats.queue_group.clone();
-        tokio::spawn(async move {
-            walgit_nats::service::serve(client, &prefix, &queue_group, publisher).await
-        })
+    async fn spawn_service(&self, publisher: &Arc<Publisher>) -> tokio::task::JoinHandle<anyhow::Result<()>> {
+        let queue_group = &self.cfg.events.nats.queue_group;
+        let registered =
+            walgit_nats::service::register(&self.client, &self.prefix, queue_group, publisher)
+                .await
+                .unwrap();
+        tokio::spawn(walgit_nats::service::serve(registered, publisher.clone()))
     }
 
     async fn notify(&self, body: &str) {
@@ -413,20 +419,8 @@ async fn notifications_and_the_service_api_wake_the_publisher() {
     let publisher = rig.publisher(NatsStart::Oldest).await;
 
     let nats_cfg = &rig.cfg.events.nats;
-    let notify = tokio::spawn(walgit_nats::wake::notify_loop(
-        rig.client.clone(),
-        nats_cfg.notify_subject.clone(),
-        nats_cfg.queue_group.clone(),
-        rig.cfg.store_prefix(),
-        publisher.clone(),
-    ));
-    let service = tokio::spawn({
-        let (client, prefix, publisher) =
-            (rig.client.clone(), rig.prefix.clone(), publisher.clone());
-        let queue_group = nats_cfg.queue_group.clone();
-        async move { walgit_nats::service::serve(client, &prefix, &queue_group, publisher).await }
-    });
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    let notify = rig.spawn_notify(&publisher).await;
+    let service = rig.spawn_service(&publisher).await;
 
     // An S3 bucket notification, as the object store publishes it.
     rig.push(&id, &[("refs/heads/main", ZERO, A)]).await;
@@ -762,8 +756,7 @@ async fn notifications_that_name_nothing_are_ignored_and_the_loop_survives() {
     rig.registry.create(&id, ObjectFormat::Sha1).await.unwrap();
     rig.push(&id, &[("refs/heads/main", ZERO, A)]).await;
     let publisher = rig.publisher(NatsStart::Oldest).await;
-    let notify = rig.spawn_notify(&publisher);
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    let notify = rig.spawn_notify(&publisher).await;
 
     for body in [
         r#"{"key":"repos/t/r/wal/abc.pack"}"#,
@@ -857,9 +850,8 @@ async fn a_nats_server_restart_keeps_the_stream_the_subscriptions_and_the_servic
     rig.registry.create(&id, ObjectFormat::Sha1).await.unwrap();
     rig.push(&id, &[("refs/heads/main", ZERO, A)]).await;
     let publisher = rig.publisher(NatsStart::Oldest).await;
-    let notify = rig.spawn_notify(&publisher);
-    let service = rig.spawn_service(&publisher);
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    let notify = rig.spawn_notify(&publisher).await;
+    let service = rig.spawn_service(&publisher).await;
     rig.notify(r#"{"repo":"t/r"}"#).await;
     rig.wait_for_messages(1).await;
 
@@ -904,8 +896,7 @@ async fn the_service_answers_bad_requests_and_reports_the_counters() {
     let rig = Rig::new(&nats, NatsStart::Oldest).await;
     let id = repo_with_three_events(&rig, "t", "r").await;
     let publisher = rig.publisher(NatsStart::Oldest).await;
-    let service = rig.spawn_service(&publisher);
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    let service = rig.spawn_service(&publisher).await;
 
     for (body, code) in [
         ("not json", "400"),
@@ -992,8 +983,7 @@ async fn a_notification_inside_the_freshness_ttl_still_publishes_the_push() {
     let (publisher, _registry, _cache) = rig
         .operator_publisher(|c| c.wal.freshness_ttl = Duration::from_mins(10))
         .await;
-    let notify = rig.spawn_notify(&publisher);
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    let notify = rig.spawn_notify(&publisher).await;
     rig.notify(r#"{"repo":"t/r"}"#).await;
     rig.wait_for_messages(1).await;
 

@@ -41,13 +41,21 @@ async fn handle(publisher: &Publisher, payload: &[u8]) -> Result<Bytes, ServiceE
     }
 }
 
-/// Serve until the endpoint closes. Instances share requests through the service queue group.
-pub async fn serve(
-    client: async_nats::Client,
+/// A registered service: the handle keeps `$SRV` answering, the endpoint carries the requests.
+pub struct Registered {
+    _service: async_nats::service::Service,
+    endpoint: async_nats::service::endpoint::Endpoint,
+}
+
+/// Register the service and its endpoint. Returns once the server has processed the
+/// subscriptions, so a request sent afterwards finds a responder. Instances share requests
+/// through the service queue group.
+pub async fn register(
+    client: &async_nats::Client,
     prefix: &SubjectPrefix,
     queue_group: &str,
-    publisher: Arc<Publisher>,
-) -> anyhow::Result<()> {
+    publisher: &Arc<Publisher>,
+) -> anyhow::Result<Registered> {
     let stats = publisher.clone();
     let service = client
         .service_builder()
@@ -57,12 +65,25 @@ pub async fn serve(
         .start(SERVICE_NAME, env!("CARGO_PKG_VERSION"))
         .await
         .map_err(|e| anyhow::anyhow!("starting the {SERVICE_NAME} service: {e}"))?;
-    let mut endpoint = service
+    let endpoint = service
         .group(prefix.child("events"))
         .endpoint("catch-up")
         .await
         .map_err(|e| anyhow::anyhow!("registering catch-up: {e}"))?;
+    client.flush().await?;
     tracing::info!(subject = %prefix.child("events.catch-up"), "service ready");
+    Ok(Registered {
+        _service: service,
+        endpoint,
+    })
+}
+
+/// Serve until the endpoint closes.
+pub async fn serve(registered: Registered, publisher: Arc<Publisher>) -> anyhow::Result<()> {
+    let Registered {
+        _service,
+        mut endpoint,
+    } = registered;
     while let Some(request) = endpoint.next().await {
         let publisher = publisher.clone();
         tokio::spawn(async move {
