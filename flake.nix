@@ -88,6 +88,7 @@
           strictDeps = true;
           nativeBuildInputs = with pkgs; [ protobuf pkg-config cmake perl python3 ];
           doCheck = false;
+          CARGO_PROFILE = "dist";
         };
         walgitArgs = commonArgs // {
           pname = "walgit";

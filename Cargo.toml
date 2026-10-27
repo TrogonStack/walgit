@@ -123,8 +123,8 @@ gix-validate = "0.11"
 google-cloud-storage = "1"
 google-cloud-gax = "1"
 google-cloud-auth = "1"
-aws-config = { version = "1", features = ["behavior-version-latest"] }
-aws-sdk-s3 = "1"
+aws-config = { version = "1", default-features = false, features = ["behavior-version-latest", "default-https-client", "rt-tokio", "credentials-process", "sso"] }
+aws-sdk-s3 = { version = "1", default-features = false, features = ["sigv4a", "http-1x", "default-https-client", "rt-tokio"] }
 aws-smithy-types = "1"
 clap = { version = "4", features = ["derive", "env"] }
 rand = "0.9"
@@ -169,6 +169,15 @@ debug = 1
 # unwind: a panic in one request task must not take down an instance serving
 # many concurrent git operations (tokio isolates task panics; CatchPanicLayer -> 500).
 panic = "unwind"
+
+# What ships (Containerfile, flake): whole-program LTO, one codegen unit, no
+# debuginfo or symbols. Much slower to build, so `release` stays the local profile.
+[profile.dist]
+inherits = "release"
+lto = "fat"
+codegen-units = 1
+debug = false
+strip = true
 
 [profile.dev]
 # Full debuginfo on this graph (gix, aws-sdk, prost, axum, …) makes every
