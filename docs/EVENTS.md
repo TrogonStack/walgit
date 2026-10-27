@@ -115,11 +115,11 @@ webhook_secret = "…"          # env: WALGIT__EVENTS__WEBHOOK_SECRET
 sweep_interval = "5m"
 ```
 
-## Delivery: NATS JetStream (`walgit-nats`)
+## Delivery: NATS JetStream (`walgit nats`)
 
-`walgit-nats` is a second sink for the same `ref` events, a separate binary
-(`walgit-nats --config walgit.toml`, `[events.nats]`) that depends on `walgit-events` (the shared event
-model) and never on `walgit-server`. The webhook bridge is unchanged and the two can run side by side.
+`walgit nats` is a second sink for the same `ref` events, a subcommand of the normal CLI
+(`walgit nats --config walgit.toml`, `[events.nats]`) built on the `walgit-nats` crate, which depends on
+`walgit-events` (the shared event model) and never on `walgit-server`. The webhook bridge is unchanged and the two can run side by side.
 Like the bridge it is a reader of the WAL, never a step of a push (D32).
 
 - **The stream is the cursor (D50).** For each repository the publisher reads the last message on the
@@ -140,7 +140,7 @@ Like the bridge it is a reader of the WAL, never a step of a push (D32).
   shapes as `POST /_events/notify` (S3 event JSON, a GCS envelope, `{"key": ...}`, `{"repo": ...}`), and
   `events.sweep_interval` is the backstop with the same warning when it finds unpublished entries.
   Gap detection matches the bridge: a log gap is logged and the entries that are readable are published.
-- **Service API.** The binary registers a NATS micro service `walgit-events` (`$SRV.PING|INFO|STATS`, built in)
+- **Service API.** `walgit nats` registers a NATS micro service `walgit-events` (`$SRV.PING|INFO|STATS`, built in)
   with one endpoint, `<subject_prefix>.events.catch-up`. Request `{"repo": "o/r"}`, reply the catch-up report
   (`repo`, `from_seq`, `head_seq`, `emitted`, `conflict`); an unknown repository is a 404 service error.
   Gap, conflict and sweep counters are in the stats response. There is no HTTP listener.
