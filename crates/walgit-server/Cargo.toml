@@ -66,6 +66,8 @@ rcgen.workspace = true
 tokio-rustls.workspace = true
 tempfile.workspace = true
 [dev-dependencies]
+async-nats.workspace = true
+walgit-nats = { workspace = true, features = ["testing"] }
 reqwest.workspace = true
 rcgen = { workspace = true, features = ["x509-parser"] }
 

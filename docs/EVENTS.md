@@ -146,6 +146,43 @@ Like the bridge it is a reader of the WAL, never a step of a push (D32).
   Gap, conflict and sweep counters are in the stats response. There is no HTTP listener.
 - **Losing the stream.** Wiping the stream republishes the WAL window on the next wake-up; history older than
   the oldest readable entry is not in the WAL and is backfilled with `walgit wal ls`. Wiping walgit loses nothing.
+  Deleting and recreating the stream republishes at once. A *purge* does not: JetStream keeps its duplicate
+  table across a purge, so inside `duplicate_window` the republished events are acknowledged as duplicates and
+  land nothing; the publisher leaves the repository open and the window's expiry heals it on a later wake-up.
+  Prefer delete and recreate, or wait out the window.
+- **`start = "head"` and restarts.** The first-seen head of a repository without a message is remembered in
+  memory only. Pushes made while the publisher is down, before the repository's first event, are skipped for good
+  after a restart (pinned by a test).
+- **A foreign message** (no `Walgit-Seq` / `Nats-Msg-Id`) as the last message on a repository's subject makes every
+  catch-up for that repository fail, naming the subject and stream sequence, until it is removed.
+- **Cost.** Every wake-up for a repository reads the last message on its subject (one JetStream request) before
+  deciding there is nothing to do, so a wiped stream is noticed without a restart.
+
+Each behaviour above has a test against a real `nats-server -js` (`crates/walgit-nats/tests/jetstream.rs`, and
+`crates/walgit-server/tests/events_nats.rs` with real git pushes); `tests/e2e.sh` runs `walgit nats` as a process.
+
+| Behaviour | Test |
+|---|---|
+| Push becomes one message per ref with the bridge's event shape | `pushes_become_events_with_the_right_shape`, `an_atomic_multi_ref_push_is_one_message_per_ref_in_order` |
+| The webhook bridge and `walgit nats` emit the same events | `the_webhook_bridge_and_the_jetstream_publisher_agree` |
+| Names are encoded in the subject | `a_dotted_repository_name_is_encoded_in_the_subject` |
+| The stream is the cursor; a restart resumes from it | `stream_is_the_cursor`, `a_restarted_publisher_resumes_from_the_stream` |
+| A crash mid-entry finishes that entry only | `a_crash_mid_entry_finishes_that_entry_only` |
+| A NATS outage mid catch-up loses and duplicates nothing | `an_outage_mid_catch_up_loses_and_duplicates_nothing` |
+| Broker dedup inside `duplicate_window`; none after it | `broker_dedup_absorbs_a_republish_inside_the_window`, `after_the_dedup_window_a_republish_lands_twice` |
+| Concurrent publishers leave each event once | `a_second_publisher_that_moved_first_stops_this_one`, `racing_publishers_leave_each_event_exactly_once` |
+| Losing the stream republishes the WAL window | `a_wiped_stream_is_republished_on_the_next_catch_up`, `a_purged_stream_heals_once_the_dedup_window_has_passed` |
+| A log gap is counted, readable entries still published | `entries_folded_before_publishing_are_a_counted_gap` |
+| Bucket notifications wake it; junk is ignored | `bucket_notifications_wake_the_publisher_without_a_catch_up_call`, `notifications_that_name_nothing_are_ignored_and_the_loop_survives` |
+| The sweep finds what nobody notified | `the_periodic_sweep_finds_a_push_nobody_notified` |
+| Service API: catch-up, errors, stats | `notifications_and_the_service_api_wake_the_publisher`, `the_catch_up_endpoint_reports_a_real_repository`, `the_service_answers_bad_requests_and_reports_the_counters` |
+| A NATS server restart keeps stream, subscriptions and service | `a_nats_server_restart_keeps_the_stream_the_subscriptions_and_the_service` |
+| `start = "head"` | `head_start_publishes_nothing_older`, `known_limitation_head_start_skips_pushes_made_while_the_publisher_was_down` |
+| A foreign message wedges the repository with a clear error | `a_foreign_message_on_a_repo_subject_fails_every_catch_up_with_a_clear_error` |
+| SIGTERM exits 0 | `tests/e2e.sh` phase 3 |
+
+Not covered: Prometheus metrics (the service stats are the only counters), multi-node JetStream clusters, and
+the Containerfile / flake packaging.
 
 ```toml
 [events]

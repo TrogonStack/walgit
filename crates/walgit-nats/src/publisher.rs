@@ -26,7 +26,7 @@ use walgit_config::NatsStart;
 use walgit_events::refs_from_entries;
 use walgit_git::RepoId;
 
-use crate::message::{EventMessage, LastPublished, after_last_published};
+use crate::message::{EventMessage, LastPublished, MsgId, after_last_published};
 use crate::subject::{RepoSubject, SubjectPrefix};
 
 /// What one `catch_up` did.
@@ -76,9 +76,10 @@ pub struct Publisher {
     prefix: SubjectPrefix,
     start: NatsStart,
     serial: tokio::sync::Mutex<()>,
-    /// Head each repository was fully published up to by this process: spares the log read when a
-    /// wake-up finds nothing new. Never a source of truth (the stream is).
-    done: std::sync::Mutex<HashMap<RepoId, u64>>,
+    /// Where each repository was fully published up to by this process: the head and the stream's
+    /// last message for its subject. A wake-up that finds both unchanged spares the log read. The
+    /// stream half is what notices a purged or recreated stream. Never a source of truth.
+    done: std::sync::Mutex<HashMap<RepoId, (u64, Option<LastPublished>)>>,
     /// `start = "head"`: the head a cold repository was first seen at.
     cold_marks: std::sync::Mutex<HashMap<RepoId, u64>>,
     pub counters: Counters,
@@ -155,12 +156,16 @@ impl Publisher {
             head_seq: head,
             ..CatchUp::default()
         };
-        if locked(&self.done).get(id).is_some_and(|d| *d >= head) {
-            return Ok(report);
-        }
 
+        // One cheap request on every wake-up: the stream, not this process, says what is published.
         let subject = RepoSubject::new(&self.prefix, id);
         let last = self.last_published(&subject).await?;
+        if locked(&self.done)
+            .get(id)
+            .is_some_and(|(done_head, done_last)| *done_head >= head && *done_last == last)
+        {
+            return Ok(report);
+        }
 
         // First seq to read; `resume` is the entry the stream may hold only part of.
         let (first, resume) = match &last {
@@ -189,6 +194,7 @@ impl Publisher {
         };
         report.from_seq = resume.map_or(first.saturating_sub(1), |l| l.id.seq());
 
+        let mut last_sent: Option<MsgId> = None;
         if first <= head {
             let entries = handle.read_log(&manifest, first, Some(head)).await?;
             let mut events = Vec::new();
@@ -196,8 +202,10 @@ impl Publisher {
             if let Some(l) = resume {
                 events = after_last_published(events, l);
             }
-            let mut expected = resume.map_or(0, |l| l.stream_seq);
+            // Whatever is on the subject now (a gap leaves older messages there too).
+            let mut expected = last.as_ref().map_or(0, |l| l.stream_seq);
             for (i, event) in events.iter().enumerate() {
+                last_sent = MsgId::of(event);
                 let mut msg = EventMessage::new(subject.clone(), event)?;
                 if i == 0 {
                     msg = msg.expecting_last_subject_sequence(expected);
@@ -234,7 +242,20 @@ impl Publisher {
             }
         }
 
-        locked(&self.done).insert(id.clone(), head);
+        // Done only when the stream confirms its last message is the one just sent: a broker
+        // that swallowed it as a duplicate of a purged message (the dedup table outlives a purge)
+        // leaves the repository open, and the retry lands once the dedup window has passed.
+        let settled = if report.emitted > 0 {
+            self.last_published(&subject).await?
+        } else {
+            last
+        };
+        let confirmed = last_sent
+            .as_ref()
+            .is_none_or(|sent| settled.as_ref().is_some_and(|s| s.id == *sent));
+        if confirmed {
+            locked(&self.done).insert(id.clone(), (head, settled));
+        }
         if report.emitted > 0 {
             tracing::info!(repo = %id, from = report.from_seq, head, emitted = report.emitted, "published");
         }

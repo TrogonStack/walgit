@@ -6,6 +6,8 @@ pub mod message;
 pub mod publisher;
 pub mod service;
 pub mod subject;
+#[cfg(feature = "testing")]
+pub mod testing;
 pub mod wake;
 
 use std::str::FromStr;
