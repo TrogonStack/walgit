@@ -1173,3 +1173,61 @@ async fn many_sequential_pushes_land_in_seq_order_across_catch_ups() {
     publisher.catch_up(&id).await.unwrap();
     assert_eq!(rig.ids().await, expected);
 }
+
+async fn published_then_recreated(rig: &Rig, publisher: &Publisher) -> RepoId {
+    let id = RepoId::new("t", "r").unwrap();
+    rig.registry.create(&id, ObjectFormat::Sha1).await.unwrap();
+    let mut prev = ZERO.to_string();
+    for i in 1..=3usize {
+        let next = format!("{i:040x}");
+        rig.push(&id, &[("refs/heads/main", &prev, &next)]).await;
+        prev = next;
+    }
+    assert_eq!(publisher.catch_up(&id).await.unwrap().emitted, 3);
+    rig.registry.delete(&id).await.unwrap();
+    rig.registry.create(&id, ObjectFormat::Sha1).await.unwrap();
+    id
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_recreated_repository_is_published_as_a_new_one() {
+    let Some(nats) = start_nats().await else { return };
+    let rig = Rig::new(&nats, NatsStart::Oldest).await;
+    let publisher = rig.publisher(NatsStart::Oldest).await;
+    let id = published_then_recreated(&rig, &publisher).await;
+    let seq = rig.push(&id, &[("refs/heads/fresh", ZERO, A)]).await;
+    assert_eq!(seq, 1, "the new incarnation starts again at seq 1");
+
+    let r = publisher.catch_up(&id).await.unwrap();
+    assert_eq!((r.head_seq, r.emitted, r.conflict), (1, 1, false), "{r:?}");
+    assert_eq!(publisher.counters.snapshot()["rewinds"], 1);
+    let ids = rig.ids().await;
+    assert_eq!(ids.len(), 4);
+    assert_eq!(ids.last().unwrap(), &msg_id(&id, 1, "refs/heads/fresh"));
+    let again = publisher.catch_up(&id).await.unwrap();
+    assert_eq!(again.emitted, 0, "steady afterwards, not rewound again");
+    assert_eq!(publisher.counters.snapshot()["rewinds"], 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_recreated_repository_colliding_with_the_old_ids_heals_after_the_dedup_window() {
+    // PINNED: the new incarnation's first event has the old incarnation's Nats-Msg-Id
+    // (`t/r:1:refs/heads/main`), so inside the window the broker swallows it, the catch-up is not
+    // confirmed and the repository stays open until the window has passed.
+    let Some(nats) = start_nats().await else { return };
+    let rig = Rig::with_window(&nats, NatsStart::Oldest, Some(Duration::from_secs(2))).await;
+    let publisher = rig.publisher(NatsStart::Oldest).await;
+    let id = published_then_recreated(&rig, &publisher).await;
+    rig.push(&id, &[("refs/heads/main", ZERO, A)]).await;
+
+    let r = publisher.catch_up(&id).await.unwrap();
+    assert_eq!((r.emitted, r.conflict), (1, false));
+    assert_eq!(publisher.counters.snapshot()["deduplicated"], 1);
+    assert_eq!(rig.message_count().await, 3, "swallowed as a duplicate of the old one");
+
+    tokio::time::sleep(Duration::from_secs(4)).await;
+    let r = publisher.catch_up(&id).await.unwrap();
+    assert_eq!((r.emitted, r.conflict), (1, false), "{r:?}");
+    assert_eq!(rig.message_count().await, 4, "it landed once the window had passed");
+    assert_eq!(publisher.catch_up(&id).await.unwrap().emitted, 0);
+}

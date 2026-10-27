@@ -53,6 +53,7 @@ pub struct Counters {
     pub deduplicated: AtomicU64,
     pub gap_entries: AtomicU64,
     pub conflicts: AtomicU64,
+    pub rewinds: AtomicU64,
     pub sweep_found: AtomicU64,
 }
 
@@ -64,6 +65,7 @@ impl Counters {
             "deduplicated": n(&self.deduplicated),
             "gap_entries": n(&self.gap_entries),
             "conflicts": n(&self.conflicts),
+            "rewinds": n(&self.rewinds),
             "sweep_found": n(&self.sweep_found),
         })
     }
@@ -162,13 +164,25 @@ impl Publisher {
         let last = self.last_published(&subject).await?;
         if locked(&self.done)
             .get(id)
-            .is_some_and(|(done_head, done_last)| *done_head >= head && *done_last == last)
+            .is_some_and(|(done_head, done_last)| *done_head == head && *done_last == last)
         {
             return Ok(report);
         }
 
+        // The stream is ahead of the WAL: the repository was deleted and created again (or the log
+        // rewound). What is on the subject belongs to the old incarnation, so it names no cursor;
+        // its stream sequence still guards the first publish.
+        let rewound = last.as_ref().is_some_and(|l| l.id.seq() > head);
+        if rewound {
+            self.counters.rewinds.fetch_add(1, Ordering::Relaxed);
+            locked(&self.cold_marks).remove(id);
+            tracing::warn!(repo = %id, published = last.as_ref().map_or(0, |l| l.id.seq()), head,
+                "the stream is ahead of the WAL: the repository was recreated; publishing it as a new one");
+        }
+        let basis = if rewound { None } else { last.as_ref() };
+
         // First seq to read; `resume` is the entry the stream may hold only part of.
-        let (first, resume) = match &last {
+        let (first, resume) = match basis {
             Some(l) if l.id.seq() >= lowest => (l.id.seq(), Some(l)),
             Some(l) => {
                 // The newest published entry is already folded away: what follows it up to the

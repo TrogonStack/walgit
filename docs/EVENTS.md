@@ -155,6 +155,18 @@ Like the bridge it is a reader of the WAL, never a step of a push (D32).
   after a restart (pinned by a test).
 - **A foreign message** (no `Walgit-Seq` / `Nats-Msg-Id`) as the last message on a repository's subject makes every
   catch-up for that repository fail, naming the subject and stream sequence, until it is removed.
+- **Deleting and recreating a repository.** The manifest has no incarnation id, so the only signal is the stream
+  being ahead of the WAL: when the last message on a subject names a seq above the repository's `head_seq`, the
+  publisher warns, counts it (`rewinds` in the service stats), ignores that message as a cursor (the first seq
+  follows `events.nats.start`) and still guards the first publish with the subject's real last stream sequence, so
+  it does not conflict. The new incarnation's `Nats-Msg-Id` (`<repo>:<seq>:<ref>`) can equal the old one's: inside
+  `duplicate_window` the broker swallows it, the catch-up is not confirmed, the repository stays open and the
+  event lands on the first wake-up after the window (pinned by a test). Limitation: a recreated repository whose
+  head has already reached the old last seq before the publisher wakes is indistinguishable from the old one, and
+  its events up to that seq are never published. Consumers should treat a delete and recreate as a new stream.
+  The webhook bridge has the same ambiguity from the other side: its cursor lives under the repository's prefix and
+  is deleted with it, so the new incarnation is published from seq 1 and the dedup key `(repo, seq, ref_name)`
+  collides with the old incarnation's events.
 - **Config adaptation.** `walgit nats` always revalidates the manifest (`wal.freshness_ttl` is forced to zero) and
   never prefetches packs (`wal.prefetch_packs` is forced off), whatever `[wal]` says, because it never applies a
   push itself and only reads manifest and log (`walgit_nats::publisher_config`).
@@ -189,6 +201,7 @@ Each behaviour above has a test against a real `nats-server -js` (`crates/walgit
 | A bad server URL fails to connect naming the setting | `an_unparsable_server_url_fails_to_connect_naming_the_setting` |
 | Tags, deletes and non-branch refs carry `ref_type` and zero OIDs | `tags_and_deletes_carry_their_ref_type_and_zero_oids` |
 | Many pushes land in seq order across catch-ups | `many_sequential_pushes_land_in_seq_order_across_catch_ups` |
+| A deleted and recreated repository is detected and published as new; an id collision heals after the dedup window | `a_recreated_repository_is_published_as_a_new_one`, `a_recreated_repository_colliding_with_the_old_ids_heals_after_the_dedup_window` |
 | SIGTERM exits 0 | `tests/e2e.sh` phase 3 |
 
 Not covered: Prometheus metrics (the service stats are the only counters), multi-node JetStream clusters, and
