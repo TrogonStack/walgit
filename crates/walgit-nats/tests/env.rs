@@ -235,6 +235,7 @@ fn tls_files(dir: &std::path::Path) -> (String, String, String) {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_ca_requires_tls_as_in_the_nats_cli() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
     let dir = tempfile::tempdir().unwrap();
     let (ca, cert, key) = tls_files(dir.path());
     let Some(plain) = start_nats_with(&[]).await else {

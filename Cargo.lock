@@ -6007,6 +6007,7 @@ dependencies = [
  "nkeys",
  "percent-encoding",
  "rcgen",
+ "rustls 0.23.45",
  "serde_json",
  "tempfile",
  "thiserror",

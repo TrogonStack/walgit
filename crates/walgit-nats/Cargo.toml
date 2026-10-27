@@ -27,6 +27,7 @@ testing = ["dep:tempfile"]
 walgit-nats = { path = ".", features = ["testing"] }
 tempfile.workspace = true
 rcgen.workspace = true
+rustls.workspace = true
 
 [lints]
 workspace = true
