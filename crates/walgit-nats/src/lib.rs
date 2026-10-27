@@ -1,15 +1,20 @@
-//! `walgit nats`: the WAL's `ref` events (`docs/EVENTS.md`) published into NATS `JetStream`.
+//! `walgit nats`: the WAL's `ref` events (`docs/EVENTS.md`) published into NATS `JetStream`,
+//! with the cursor in the stream.
+//! The event model is shared with the webhook bridge through `walgit-events`.
 
 pub mod env;
 pub mod message;
+pub mod publisher;
 pub mod subject;
 #[cfg(feature = "testing")]
 pub mod testing;
 
 use anyhow::Context;
-use walgit_config::NatsEventsConfig;
+use async_nats::jetstream::{self, stream};
+use walgit_config::{Config, NatsEventsConfig};
 
 use crate::env::{NatsEnv, Servers};
+use crate::subject::SubjectPrefix;
 
 /// Connect to `NATS_URL`, or `[events.nats] urls` when it is unset, as `env` says. Only the
 /// methods and the URLs without their credentials are logged, never a secret.
@@ -28,4 +33,39 @@ pub async fn connect(cfg: &NatsEventsConfig, env: &NatsEnv) -> anyhow::Result<as
         .connect(servers.addrs)
         .await
         .with_context(|| format!("connecting to NATS (auth: {auth})"))
+}
+
+/// The stream holding the events: created when missing (file storage, `<prefix>.ref.>`,
+/// `duplicate_window`) if `ensure_stream`, otherwise it must exist.
+pub async fn open_stream(
+    js: &jetstream::Context,
+    cfg: &NatsEventsConfig,
+    prefix: &SubjectPrefix,
+) -> anyhow::Result<stream::Stream> {
+    if cfg.ensure_stream {
+        js.get_or_create_stream(stream::Config {
+            name: cfg.stream.clone(),
+            subjects: vec![prefix.stream_filter()],
+            storage: stream::StorageType::File,
+            duplicate_window: cfg.duplicate_window,
+            ..stream::Config::default()
+        })
+        .await
+        .with_context(|| format!("ensuring stream {}", cfg.stream))
+    } else {
+        js.get_stream(&cfg.stream)
+            .await
+            .with_context(|| format!("stream {} (events.nats.ensure_stream is off)", cfg.stream))
+    }
+}
+
+/// The config the publisher's registry runs on. This process never applies a push itself, so a
+/// wake-up must always see the manifest as it is in the bucket (`freshness_ttl` would let it
+/// skip the GET and miss the push it was woken for), and it only reads manifest and log, so
+/// pack prefetch would pull bytes nobody reads. Both hold whatever `[wal]` says.
+pub fn publisher_config(cfg: &Config) -> Config {
+    let mut cfg = cfg.clone();
+    cfg.wal.freshness_ttl = std::time::Duration::ZERO;
+    cfg.wal.prefetch_packs = false;
+    cfg
 }

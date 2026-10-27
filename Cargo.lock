@@ -6008,6 +6008,7 @@ dependencies = [
  "percent-encoding",
  "rcgen",
  "rustls 0.23.45",
+ "serde",
  "serde_json",
  "tempfile",
  "thiserror",
@@ -6017,6 +6018,9 @@ dependencies = [
  "walgit-events",
  "walgit-git",
  "walgit-nats",
+ "walgit-proto",
+ "walgit-store",
+ "walgit-wal",
 ]
 
 [[package]]

@@ -7,7 +7,9 @@ license.workspace = true
 [dependencies]
 walgit-events.workspace = true
 walgit-config.workspace = true
+walgit-store.workspace = true
 walgit-git.workspace = true
+walgit-wal.workspace = true
 async-nats.workspace = true
 nkeys.workspace = true
 percent-encoding.workspace = true
@@ -16,6 +18,7 @@ thiserror.workspace = true
 bytes.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+serde.workspace = true
 serde_json.workspace = true
 tempfile = { workspace = true, optional = true }
 
@@ -25,6 +28,7 @@ testing = ["dep:tempfile"]
 
 [dev-dependencies]
 walgit-nats = { path = ".", features = ["testing"] }
+walgit-proto.workspace = true
 tempfile.workspace = true
 rcgen.workspace = true
 rustls.workspace = true
