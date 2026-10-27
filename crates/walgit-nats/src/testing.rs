@@ -7,16 +7,18 @@ use std::time::{Duration, Instant};
 pub struct NatsServer {
     child: Child,
     port: u16,
+    args: Vec<String>,
     pub url: String,
     store: tempfile::TempDir,
 }
 
 impl NatsServer {
-    fn spawn(port: u16, store: &std::path::Path) -> Child {
+    fn spawn(port: u16, store: &std::path::Path, args: &[String]) -> Child {
         #[allow(clippy::expect_used)]
         Command::new("nats-server")
             .args(["-js", "-a", "127.0.0.1", "-p", &port.to_string(), "-sd"])
             .arg(store)
+            .args(args)
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
@@ -35,14 +37,17 @@ impl NatsServer {
     /// When the server does not accept connections within 15 s.
     pub async fn restart(&mut self) {
         self.stop();
-        self.child = Self::spawn(self.port, self.store.path());
-        wait_ready(&self.url).await;
+        self.child = Self::spawn(self.port, self.store.path(), &self.args);
+        wait_ready(self.port).await;
     }
 }
 
-async fn wait_ready(url: &str) {
+async fn wait_ready(port: u16) {
     let t0 = Instant::now();
-    while async_nats::connect(url).await.is_err() {
+    while tokio::net::TcpStream::connect(("127.0.0.1", port))
+        .await
+        .is_err()
+    {
         assert!(
             t0.elapsed() < Duration::from_secs(15),
             "nats-server did not start"
@@ -65,6 +70,15 @@ impl Drop for NatsServer {
 /// When the server cannot be spawned or does not accept connections within 15 s.
 #[allow(clippy::expect_used)]
 pub async fn start_nats() -> Option<NatsServer> {
+    start_nats_with(&[]).await
+}
+
+/// [`start_nats`] with extra `nats-server` arguments (`--auth`, `--user`/`--pass`, ...).
+///
+/// # Panics
+/// When the server cannot be spawned or does not accept connections within 15 s.
+#[allow(clippy::expect_used)]
+pub async fn start_nats_with(args: &[&str]) -> Option<NatsServer> {
     if !Command::new("nats-server")
         .arg("--version")
         .stdout(Stdio::null())
@@ -81,13 +95,15 @@ pub async fn start_nats() -> Option<NatsServer> {
         .expect("local addr")
         .port();
     let store = tempfile::tempdir().expect("tempdir");
-    let child = NatsServer::spawn(port, store.path());
+    let args: Vec<String> = args.iter().map(|a| (*a).to_owned()).collect();
+    let child = NatsServer::spawn(port, store.path(), &args);
     let server = NatsServer {
         child,
         port,
+        args,
         url: format!("nats://127.0.0.1:{port}"),
         store,
     };
-    wait_ready(&server.url).await;
+    wait_ready(port).await;
     Some(server)
 }

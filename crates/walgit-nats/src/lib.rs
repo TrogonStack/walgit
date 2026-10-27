@@ -2,6 +2,7 @@
 //! the cursor in the stream, wake-ups over NATS and a `$SRV` service API instead of HTTP.
 //! The event model is shared with the webhook bridge through `walgit-events`.
 
+pub mod auth;
 pub mod message;
 pub mod publisher;
 pub mod service;
@@ -17,24 +18,24 @@ use anyhow::Context;
 use async_nats::jetstream::{self, stream};
 use walgit_config::{Config, NatsEventsConfig};
 
+use crate::auth::NatsAuth;
 use crate::publisher::Publisher;
 use crate::subject::SubjectPrefix;
 
-/// Connect as `[events.nats]` says. The credentials path is read, never logged.
-pub async fn connect(cfg: &NatsEventsConfig) -> anyhow::Result<async_nats::Client> {
+/// Connect to `[events.nats] urls` with `auth`. Only the method is logged, never the secret.
+pub async fn connect(cfg: &NatsEventsConfig, auth: &NatsAuth) -> anyhow::Result<async_nats::Client> {
     let addrs = cfg
         .urls
         .iter()
         .map(|u| async_nats::ServerAddr::from_str(u).with_context(|| format!("events.nats.urls: {u}")))
         .collect::<anyhow::Result<Vec<_>>>()?;
-    let mut options = async_nats::ConnectOptions::new().name("walgit");
-    if let Some(path) = &cfg.credentials_file {
-        options = options
-            .credentials_file(path)
-            .await
-            .context("events.nats.credentials_file")?;
-    }
-    options.connect(addrs).await.context("connecting to NATS")
+    tracing::info!(urls = ?cfg.urls, auth = auth.description(), "connecting to NATS");
+    auth.connect_options()
+        .await?
+        .name("walgit")
+        .connect(addrs)
+        .await
+        .with_context(|| format!("connecting to NATS (auth: {})", auth.description()))
 }
 
 /// The stream holding the events: created when missing (file storage, `<prefix>.ref.>`,
@@ -97,7 +98,7 @@ pub async fn run(cfg: Arc<Config>) -> anyhow::Result<()> {
     let store = walgit_store::open_store(&cfg).await?;
     let registry = walgit_wal::Registry::new(store, Arc::new(publisher_config(&cfg)));
 
-    let client = crate::connect(nats).await?;
+    let client = crate::connect(nats, &NatsAuth::from_process_env()).await?;
     let js = async_nats::jetstream::new(client.clone());
     let stream = crate::open_stream(&js, nats, &prefix).await?;
     let publisher = Publisher::new(registry, js, stream, prefix.clone(), nats.start);

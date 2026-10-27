@@ -52,7 +52,7 @@ impl Rig {
             urls: vec![nats.url.clone()],
             ..NatsEventsConfig::default()
         };
-        let client = walgit_nats::connect(&nats_cfg).await?;
+        let client = walgit_nats::connect(&nats_cfg, &walgit_nats::auth::NatsAuth::None).await?;
         let js = jetstream::new(client.clone());
         let prefix = SubjectPrefix::new(&nats_cfg.subject_prefix)?;
         Ok(Rig {

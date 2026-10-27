@@ -671,8 +671,6 @@ pub enum NatsStart {
 pub struct NatsEventsConfig {
     /// Server URLs (`nats://host:4222`); the client connects to the first reachable one.
     pub urls: Vec<String>,
-    /// A `.creds` or `NKey` seed file. Never logged.
-    pub credentials_file: Option<std::path::PathBuf>,
     /// The `JetStream` stream holding the events (subjects `<subject_prefix>.ref.>`).
     pub stream: String,
     /// Create the stream when missing (file storage, `duplicate_window`). An existing stream is used as is.
@@ -693,7 +691,6 @@ impl Default for NatsEventsConfig {
     fn default() -> Self {
         NatsEventsConfig {
             urls: vec!["nats://127.0.0.1:4222".into()],
-            credentials_file: None,
             stream: "WALGIT_EVENTS".into(),
             ensure_stream: true,
             duplicate_window: Duration::from_hours(1),
