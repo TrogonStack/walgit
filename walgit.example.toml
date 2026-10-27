@@ -205,8 +205,10 @@ lock_wait_warn = "1s"             # WARN "lock wait" (lock, repo, wait_ms, reque
 
 [events.nats]                     # docs/EVENTS.md: read only by `walgit nats --config walgit.toml`
 # urls = ["nats://127.0.0.1:4222"]       # the client connects to the first reachable server
-#   auth comes from the environment, first non-empty match wins: NATS_CREDS (.creds file), NATS_NKEY (seed),
-#   NATS_USER + NATS_PASSWORD, NATS_TOKEN; none set = no auth; secrets are never logged
+#   the connection reads the `nats` CLI's variables the way it does (empty = unset): NATS_URL replaces urls;
+#   identity is the first of NATS_USER + NATS_PASSWORD, NATS_CREDS (file), NATS_NKEY (seed file),
+#   NATS_JWT + NATS_SEED, NATS_JWT; NATS_TOKEN (or NATS_USER without a password) is sent with it;
+#   NATS_CERT + NATS_KEY, NATS_CA for TLS; NATS_CONTEXT and NATS_SOCKS_PROXY are refused; secrets are never logged
 # stream = "WALGIT_EVENTS"        # the JetStream stream holding the events (subjects "<subject_prefix>.ref.>"); it is the resume cursor
 # ensure_stream = true            # create the stream when missing (file storage); an existing stream is used as is
 # duplicate_window = "1h"         # dedup window (Nats-Msg-Id) of a stream `walgit nats` creates

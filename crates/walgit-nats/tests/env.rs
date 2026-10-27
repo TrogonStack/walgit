@@ -1,10 +1,10 @@
-//! `walgit nats` authenticates with whatever the `NATS_*` variables resolve to, against a real
+//! `walgit nats` connects with whatever the `NATS_*` variables resolve to, against a real
 //! `nats-server` that requires it.
 
 use std::time::Duration;
 
 use walgit_config::NatsEventsConfig;
-use walgit_nats::auth::NatsAuth;
+use walgit_nats::env::NatsEnv;
 use walgit_nats::testing::{NatsServer, start_nats_with};
 
 fn cfg(nats: &NatsServer) -> NatsEventsConfig {
@@ -14,15 +14,17 @@ fn cfg(nats: &NatsServer) -> NatsEventsConfig {
     }
 }
 
-fn env(vars: &[(&str, &str)]) -> NatsAuth {
+#[allow(clippy::expect_used)]
+fn env(vars: &[(&str, &str)]) -> NatsEnv {
     let vars: Vec<(String, String)> = vars
         .iter()
         .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
         .collect();
-    NatsAuth::from_env(|name| vars.iter().find(|(k, _)| k == name).map(|(_, v)| v.clone()))
+    NatsEnv::from_env(|name| vars.iter().find(|(k, _)| k == name).map(|(_, v)| v.clone()))
+        .expect("the variables resolve")
 }
 
-async fn connects(nats: &NatsServer, auth: &NatsAuth) -> bool {
+async fn connects(nats: &NatsServer, auth: &NatsEnv) -> bool {
     let attempt = tokio::time::timeout(Duration::from_secs(5), async {
         let client = walgit_nats::connect(&cfg(nats), auth).await?;
         client.flush().await?;
@@ -60,14 +62,38 @@ async fn a_user_and_password_from_the_environment_authenticate() {
         )
         .await
     );
-    assert!(
-        !connects(&nats, &env(&[("NATS_USER", "walgit")])).await,
-        "a user alone is no auth"
-    );
+    assert!(!connects(&nats, &env(&[("NATS_USER", "walgit")])).await);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn an_nkey_seed_from_the_environment_authenticates() {
+async fn a_user_without_a_password_is_a_token_as_in_the_nats_cli() {
+    let Some(nats) = start_nats_with(&["--auth", "s3cret-token"]).await else {
+        return;
+    };
+    assert!(connects(&nats, &env(&[("NATS_USER", "s3cret-token")])).await);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn nats_url_wins_over_the_configured_servers() {
+    let Some(nats) = start_nats_with(&[]).await else {
+        return;
+    };
+    let unreachable = NatsEventsConfig {
+        urls: vec!["nats://127.0.0.1:1".into()],
+        ..NatsEventsConfig::default()
+    };
+    let client = tokio::time::timeout(
+        Duration::from_secs(5),
+        walgit_nats::connect(&unreachable, &env(&[("NATS_URL", &nats.url)])),
+    )
+    .await
+    .expect("connects without trying the configured server")
+    .unwrap();
+    client.flush().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_nkey_seed_file_from_the_environment_authenticates() {
     let user = nkeys::KeyPair::new_user();
     let other = nkeys::KeyPair::new_user();
     let dir = tempfile::tempdir().unwrap();
@@ -83,8 +109,18 @@ async fn an_nkey_seed_from_the_environment_authenticates() {
     let Some(nats) = start_nats_with(&["-c", conf.to_str().unwrap()]).await else {
         return;
     };
-    assert!(connects(&nats, &env(&[("NATS_NKEY", &user.seed().unwrap())])).await);
-    assert!(!connects(&nats, &env(&[("NATS_NKEY", &other.seed().unwrap())])).await);
+    let seed_file = |name: &str, key: &nkeys::KeyPair| {
+        let path = dir.path().join(name);
+        std::fs::write(&path, format!("{}\n", key.seed().unwrap())).unwrap();
+        path.to_str().unwrap().to_owned()
+    };
+    let (user_file, other_file) = (seed_file("user.nk", &user), seed_file("other.nk", &other));
+    assert!(connects(&nats, &env(&[("NATS_NKEY", &user_file)])).await);
+    assert!(!connects(&nats, &env(&[("NATS_NKEY", &other_file)])).await);
+    assert!(
+        !connects(&nats, &env(&[("NATS_NKEY", &user.seed().unwrap())])).await,
+        "NATS_NKEY is a seed file, never the seed itself"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -96,7 +132,10 @@ async fn the_credentials_file_wins_and_a_missing_one_fails_naming_the_variable()
         ("NATS_CREDS", "/nonexistent/walgit.creds"),
         ("NATS_TOKEN", "s3cret-token"),
     ]);
-    assert!(matches!(auth, NatsAuth::Credentials(_)));
+    assert!(matches!(
+        auth.identity,
+        Some(walgit_nats::env::Identity::Credentials(_))
+    ));
     let err = walgit_nats::connect(&cfg(&nats), &auth).await.unwrap_err();
     let msg = format!("{err:#}");
     assert!(

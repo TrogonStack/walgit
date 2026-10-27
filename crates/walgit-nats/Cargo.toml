@@ -9,6 +9,7 @@ walgit-events.workspace = true
 walgit-config.workspace = true
 walgit-git.workspace = true
 async-nats.workspace = true
+nkeys.workspace = true
 anyhow.workspace = true
 thiserror.workspace = true
 bytes.workspace = true
@@ -23,7 +24,6 @@ testing = ["dep:tempfile"]
 
 [dev-dependencies]
 walgit-nats = { path = ".", features = ["testing"] }
-nkeys.workspace = true
 tempfile.workspace = true
 
 [lints]
