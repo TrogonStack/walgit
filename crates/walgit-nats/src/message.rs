@@ -69,13 +69,36 @@ pub struct LastPublished {
     /// Stream sequence of the message (the `Nats-Expected-Last-Subject-Sequence` token).
     pub stream_seq: u64,
     pub id: MsgId,
+    /// The ref's `old` and `new` from the body: a seq names an entry only within one incarnation
+    /// of the repository, so these tell its entry apart from a recreated one's at the same seq.
+    pub old: String,
+    pub new: String,
 }
 
 impl LastPublished {
-    pub fn from_headers(stream_seq: u64, headers: &HeaderMap) -> Option<Self> {
+    pub fn from_message(stream_seq: u64, headers: &HeaderMap, payload: &[u8]) -> Option<Self> {
         let id = MsgId::parse(headers.get(NATS_MESSAGE_ID)?.as_str())?;
         let seq: u64 = headers.get(HEADER_SEQ)?.as_str().parse().ok()?;
-        (seq == id.seq()).then_some(LastPublished { stream_seq, id })
+        let body: serde_json::Value = serde_json::from_slice(payload).ok()?;
+        let oid = |key: &str| body.get(key)?.as_str().map(str::to_owned);
+        (seq == id.seq()).then_some(LastPublished {
+            stream_seq,
+            id,
+            old: oid("old")?,
+            new: oid("new")?,
+        })
+    }
+
+    /// Whether the entry read at this message's seq yielded the event it carries. `false` means
+    /// the stream holds another incarnation of the repository.
+    pub fn published_from(&self, events: &[RefEvent]) -> bool {
+        let seq = self.id.seq().to_string();
+        events.iter().any(|e| {
+            e.walgit.seq == seq
+                && e.ref_name == self.id.ref_name()
+                && e.old == self.old
+                && e.new == self.new
+        })
     }
 }
 
@@ -171,6 +194,8 @@ mod tests {
         let last = |seq, name: &str| LastPublished {
             stream_seq: 9,
             id: MsgId::new("acme/repo", seq, name),
+            old: "a".into(),
+            new: "b".into(),
         };
         let names = |v: Vec<RefEvent>| {
             v.into_iter()
@@ -194,6 +219,39 @@ mod tests {
             after_last_published(events.clone(), &last(5, "refs/heads/zzz")).len(),
             4
         );
+    }
+
+    #[test]
+    fn the_last_message_is_read_back_from_its_headers_and_body() {
+        let ev = event(7, "refs/heads/main");
+        let mut headers = HeaderMap::new();
+        headers.insert(NATS_MESSAGE_ID, "acme/repo:7:refs/heads/main");
+        headers.insert(HEADER_SEQ, "7");
+        let body = serde_json::to_vec(&ev).unwrap();
+        let last = LastPublished::from_message(3, &headers, &body).unwrap();
+        assert_eq!((last.stream_seq, last.id.seq(), last.id.ref_name()), (3, 7, "refs/heads/main"));
+        assert_eq!((last.old.as_str(), last.new.as_str()), ("a", "b"));
+
+        assert_eq!(LastPublished::from_message(3, &headers, b"{}"), None, "no oids in the body");
+        headers.insert(HEADER_SEQ, "8");
+        assert_eq!(LastPublished::from_message(3, &headers, &body), None, "seq headers disagree");
+    }
+
+    #[test]
+    fn only_the_entry_it_came_from_yields_the_last_message() {
+        let last = LastPublished {
+            stream_seq: 9,
+            id: MsgId::new("acme/repo", 5, "refs/heads/main"),
+            old: "a".into(),
+            new: "b".into(),
+        };
+        assert!(last.published_from(&[event(5, "refs/heads/x"), event(5, "refs/heads/main")]));
+        let mut recreated = event(5, "refs/heads/main");
+        recreated.new = "c".into();
+        assert!(!last.published_from(&[recreated]), "same seq and ref, another push");
+        assert!(!last.published_from(&[event(5, "refs/heads/other")]));
+        assert!(!last.published_from(&[event(6, "refs/heads/main")]));
+        assert!(!last.published_from(&[]), "an entry without ref events");
     }
 
     #[test]
