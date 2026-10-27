@@ -55,6 +55,7 @@ pub struct Counters {
     pub conflicts: AtomicU64,
     pub rewinds: AtomicU64,
     pub sweep_found: AtomicU64,
+    pub refused: AtomicU64,
 }
 
 impl Counters {
@@ -67,6 +68,7 @@ impl Counters {
             "conflicts": n(&self.conflicts),
             "rewinds": n(&self.rewinds),
             "sweep_found": n(&self.sweep_found),
+            "refused": n(&self.refused),
         })
     }
 }
