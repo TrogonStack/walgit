@@ -149,10 +149,11 @@ impl Rig {
 
     /// Publish a message on the repo's subject as walgit would, but for a ref the entry does not
     /// contain: the stream's last message for the subject then names something `catch_up` cannot
-    /// find in the entry, which forces it to republish the entry. Returns its stream sequence.
+    /// find in the entry, so it holds another incarnation and the repository is published again
+    /// from the oldest readable entry. Returns its stream sequence.
     async fn inject(&self, id: &RepoId, seq: u64, ref_name: &str) -> u64 {
         let msg = PublishMessage::build()
-            .payload("{}".into())
+            .payload(format!(r#"{{"old":"{ZERO}","new":"{A}"}}"#).into())
             .message_id(format!("{id}:{seq}:{ref_name}"))
             .header("Walgit-Seq", seq.to_string().as_str())
             .header("Walgit-Repo", id.to_string().as_str());
@@ -392,14 +393,14 @@ async fn broker_dedup_absorbs_a_republish_inside_the_window() {
     assert_eq!(rig.message_count().await, 3);
 
     // The real path: the last message on the subject names a ref the entry does not contain, so
-    // `after_last_published` cannot find where the stream got to and republishes the whole entry.
+    // the stream holds another incarnation and the whole repository is republished.
     rig.inject(&id, 2, "refs/heads/not-in-the-entry").await;
     assert_eq!(rig.message_count().await, 4);
     let restarted = rig.publisher(NatsStart::Oldest).await;
     let r = restarted.catch_up(&id).await.unwrap();
-    assert_eq!((r.from_seq, r.emitted, r.conflict), (2, 2, false), "{r:?}");
+    assert_eq!((r.from_seq, r.emitted, r.conflict), (0, 3, false), "{r:?}");
     let counters = restarted.counters.snapshot();
-    assert_eq!(counters["deduplicated"], 2, "both republished events were broker duplicates");
+    assert_eq!(counters["deduplicated"], 3, "every republished event was a broker duplicate");
     assert_eq!(counters["published"], 0);
     assert_eq!(rig.message_count().await, 4, "the stream did not grow");
 }
@@ -476,13 +477,13 @@ async fn after_the_dedup_window_a_republish_lands_twice() {
 
     let restarted = rig.publisher(NatsStart::Oldest).await;
     let r = restarted.catch_up(&id).await.unwrap();
-    assert_eq!(r.emitted, 2);
+    assert_eq!(r.emitted, 3);
     let counters = restarted.counters.snapshot();
-    assert_eq!((counters["published"].as_u64(), counters["deduplicated"].as_u64()), (Some(2), Some(0)));
-    assert_eq!(rig.message_count().await, 6, "both republished events landed a second time");
+    assert_eq!((counters["published"].as_u64(), counters["deduplicated"].as_u64()), (Some(3), Some(0)));
+    assert_eq!(rig.message_count().await, 7, "every republished event landed a second time");
     let ids = rig.ids().await;
-    for name in ["refs/heads/a", "refs/heads/b"] {
-        let id = msg_id(&id, 2, name);
+    for (seq, name) in [(1, "refs/heads/main"), (2, "refs/heads/a"), (2, "refs/heads/b")] {
+        let id = msg_id(&id, seq, name);
         assert_eq!(ids.iter().filter(|i| **i == id).count(), 2, "{id} must be in the stream twice");
     }
 }
@@ -931,6 +932,77 @@ async fn a_recreated_repository_is_published_as_a_new_one() {
     assert_eq!(ids.last().unwrap(), &msg_id(&id, 1, "refs/heads/fresh"));
     let again = publisher.catch_up(&id).await.unwrap();
     assert_eq!(again.emitted, 0, "steady afterwards, not rewound again");
+    assert_eq!(publisher.counters.snapshot()["rewinds"], 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_recreated_repository_that_caught_up_with_the_old_seqs_is_still_published_whole() {
+    let Some(nats) = start_nats().await else { return };
+    let rig = Rig::new(&nats, NatsStart::Oldest).await;
+    let publisher = rig.publisher(NatsStart::Oldest).await;
+    let id = published_then_recreated(&rig, &publisher).await;
+    let mut prev = ZERO.to_string();
+    for i in 1..=4usize {
+        let next = format!("{:040x}", 0x100 + i);
+        rig.push(&id, &[("refs/heads/new", &prev, &next)]).await;
+        prev = next;
+    }
+
+    let r = publisher.catch_up(&id).await.unwrap();
+    assert_eq!((r.from_seq, r.head_seq, r.emitted, r.conflict), (0, 4, 4, false), "{r:?}");
+    assert_eq!(publisher.counters.snapshot()["rewinds"], 1);
+    let ids = rig.ids().await;
+    let fresh: Vec<_> = (1..=4).map(|seq| msg_id(&id, seq, "refs/heads/new")).collect();
+    assert_eq!(ids[3..], fresh[..], "the new incarnation from its first entry");
+    let restarted = rig.publisher(NatsStart::Oldest).await;
+    assert_eq!(restarted.catch_up(&id).await.unwrap().emitted, 0, "its own last message is a cursor");
+    assert_eq!(restarted.counters.snapshot()["rewinds"], 0);
+}
+
+async fn head_start_marked_then_recreated(rig: &Rig, publisher: &Publisher) -> RepoId {
+    let id = RepoId::new("t", "r").unwrap();
+    rig.registry.create(&id, ObjectFormat::Sha1).await.unwrap();
+    for name in ["refs/heads/a", "refs/heads/b", "refs/heads/c"] {
+        rig.push(&id, &[(name, ZERO, A)]).await;
+    }
+    assert_eq!(publisher.catch_up(&id).await.unwrap().emitted, 0, "first sighting at head 3");
+    rig.registry.delete(&id).await.unwrap();
+    id
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_deleted_repository_under_head_start_forgets_its_mark() {
+    let Some(nats) = start_nats().await else { return };
+    let rig = Rig::new(&nats, NatsStart::Head).await;
+    let publisher = rig.publisher(NatsStart::Head).await;
+    let id = head_start_marked_then_recreated(&rig, &publisher).await;
+    assert!(publisher.catch_up_if_present(&id).await.unwrap().is_none());
+    rig.registry.create(&id, ObjectFormat::Sha1).await.unwrap();
+
+    rig.push(&id, &[("refs/heads/before", ZERO, A)]).await;
+    assert_eq!(publisher.catch_up(&id).await.unwrap().emitted, 0, "first sighting at head 1");
+    rig.push(&id, &[("refs/heads/after", ZERO, B)]).await;
+    let r = publisher.catch_up(&id).await.unwrap();
+    assert_eq!((r.emitted, r.conflict), (1, false), "{r:?}");
+    assert_eq!(rig.ids().await, [msg_id(&id, 2, "refs/heads/after")]);
+    assert_eq!(publisher.counters.snapshot()["rewinds"], 0, "a deletion it saw is no rewind");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_recreation_under_head_start_seen_only_as_a_lower_head_resets_the_mark() {
+    let Some(nats) = start_nats().await else { return };
+    let rig = Rig::new(&nats, NatsStart::Head).await;
+    let publisher = rig.publisher(NatsStart::Head).await;
+    let id = head_start_marked_then_recreated(&rig, &publisher).await;
+    rig.registry.create(&id, ObjectFormat::Sha1).await.unwrap();
+
+    rig.push(&id, &[("refs/heads/before", ZERO, A)]).await;
+    assert_eq!(publisher.catch_up(&id).await.unwrap().emitted, 0, "the new head is the mark");
+    assert_eq!(publisher.counters.snapshot()["rewinds"], 1);
+    rig.push(&id, &[("refs/heads/after", ZERO, B)]).await;
+    let r = publisher.catch_up(&id).await.unwrap();
+    assert_eq!((r.emitted, r.conflict), (1, false), "{r:?}");
+    assert_eq!(rig.ids().await, [msg_id(&id, 2, "refs/heads/after")]);
     assert_eq!(publisher.counters.snapshot()["rewinds"], 1);
 }
 

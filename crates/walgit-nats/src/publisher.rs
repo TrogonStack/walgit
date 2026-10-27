@@ -138,10 +138,10 @@ impl Publisher {
             .await
         {
             Ok(m) => {
-                let last = LastPublished::from_headers(m.sequence, &m.headers);
+                let last = LastPublished::from_message(m.sequence, &m.headers, &m.payload);
                 anyhow::ensure!(
                     last.is_some(),
-                    "last message on {subject} (stream seq {}) lacks Walgit-Seq / Nats-Msg-Id",
+                    "last message on {subject} (stream seq {}) lacks Walgit-Seq / Nats-Msg-Id or a ref event body",
                     m.sequence
                 );
                 Ok(last)
@@ -184,61 +184,77 @@ impl Publisher {
             return Ok(report);
         }
 
-        // The stream is ahead of the WAL: the repository was deleted and created again (or the log
-        // rewound). What is on the subject belongs to the old incarnation, so it names no cursor;
-        // its stream sequence still guards the first publish.
-        let rewound = last.as_ref().is_some_and(|l| l.id.seq() > head);
-        let behind = last.as_ref().filter(|_| rewound).map(|l| l.stream_seq);
-        let seen = ColdMark { head, behind };
-        let first_sighting = rewound
-            && locked(&self.cold_marks)
-                .get(id)
-                .is_none_or(|mark| mark.behind != behind);
-        if first_sighting {
-            self.counters.rewinds.fetch_add(1, Ordering::Relaxed);
-            locked(&self.cold_marks).insert(id.clone(), seen);
-            tracing::warn!(repo = %id, published = last.as_ref().map_or(0, |l| l.id.seq()), head,
-                "the stream is ahead of the WAL: the repository was recreated; publishing it as a new one");
-        }
-        let basis = if rewound { None } else { last.as_ref() };
-
-        // First seq to read; `resume` is the entry the stream may hold only part of.
-        let (first, resume) = match basis {
-            Some(l) if l.id.seq() >= lowest => (l.id.seq(), Some(l)),
-            Some(l) => {
-                // The newest published entry is already folded away: what follows it up to the
-                // log window is lost to us.
-                let published = l.id.seq();
-                let first_sighting = published < readable_from
-                    && locked(&self.gaps_seen).insert(id.clone(), l.stream_seq) != Some(l.stream_seq);
-                if first_sighting {
-                    report.gap = Some([published + 1, readable_from]);
-                    self.counters
-                        .gap_entries
-                        .fetch_add(readable_from - published, Ordering::Relaxed);
-                    tracing::warn!(repo = %id, first = published + 1, last = readable_from,
-                        "entries folded into a checkpoint before they were published; consumers backfill from the WAL");
-                }
-                (lowest, None)
+        // The subject's last message belongs to another incarnation when it is ahead of the WAL
+        // or its entry yields another event: the repository was deleted and created again (or the
+        // log rewound). It then names no cursor; its stream sequence still guards the first publish.
+        let mut recreated = last.as_ref().is_some_and(|l| l.id.seq() > head);
+        let (first, events) = loop {
+            let behind = last.as_ref().filter(|_| recreated).map(|l| l.stream_seq);
+            let seen = ColdMark { head, behind };
+            let first_sighting = recreated
+                && locked(&self.cold_marks)
+                    .get(id)
+                    .is_none_or(|mark| mark.behind != behind);
+            if first_sighting {
+                self.counters.rewinds.fetch_add(1, Ordering::Relaxed);
+                locked(&self.cold_marks).insert(id.clone(), seen);
+                tracing::warn!(repo = %id, published = last.as_ref().map_or(0, |l| l.id.seq()), head,
+                    "the stream holds another incarnation of the repository: it was recreated; publishing it as a new one");
             }
-            None => match self.start {
-                NatsStart::Oldest => (lowest, None),
-                NatsStart::Head => {
-                    let mark = locked(&self.cold_marks).entry(id.clone()).or_insert(seen).head;
-                    (mark.saturating_add(1).max(lowest), None)
+            let basis = if recreated { None } else { last.as_ref() };
+
+            // First seq to read; `resume` is the entry the stream may hold only part of.
+            let (first, resume) = match basis {
+                Some(l) if l.id.seq() >= lowest => (l.id.seq(), Some(l)),
+                Some(l) => {
+                    // The newest published entry is already folded away: what follows it up to
+                    // the log window is lost to us.
+                    let published = l.id.seq();
+                    let first_sighting = published < readable_from
+                        && locked(&self.gaps_seen).insert(id.clone(), l.stream_seq) != Some(l.stream_seq);
+                    if first_sighting {
+                        report.gap = Some([published + 1, readable_from]);
+                        self.counters
+                            .gap_entries
+                            .fetch_add(readable_from - published, Ordering::Relaxed);
+                        tracing::warn!(repo = %id, first = published + 1, last = readable_from,
+                            "entries folded into a checkpoint before they were published; consumers backfill from the WAL");
+                    }
+                    (lowest, None)
                 }
-            },
+                None => match self.start {
+                    NatsStart::Oldest => (lowest, None),
+                    NatsStart::Head => {
+                        let mut marks = locked(&self.cold_marks);
+                        let mark = marks.entry(id.clone()).or_insert(seen);
+                        if mark.head > head {
+                            // The WAL went backwards with nothing of the old incarnation on the
+                            // subject: the repository was recreated while this process watched.
+                            *mark = seen;
+                            self.counters.rewinds.fetch_add(1, Ordering::Relaxed);
+                            tracing::warn!(repo = %id, head,
+                                "the head went backwards: the repository was recreated; publishing it as a new one");
+                        }
+                        (mark.head.saturating_add(1).max(lowest), None)
+                    }
+                },
+            };
+            report.from_seq = resume.map_or(first.saturating_sub(1), |l| l.id.seq());
+
+            let mut events = Vec::new();
+            if first <= head {
+                let entries = handle.read_log(&manifest, first, Some(head)).await?;
+                refs_from_entries(id, &entries, &mut events);
+            }
+            match resume {
+                Some(l) if !l.published_from(&events) => recreated = true,
+                Some(l) => break (first, after_last_published(events, l)),
+                None => break (first, events),
+            }
         };
-        report.from_seq = resume.map_or(first.saturating_sub(1), |l| l.id.seq());
 
         let mut last_sent: Option<MsgId> = None;
         if first <= head {
-            let entries = handle.read_log(&manifest, first, Some(head)).await?;
-            let mut events = Vec::new();
-            refs_from_entries(id, &entries, &mut events);
-            if let Some(l) = resume {
-                events = after_last_published(events, l);
-            }
             // Whatever is on the subject now (a gap leaves older messages there too).
             let mut expected = last.as_ref().map_or(0, |l| l.stream_seq);
             for (i, event) in events.iter().enumerate() {
@@ -308,6 +324,9 @@ impl Publisher {
                     Some(walgit_wal::WalError::NotFound)
                 ) =>
             {
+                locked(&self.done).remove(id);
+                locked(&self.cold_marks).remove(id);
+                locked(&self.gaps_seen).remove(id);
                 Ok(None)
             }
             r => r.map(Some),
