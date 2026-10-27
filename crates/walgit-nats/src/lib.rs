@@ -79,12 +79,23 @@ async fn shutdown_signal() {
     let _ = tokio::signal::ctrl_c().await;
 }
 
+/// The config the publisher's registry runs on. This process never applies a push itself, so a
+/// wake-up must always see the manifest as it is in the bucket (`freshness_ttl` would let it
+/// skip the GET and miss the push it was woken for), and it only reads manifest and log, so
+/// pack prefetch would pull bytes nobody reads. Both hold whatever `[wal]` says.
+pub fn publisher_config(cfg: &Config) -> Config {
+    let mut cfg = cfg.clone();
+    cfg.wal.freshness_ttl = std::time::Duration::ZERO;
+    cfg.wal.prefetch_packs = false;
+    cfg
+}
+
 /// `walgit nats`: publish until SIGTERM/ctrl-c, or fail when a worker stops.
 pub async fn run(cfg: Arc<Config>) -> anyhow::Result<()> {
     let nats = &cfg.events.nats;
     let prefix = SubjectPrefix::new(&nats.subject_prefix)?;
     let store = walgit_store::open_store(&cfg).await?;
-    let registry = walgit_wal::Registry::new(store, cfg.clone());
+    let registry = walgit_wal::Registry::new(store, Arc::new(publisher_config(&cfg)));
 
     let client = crate::connect(nats).await?;
     let js = async_nats::jetstream::new(client.clone());

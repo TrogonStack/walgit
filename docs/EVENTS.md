@@ -155,6 +155,9 @@ Like the bridge it is a reader of the WAL, never a step of a push (D32).
   after a restart (pinned by a test).
 - **A foreign message** (no `Walgit-Seq` / `Nats-Msg-Id`) as the last message on a repository's subject makes every
   catch-up for that repository fail, naming the subject and stream sequence, until it is removed.
+- **Config adaptation.** `walgit nats` always revalidates the manifest (`wal.freshness_ttl` is forced to zero) and
+  never prefetches packs (`wal.prefetch_packs` is forced off), whatever `[wal]` says, because it never applies a
+  push itself and only reads manifest and log (`walgit_nats::publisher_config`).
 - **Cost.** Every wake-up for a repository reads the last message on its subject (one JetStream request) before
   deciding there is nothing to do, so a wiped stream is noticed without a restart.
 
@@ -179,6 +182,13 @@ Each behaviour above has a test against a real `nats-server -js` (`crates/walgit
 | A NATS server restart keeps stream, subscriptions and service | `a_nats_server_restart_keeps_the_stream_the_subscriptions_and_the_service` |
 | `start = "head"` | `head_start_publishes_nothing_older`, `known_limitation_head_start_skips_pushes_made_while_the_publisher_was_down` |
 | A foreign message wedges the repository with a clear error | `a_foreign_message_on_a_repo_subject_fails_every_catch_up_with_a_clear_error` |
+| A notification inside `wal.freshness_ttl` still publishes the push; no pack prefetch | `a_notification_inside_the_freshness_ttl_still_publishes_the_push`, `the_publisher_never_prefetches_packs_whatever_the_operator_configured` |
+| Subject tokens round-trip odd names and never carry `.`, `*`, `>` | `odd_names_round_trip_and_never_carry_a_metacharacter`, `every_single_byte_string_round_trips` (unit, `subject.rs`) |
+| Notification shapes: S3 multi-record, GCS finalize only, `store.prefix` | `an_s3_event_with_several_records_names_each_repo_once`, `a_gcs_envelope_counts_only_finalize_events`, `the_store_prefix_scopes_what_is_notified` (unit, `wake.rs`) |
+| `ensure_stream = false` with no stream fails clearly; an existing stream is reused | `a_missing_stream_with_ensure_stream_off_fails_clearly_and_creates_nothing`, `an_existing_stream_with_other_settings_is_reused_not_clobbered` |
+| A bad server URL fails to connect naming the setting | `an_unparsable_server_url_fails_to_connect_naming_the_setting` |
+| Tags, deletes and non-branch refs carry `ref_type` and zero OIDs | `tags_and_deletes_carry_their_ref_type_and_zero_oids` |
+| Many pushes land in seq order across catch-ups | `many_sequential_pushes_land_in_seq_order_across_catch_ups` |
 | SIGTERM exits 0 | `tests/e2e.sh` phase 3 |
 
 Not covered: Prometheus metrics (the service stats are the only counters), multi-node JetStream clusters, and

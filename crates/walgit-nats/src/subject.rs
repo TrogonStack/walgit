@@ -206,4 +206,35 @@ mod tests {
             assert!(SubjectPrefix::new(bad).is_err(), "{bad:?}");
         }
     }
+
+    #[test]
+    fn odd_names_round_trip_and_never_carry_a_metacharacter() {
+        let names = [
+            "a", "-", "_", "a.b.c", "*", ">", "%", "%2E", "%%", "a b", "tab\tnl\n", "é", "日本語",
+            "emoji\u{1F600}", "a/b\\c", "\u{0}", "..", "*.>", "Z%zz",
+        ];
+        for raw in names {
+            let t = Token::encode(raw);
+            assert!(!t.as_str().is_empty(), "{raw:?}");
+            assert!(
+                t.as_str()
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'%')),
+                "{raw:?} -> {t}"
+            );
+            assert_eq!(Token::decode(t.as_str()).as_deref(), Some(raw), "{raw:?}");
+        }
+        let mut seen = std::collections::HashSet::new();
+        assert!(names.iter().all(|n| seen.insert(Token::encode(n).to_string())), "injective");
+    }
+
+    #[test]
+    fn every_single_byte_string_round_trips() {
+        for c in (1u32..0x250).filter_map(char::from_u32) {
+            let raw = c.to_string();
+            let t = Token::encode(&raw);
+            assert_eq!(Token::decode(t.as_str()).as_deref(), Some(raw.as_str()), "{c:?}");
+            assert!(!t.as_str().contains(['.', '*', '>']), "{c:?}");
+        }
+    }
 }

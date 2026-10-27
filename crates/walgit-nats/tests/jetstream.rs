@@ -28,6 +28,7 @@ const C: &str = "3333333333333333333333333333333333333333";
 
 struct Rig {
     cfg: Arc<Config>,
+    store: Arc<walgit_store::memory::MemoryStore>,
     registry: Arc<walgit_wal::Registry>,
     client: async_nats::Client,
     js: jetstream::Context,
@@ -52,10 +53,8 @@ impl Rig {
             cfg.events.nats.duplicate_window = window;
         }
         let cfg = Arc::new(cfg);
-        let registry = walgit_wal::Registry::new(
-            Arc::new(walgit_store::memory::MemoryStore::new()),
-            cfg.clone(),
-        );
+        let store = Arc::new(walgit_store::memory::MemoryStore::new());
+        let registry = walgit_wal::Registry::new(store.clone(), cfg.clone());
         let client = walgit_nats::connect(&cfg.events.nats).await.unwrap();
         let js = jetstream::ContextBuilder::new()
             .timeout(Duration::from_secs(3))
@@ -63,6 +62,7 @@ impl Rig {
         let prefix = SubjectPrefix::new(&cfg.events.nats.subject_prefix).unwrap();
         Rig {
             cfg,
+            store,
             registry,
             client,
             js,
@@ -83,6 +83,34 @@ impl Rig {
             self.prefix.clone(),
             start,
         )
+    }
+
+    /// What `walgit nats` runs: its own registry over the same store (it never sees the
+    /// writer's pushes except through the bucket) on the operator's `[wal]` settings, as
+    /// `run` adapts them. Returns the registry's cache dir guard too.
+    async fn operator_publisher(
+        &self,
+        operator: impl FnOnce(&mut Config),
+    ) -> (Arc<Publisher>, Arc<walgit_wal::Registry>, tempfile::TempDir) {
+        let cache = tempfile::tempdir().unwrap();
+        let mut cfg = (*self.cfg).clone();
+        cfg.cache.dir = cache.path().to_path_buf();
+        operator(&mut cfg);
+        let registry = walgit_wal::Registry::new(
+            self.store.clone(),
+            Arc::new(walgit_nats::publisher_config(&cfg)),
+        );
+        let stream = walgit_nats::open_stream(&self.js, &self.cfg.events.nats, &self.prefix)
+            .await
+            .unwrap();
+        let publisher = Publisher::new(
+            registry.clone(),
+            self.js.clone(),
+            stream,
+            self.prefix.clone(),
+            NatsStart::Oldest,
+        );
+        (publisher, registry, cache)
     }
 
     async fn push(&self, id: &RepoId, updates: &[(&str, &str, &str)]) -> u64 {
@@ -906,4 +934,242 @@ async fn the_periodic_sweep_finds_a_push_nobody_notified() {
     rig.wait_for_messages(2).await;
     assert_eq!(publisher.counters.snapshot()["sweep_found"], 1);
     sweeping.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_notification_inside_the_freshness_ttl_still_publishes_the_push() {
+    let Some(nats) = start_nats().await else { return };
+    let rig = Rig::new(&nats, NatsStart::Oldest).await;
+    let id = RepoId::new("t", "r").unwrap();
+    rig.registry.create(&id, ObjectFormat::Sha1).await.unwrap();
+    rig.push(&id, &[("refs/heads/main", ZERO, A)]).await;
+    let (publisher, _registry, _cache) = rig
+        .operator_publisher(|c| c.wal.freshness_ttl = Duration::from_mins(10))
+        .await;
+    let notify = rig.spawn_notify(&publisher);
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    rig.notify(r#"{"repo":"t/r"}"#).await;
+    rig.wait_for_messages(1).await;
+
+    // Pushed through another registry: the publisher only learns of it from the bucket.
+    rig.push(&id, &[("refs/heads/main", A, B)]).await;
+    rig.notify(r#"{"repo":"t/r"}"#).await;
+    rig.wait_for_messages(2).await;
+    assert_eq!(rig.ids().await, [msg_id(&id, 1, "refs/heads/main"), msg_id(&id, 2, "refs/heads/main")]);
+    notify.abort();
+}
+
+fn pack_files(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut found = Vec::new();
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        for entry in std::fs::read_dir(&d).into_iter().flatten().flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if path.extension().is_some_and(|e| e == "pack") {
+                found.push(path);
+            }
+        }
+    }
+    found
+}
+
+/// A push carrying a real pack (one commit), so the repository has pack bytes in the bucket.
+async fn push_with_pack(rig: &Rig, id: &RepoId) {
+    let work = tempfile::tempdir().unwrap();
+    let git = |args: &[&str]| {
+        let out = std::process::Command::new("git")
+            .args(["-c", "user.name=T", "-c", "user.email=t@t", "-c", "commit.gpgsign=false"])
+            .args(args)
+            .current_dir(work.path())
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        String::from_utf8(out.stdout).unwrap().trim().to_string()
+    };
+    git(&["init", "-q"]);
+    std::fs::write(work.path().join("f"), "x").unwrap();
+    git(&["add", "."]);
+    git(&["commit", "-q", "-m", "c"]);
+    let head = git(&["rev-parse", "HEAD"]);
+    let pack = {
+        use std::io::Write as _;
+        let mut child = std::process::Command::new("git")
+            .args(["pack-objects", "--stdout", "--revs"])
+            .current_dir(work.path())
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        child.stdin.take().unwrap().write_all(format!("{head}\n").as_bytes()).unwrap();
+        child.wait_with_output().unwrap().stdout
+    };
+    let handle = rig.registry.open(id).await.unwrap();
+    let ingested = handle
+        .local()
+        .ingest_pack(
+            std::io::Cursor::new(pack),
+            walgit_git::IngestOptions { fsck: false, max_bytes: None, thin: false },
+        )
+        .await
+        .unwrap();
+    let txn = RefTransaction {
+        updates: vec![RefUpdate {
+            name: "refs/heads/main".into(),
+            old_oid: String::new(),
+            new_oid: head,
+            ..Default::default()
+        }],
+        atomic: true,
+        ..Default::default()
+    };
+    let r = handle.publish_push(ingested, txn, HashMap::new()).await.unwrap();
+    assert!(r.seq > 0, "push rejected: {:?}", r.per_ref);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_publisher_never_prefetches_packs_whatever_the_operator_configured() {
+    let Some(nats) = start_nats().await else { return };
+    let rig = Rig::new(&nats, NatsStart::Oldest).await;
+    let id = RepoId::new("t", "r").unwrap();
+    rig.registry.create(&id, ObjectFormat::Sha1).await.unwrap();
+    push_with_pack(&rig, &id).await;
+
+    let (publisher, _registry, cache) = rig
+        .operator_publisher(|c| c.wal.prefetch_packs = true)
+        .await;
+    assert_eq!(publisher.catch_up(&id).await.unwrap().emitted, 1);
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert_eq!(pack_files(cache.path()), Vec::<std::path::PathBuf>::new(), "no pack bytes pulled");
+
+    // Control: the same operator config without the adaptation does prefetch.
+    let control_cache = tempfile::tempdir().unwrap();
+    let mut operator = (*rig.cfg).clone();
+    operator.cache.dir = control_cache.path().to_path_buf();
+    operator.wal.prefetch_packs = true;
+    let plain = walgit_wal::Registry::new(rig.store.clone(), Arc::new(operator));
+    let handle = plain.open(&id).await.unwrap();
+    drop(handle.sync_refs().await.unwrap());
+    let t0 = Instant::now();
+    while pack_files(control_cache.path()).is_empty() {
+        assert!(t0.elapsed() < Duration::from_secs(10), "the control never prefetched");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_missing_stream_with_ensure_stream_off_fails_clearly_and_creates_nothing() {
+    let Some(nats) = start_nats().await else { return };
+    let rig = Rig::new(&nats, NatsStart::Oldest).await;
+    let mut cfg = rig.cfg.events.nats.clone();
+    cfg.ensure_stream = false;
+    let err = walgit_nats::open_stream(&rig.js, &cfg, &rig.prefix).await.unwrap_err();
+    let text = format!("{err:#}");
+    assert!(
+        text.contains("WALGIT_EVENTS") && text.contains("ensure_stream is off"),
+        "the error must name the stream and the setting: {text}"
+    );
+    assert!(rig.js.get_stream("WALGIT_EVENTS").await.is_err(), "nothing was created");
+
+    cfg.ensure_stream = true;
+    walgit_nats::open_stream(&rig.js, &cfg, &rig.prefix).await.unwrap();
+    cfg.ensure_stream = false;
+    walgit_nats::open_stream(&rig.js, &cfg, &rig.prefix).await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_existing_stream_with_other_settings_is_reused_not_clobbered() {
+    let Some(nats) = start_nats().await else { return };
+    let rig = Rig::new(&nats, NatsStart::Oldest).await;
+    let existing = jetstream::stream::Config {
+        name: "WALGIT_EVENTS".into(),
+        subjects: vec!["walgit.ref.>".into(), "other.>".into()],
+        max_messages: 1000,
+        duplicate_window: Duration::from_secs(30),
+        ..Default::default()
+    };
+    rig.js.create_stream(existing).await.unwrap();
+
+    let stream = walgit_nats::open_stream(&rig.js, &rig.cfg.events.nats, &rig.prefix)
+        .await
+        .unwrap();
+    let config = stream.cached_info().config.clone();
+    assert_eq!(config.max_messages, 1000);
+    assert_eq!(config.duplicate_window, Duration::from_secs(30));
+    assert_eq!(config.subjects, ["walgit.ref.>", "other.>"]);
+
+    let id = RepoId::new("t", "r").unwrap();
+    rig.registry.create(&id, ObjectFormat::Sha1).await.unwrap();
+    rig.push(&id, &[("refs/heads/main", ZERO, A)]).await;
+    let publisher = rig.publisher(NatsStart::Oldest).await;
+    assert_eq!(publisher.catch_up(&id).await.unwrap().emitted, 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_unparsable_server_url_fails_to_connect_naming_the_setting() {
+    let cfg = walgit_config::NatsEventsConfig {
+        urls: vec!["nats://bad host:not-a-port".into()],
+        ..Default::default()
+    };
+    let err = walgit_nats::connect(&cfg).await.unwrap_err();
+    assert!(format!("{err:#}").contains("events.nats.urls"), "{err:#}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn tags_and_deletes_carry_their_ref_type_and_zero_oids() {
+    let Some(nats) = start_nats().await else { return };
+    let rig = Rig::new(&nats, NatsStart::Oldest).await;
+    let id = RepoId::new("t", "r").unwrap();
+    rig.registry.create(&id, ObjectFormat::Sha1).await.unwrap();
+    rig.push(&id, &[("refs/heads/main", ZERO, A), ("refs/tags/v1", ZERO, B)]).await;
+    rig.push(&id, &[("refs/heads/main", A, ZERO), ("refs/tags/v1", B, ZERO)]).await;
+    rig.push(&id, &[("refs/notes/x", ZERO, C)]).await;
+    let publisher = rig.publisher(NatsStart::Oldest).await;
+    assert_eq!(publisher.catch_up(&id).await.unwrap().emitted, 5);
+
+    let stream = rig.stream().await;
+    let mut seen = Vec::new();
+    for n in 1..=5 {
+        let raw = stream.get_raw_message(n).await.unwrap();
+        let b: serde_json::Value = serde_json::from_slice(&raw.payload).unwrap();
+        let get = |k: &str| b[k].as_str().unwrap().to_string();
+        seen.push((get("action"), get("ref_type"), get("ref_name"), get("old"), get("new")));
+    }
+    let row = |a: &str, t: &str, r: &str, o: &str, n: &str| {
+        (a.to_string(), t.to_string(), r.to_string(), o.to_string(), n.to_string())
+    };
+    assert_eq!(
+        seen,
+        [
+            row("create", "branch", "refs/heads/main", ZERO, A),
+            row("create", "tag", "refs/tags/v1", ZERO, B),
+            row("delete", "branch", "refs/heads/main", A, ZERO),
+            row("delete", "tag", "refs/tags/v1", B, ZERO),
+            row("create", "", "refs/notes/x", ZERO, C),
+        ]
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn many_sequential_pushes_land_in_seq_order_across_catch_ups() {
+    let Some(nats) = start_nats().await else { return };
+    let rig = Rig::new(&nats, NatsStart::Oldest).await;
+    let id = RepoId::new("t", "r").unwrap();
+    rig.registry.create(&id, ObjectFormat::Sha1).await.unwrap();
+    let publisher = rig.publisher(NatsStart::Oldest).await;
+    let oid = |i: usize| format!("{i:040x}");
+    let mut prev = ZERO.to_string();
+    let mut expected = Vec::new();
+    for i in 1..=30usize {
+        let next = oid(i);
+        let seq = rig.push(&id, &[("refs/heads/main", &prev, &next)]).await;
+        expected.push(msg_id(&id, seq, "refs/heads/main"));
+        prev = next;
+        if i % 7 == 0 {
+            publisher.catch_up(&id).await.unwrap();
+        }
+    }
+    publisher.catch_up(&id).await.unwrap();
+    assert_eq!(rig.ids().await, expected);
 }
