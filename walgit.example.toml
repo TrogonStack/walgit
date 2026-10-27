@@ -203,6 +203,18 @@ lock_wait_warn = "1s"             # WARN "lock wait" (lock, repo, wait_ms, reque
 # webhook_secret = ""             # X-Walgit-Signature: sha256=<HMAC-SHA256 of the body>; unset = unsigned
 # sweep_interval = "5m"           # backstop + health check (warns when a sweep finds unpublished entries); 0 = off
 
+[events.nats]                     # docs/EVENTS.md: read only by `walgit nats --config walgit.toml`
+# urls = ["nats://127.0.0.1:4222"]       # the client connects to the first reachable server
+#   auth comes from the environment, first match wins: NATS_CREDS (.creds file), NATS_NKEY (seed),
+#   NATS_USER + NATS_PASSWORD, NATS_TOKEN; none set = no auth; secrets are never logged
+# stream = "WALGIT_EVENTS"        # the JetStream stream holding the events (subjects "<subject_prefix>.ref.>"); it is the resume cursor
+# ensure_stream = true            # create the stream when missing (file storage); an existing stream is used as is
+# duplicate_window = "1h"         # dedup window (Nats-Msg-Id) of a stream `walgit nats` creates
+# subject_prefix = "walgit"       # events go to "<subject_prefix>.ref.<owner>.<repo>"; metacharacters in names are %XX encoded
+# notify_subject = "walgit.notify" # core subject bucket notifications are published to (S3 event JSON, {"key"} or {"repo"})
+# queue_group = "walgit-events"   # notify subscription and service endpoints: instances in a group share the work
+# start = "oldest"                # first sight of a repo with no events in the stream: "oldest" (oldest readable seq) or "head" (only new pushes)
+
 # Packfile foundations: these policies are validated and stored, but URI delivery and
 # ref filtering are not enabled by the foundation-only change.
 [refs]
