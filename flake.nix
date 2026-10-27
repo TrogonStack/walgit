@@ -3,7 +3,9 @@
   #
   #   nix run github:<you>/walgit -- --config walgit.toml      # run it
   #   nix build .#walgit                                       # result/bin/{walgit,walgit-server}
-  #   nix build .#image && podman load < result                # an OCI image (same bytes as the Containerfile)
+  #   nix build .#walgit-nats                                  # result/bin/walgit-nats, no web UI
+  #   nix build .#image && podman load < result                # the walgit image (the Containerfile's walgit target)
+  #   nix build .#image-nats && podman load < result           # the walgit-nats image (its walgit-nats target)
   #   nix develop                                              # rust, protobuf, pnpm, git, just, rustfs-compatible tools
   #
   # The web UI is built from web/ with pnpm and embedded into the binary at compile time
@@ -81,18 +83,23 @@
         });
 
         commonArgs = {
-          pname = "walgit";
           inherit version;
           src = rustSrc;
           strictDeps = true;
           nativeBuildInputs = with pkgs; [ protobuf pkg-config cmake perl python3 ];
-          cargoExtraArgs = "-p walgit-cli --locked";
           doCheck = false;
         };
-        cargoArtifacts = craneLib.buildDepsOnly commonArgs;
+        walgitArgs = commonArgs // {
+          pname = "walgit";
+          cargoExtraArgs = "-p walgit-cli --locked";
+        };
+        natsArgs = commonArgs // {
+          pname = "walgit-nats";
+          cargoExtraArgs = "-p walgit-nats --locked";
+        };
 
-        walgit = craneLib.buildPackage (commonArgs // {
-          inherit cargoArtifacts;
+        walgit = craneLib.buildPackage (walgitArgs // {
+          cargoArtifacts = craneLib.buildDepsOnly walgitArgs;
           env.WALGIT_BUILD_SHA = self.shortRev or self.dirtyShortRev or "dev";
           preConfigure = ''
             mkdir -p web
@@ -108,6 +115,21 @@
           meta = {
             description = "git hosting on an object store: smart HTTP, LFS, web UI — one binary";
             mainProgram = "walgit";
+            license = lib.licenses.mit;
+          };
+        });
+
+        walgit-nats = craneLib.buildPackage (natsArgs // {
+          cargoArtifacts = craneLib.buildDepsOnly natsArgs;
+          env.WALGIT_BUILD_SHA = self.shortRev or self.dirtyShortRev or "dev";
+          # `git init --bare` and `git config` when it creates a repository's local refs copy.
+          nativeBuildInputs = commonArgs.nativeBuildInputs ++ [ pkgs.makeWrapper ];
+          postInstall = ''
+            wrapProgram "$out/bin/walgit-nats" --prefix PATH : ${lib.makeBinPath [ pkgs.git ]}
+          '';
+          meta = {
+            description = "walgit's ref events published into NATS JetStream";
+            mainProgram = "walgit-nats";
             license = lib.licenses.mit;
           };
         });
@@ -136,11 +158,37 @@
             ];
           };
         };
+
+        imageNats = pkgs.dockerTools.buildLayeredImage {
+          name = "walgit-nats";
+          tag = version;
+          contents = [ walgit-nats pkgs.cacert ];
+          extraCommands = ''
+            mkdir -p etc/walgit var/lib/walgit-nats tmp
+            chmod 1777 tmp
+            printf 'walgit:x:1000:1000:walgit:/var/lib/walgit-nats:/sbin/nologin\n' > etc/passwd
+            printf 'walgit:x:1000:\n' > etc/group
+            chown 1000:1000 var/lib/walgit-nats
+            cp ${./walgit.example.toml} etc/walgit/walgit.toml
+          '';
+          config = {
+            Entrypoint = [ "${walgit-nats}/bin/walgit-nats" ];
+            User = "1000:1000";
+            WorkingDir = "/var/lib/walgit-nats";
+            Env = [
+              "RUST_LOG=info,walgit=debug"
+              "WALGIT_CONFIG=/etc/walgit/walgit.toml"
+              "WALGIT__CACHE__DIR=/var/lib/walgit-nats"
+              "SSL_CERT_FILE=${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt"
+            ];
+          };
+        };
       in
       {
         packages = {
           default = walgit;
-          inherit walgit web image;
+          inherit walgit walgit-nats web image;
+          image-nats = imageNats;
         };
 
         apps.default = {

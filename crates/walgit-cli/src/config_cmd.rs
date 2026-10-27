@@ -5,7 +5,7 @@ use std::sync::Arc;
 use anyhow::Result;
 
 use crate::ConfigAction;
-use walgit_config::Config;
+use walgit_config::{Config, Settings};
 
 pub async fn run(action: ConfigAction, cfg: &Arc<Config>) -> Result<()> {
     match action {

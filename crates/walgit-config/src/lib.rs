@@ -6,6 +6,10 @@ pub mod packs;
 pub use packs::{DeltaBudget, FoldInventory, FoldReason, FreezeReason, PacksConfig};
 pub mod refs;
 pub use refs::{PackGroupConfig, PackGroupKind, RefsConfig};
+pub mod nats;
+pub use nats::{DEFAULT_SWEEP_INTERVAL, NatsConfig, NatsEventsConfig, NatsStart, SinkEventsConfig};
+pub mod settings;
+pub use settings::Settings;
 
 use std::{net::SocketAddr, path::PathBuf, time::Duration};
 
@@ -241,6 +245,13 @@ pub struct StoreConfig {
     pub multipart_part_size: ByteSize,
 }
 
+impl StoreConfig {
+    pub fn validate(&self) -> Result<()> {
+        anyhow::ensure!(!self.bucket.is_empty(), "store.bucket must be set");
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum StoreBackend {
@@ -396,6 +407,13 @@ pub struct WalConfig {
 }
 
 /// The `maintain` role's loop.
+impl WalConfig {
+    pub fn validate(&self) -> Result<()> {
+        anyhow::ensure!(self.max_batch >= 1, "wal.max_batch must be >= 1");
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct MaintenanceConfig {
@@ -623,7 +641,8 @@ pub enum ObjectFormat {
 
 /// Events (`docs/EVENTS.md`): the bridge (`Role::Events`) tails every repo's
 /// WAL from a durable cursor and publishes `ref` events to the webhook. Only the
-/// bridge reads this section; nothing on the push path does.
+/// bridge reads this section; nothing on the push path does. `[events.nats]` belongs to
+/// `walgit-nats` ([`NatsConfig`]) and is skipped here, so a shared `walgit.toml` may hold it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct EventsConfig {
@@ -637,8 +656,6 @@ pub struct EventsConfig {
     /// warns when a sweep finds unpublished entries. `0` = off.
     #[serde(with = "humantime_serde")]
     pub sweep_interval: Duration,
-    /// The `JetStream` publisher (`walgit nats`, `docs/EVENTS.md`). Read only by that subcommand.
-    pub nats: NatsEventsConfig,
 }
 
 impl Default for EventsConfig {
@@ -646,86 +663,8 @@ impl Default for EventsConfig {
         EventsConfig {
             webhook_url: None,
             webhook_secret: None,
-            sweep_interval: Duration::from_mins(5),
-            nats: NatsEventsConfig::default(),
+            sweep_interval: DEFAULT_SWEEP_INTERVAL,
         }
-    }
-}
-
-/// Where a cold repository (no message on its subject yet) starts publishing.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(rename_all = "snake_case")]
-pub enum NatsStart {
-    /// The oldest readable seq (`min_seq - 1`), as the webhook bridge does.
-    #[default]
-    Oldest,
-    /// Nothing older than the head the publisher first sees.
-    Head,
-}
-
-/// `[events.nats]`: `walgit nats` publishes the bridge's `ref` events into `JetStream`.
-/// The resume cursor is the last message on each repository's subject, so there is no cursor
-/// object in the bucket.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields, default)]
-pub struct NatsEventsConfig {
-    /// Server URLs (`nats://host:4222`); the client connects to the first reachable one.
-    pub urls: Vec<String>,
-    /// The `JetStream` stream holding the events (subjects `<subject_prefix>.ref.>`).
-    pub stream: String,
-    /// Events go to `<subject_prefix>.ref.<owner>.<repo>`.
-    pub subject_prefix: String,
-    /// Core subject bucket notifications are published to (S3 event JSON, `{"key"}` or `{"repo"}`).
-    pub notify_subject: String,
-    /// Queue group of the notify subscription and the service endpoints: instances share the work.
-    pub queue_group: String,
-    pub start: NatsStart,
-}
-
-impl Default for NatsEventsConfig {
-    fn default() -> Self {
-        NatsEventsConfig {
-            urls: vec!["nats://127.0.0.1:4222".into()],
-            stream: "WALGIT_EVENTS".into(),
-            subject_prefix: "walgit".into(),
-            notify_subject: "walgit.notify".into(),
-            queue_group: "walgit-events".into(),
-            start: NatsStart::Oldest,
-        }
-    }
-}
-
-impl NatsEventsConfig {
-    fn validate(&self) -> Result<()> {
-        anyhow::ensure!(!self.urls.is_empty(), "events.nats.urls must not be empty");
-        anyhow::ensure!(
-            self.urls.iter().all(|u| !u.trim().is_empty()),
-            "events.nats.urls must not contain empty entries"
-        );
-        let plain = |s: &str| {
-            !s.is_empty()
-                && !s
-                    .chars()
-                    .any(|c| c.is_whitespace() || c.is_control() || matches!(c, '*' | '>'))
-        };
-        let dotted = |s: &str| plain(s) && s.split('.').all(|t| !t.is_empty());
-        anyhow::ensure!(
-            plain(&self.stream) && !self.stream.contains(['.', '/', '\\']),
-            "events.nats.stream must be a stream name (no '.', '/', '\\', '*', '>' or whitespace)"
-        );
-        anyhow::ensure!(
-            dotted(&self.subject_prefix),
-            "events.nats.subject_prefix must be dot-separated tokens (no '*', '>' or whitespace)"
-        );
-        anyhow::ensure!(
-            dotted(&self.notify_subject),
-            "events.nats.notify_subject must be a literal subject (no '*', '>' or whitespace)"
-        );
-        anyhow::ensure!(
-            plain(&self.queue_group),
-            "events.nats.queue_group must not be empty or contain '*', '>' or whitespace"
-        );
-        Ok(())
     }
 }
 
@@ -844,27 +783,6 @@ impl Config {
 }
 
 /// `owner/name` matches an entry of `list` (`owner/name`, `owner/*`, `*`; `.git` tolerated).
-/// The `placement` table as the env overrides alone set it (None when no
-/// `WALGIT__PLACEMENT__*` variable was present).
-fn env_placement_overrides(doc: &toml::Table, vars_seen: &[String]) -> Option<toml::Value> {
-    let keys: Vec<String> = vars_seen
-        .iter()
-        .filter_map(|k| k.strip_prefix("WALGIT__PLACEMENT__"))
-        .map(str::to_ascii_lowercase)
-        .collect();
-    if keys.is_empty() {
-        return None;
-    }
-    let table = doc.get("placement")?.as_table()?;
-    let mut out = toml::Table::new();
-    for k in keys {
-        if let Some(v) = table.get(&k) {
-            out.insert(k, v.clone());
-        }
-    }
-    Some(toml::Value::Table(out))
-}
-
 pub fn repo_listed(list: &[String], owner: &str, name: &str) -> bool {
     list.iter().any(|r| {
         let r = r.trim().trim_end_matches(".git");
@@ -1028,141 +946,30 @@ impl Default for TelemetryConfig {
     }
 }
 
-impl Config {
-    pub fn parse(toml_text: &str) -> Result<Config> {
-        let mut cfg: Config = toml::from_str(toml_text).context("parsing walgit.toml")?;
-        cfg.apply_env(std::env::vars())?;
-        cfg.validate()?;
-        Ok(cfg)
+impl Settings for Config {
+    const FOREIGN: &'static [&'static [&'static str]] = &[&["events", "nats"]];
+
+    fn telemetry(&self) -> &TelemetryConfig {
+        &self.telemetry
     }
 
-    pub fn load(path: &std::path::Path) -> Result<Config> {
-        let text =
-            std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
-        Self::parse(&text)
+    fn apply_port(&mut self, port: u16) {
+        self.server.listen.set_port(port);
+        if let Some(u) = self.server.public_url.as_mut()
+            && origin_is_loopback(u)
+        {
+            *u = rewrite_origin_port(u, port);
+        }
     }
 
-    /// Apply `WALGIT__a__b=v` overrides (values parsed as TOML values, falling back to string)
-    /// and a serverless host's `PORT`.
-    ///
-    /// Config and image are released independently (the ssd-host host follows
-    /// the serving image's version): an override for a key **unknown to this build**
-    /// (or with an unparsable value) is **ignored with a WARN**, never a
-    /// startup failure (2026-08-21: `unknown field disk_high_watermark`
-    /// crash-looped a host running the previous image). The ignored keys are
-    /// returned by [`apply_env_report`].
-    pub fn apply_env(&mut self, vars: impl Iterator<Item = (String, String)>) -> Result<()> {
-        let ignored = self.apply_env_report(vars)?;
-        for (k, why) in &ignored {
-            tracing::warn!(key = %k, reason = %why, "ignoring {k}: unknown in this build");
-        }
-        Ok(())
+    fn env_groups() -> Result<Vec<(&'static str, toml::Table)>> {
+        Ok(vec![(
+            "placement",
+            toml::Table::try_from(PlacementConfig::default()).context("placement defaults")?,
+        )])
     }
 
-    /// [`apply_env`] returning the `(key, reason)` pairs it had to ignore.
-    pub fn apply_env_report(
-        &mut self,
-        vars: impl Iterator<Item = (String, String)>,
-    ) -> Result<Vec<(String, String)>> {
-        let mut vars_seen: Vec<String> = Vec::new();
-        let mut doc: toml::Table = toml::Table::try_from(&*self).context("serializing config")?;
-        let mut touched = false;
-        let mut ignored = Vec::new();
-        let mut port_override = None;
-        for (k, v) in vars {
-            if k == "PORT" {
-                port_override = v.parse::<u16>().ok();
-                continue;
-            }
-            let Some(rest) = k.strip_prefix("WALGIT__") else {
-                continue;
-            };
-            vars_seen.push(k.clone());
-            let path: Vec<String> = rest.split("__").map(str::to_ascii_lowercase).collect();
-            if path.is_empty() || path.iter().any(std::string::String::is_empty) {
-                continue;
-            }
-            // Apply into a copy and type-check it alone: a bad/unknown key is
-            // dropped (WARN) instead of failing every other override with it.
-            let apply = |value: toml::Value| {
-                fn set(
-                    cur: &mut toml::Table,
-                    path: &[String],
-                    value: toml::Value,
-                ) -> std::result::Result<(), String> {
-                    let Some((key, rest)) = path.split_first() else {
-                        return Err("empty configuration path".into());
-                    };
-                    if rest.is_empty() {
-                        cur.insert(key.clone(), value);
-                        return Ok(());
-                    }
-                    let next = cur
-                        .entry(key.clone())
-                        .or_insert_with(|| toml::Value::Table(toml::Table::new()))
-                        .as_table_mut()
-                        .ok_or_else(|| format!("{key} is not a table"))?;
-                    set(next, rest, value)
-                }
-                let mut trial = doc.clone();
-                set(&mut trial, &path, value)?;
-                match trial.clone().try_into::<Config>() {
-                    Ok(_) => Ok(trial),
-                    Err(e) => Err(e
-                        .to_string()
-                        .lines()
-                        .next()
-                        .unwrap_or("invalid")
-                        .to_string()),
-                }
-            };
-            // The TOML reading first, then the text itself: a key that takes text keeps a
-            // value that only looks like a number or boolean (a numeric bucket name, the
-            // `0` a duration documents as "off").
-            let literal = toml::Value::String(v.clone());
-            let applied = match v.parse::<toml::Value>() {
-                Ok(value) => apply(value).or_else(|why| apply(literal).map_err(|_| why)),
-                Err(_) => apply(literal),
-            };
-            match applied {
-                Ok(trial) => {
-                    doc = trial;
-                    touched = true;
-                }
-                Err(why) => ignored.push((k, why)),
-            }
-        }
-        // `[placement]` is a host fact set as a GROUP: any WALGIT__PLACEMENT__* override
-        // replaces the whole section (unset keys = the section's defaults), never
-        // merges with the baked file's. 2026-08-21 07:00Z: the image's toml carried
-        // the serverless host shape (serve_exclude = ["acme/monorepo"]); the SSD host's env set only
-        // MAINTAIN* and inherited the exclude — it refused its own repo for 12 min.
-        if let Some(toml::Value::Table(env_placement)) = env_placement_overrides(&doc, &vars_seen) {
-            let mut fresh: toml::Table =
-                toml::Table::try_from(PlacementConfig::default()).context("placement defaults")?;
-            for (k, v) in env_placement {
-                fresh.insert(k, v);
-            }
-            doc.insert("placement".into(), toml::Value::Table(fresh));
-            touched = true;
-        }
-        if touched {
-            *self = doc.try_into().context("applying WALGIT__ env overrides")?;
-        }
-        if let Some(port) = port_override {
-            self.server.listen.set_port(port);
-            // Standalone / `dev server`: public_url is the origin the browser hits. Keep its
-            // port in lockstep with PORT. A real public_url is left alone.
-            if let Some(u) = self.server.public_url.as_mut()
-                && origin_is_loopback(u)
-            {
-                *u = rewrite_origin_port(u, port);
-            }
-        }
-        Ok(ignored)
-    }
-
-    pub fn validate(&self) -> Result<()> {
+    fn validate(&self) -> Result<()> {
         self.refs.validate()?;
         self.packs.validate()?;
         anyhow::ensure!(
@@ -1177,7 +984,7 @@ impl Config {
             (1..=64).contains(&self.packfile_uri.max_uris_per_fetch),
             "packfile_uri.max_uris_per_fetch must be 1..=64"
         );
-        anyhow::ensure!(!self.store.bucket.is_empty(), "store.bucket must be set");
+        self.store.validate()?;
         let t = &self.server.tls;
         match t.mode {
             TlsMode::Files => anyhow::ensure!(
@@ -1325,17 +1132,18 @@ impl Config {
                 "server.auth.session_secret is required with oauth_client_id (it signs sessions and access tokens)"
             );
         }
-        anyhow::ensure!(self.wal.max_batch >= 1, "wal.max_batch must be >= 1");
+        self.wal.validate()?;
         if let Some(u) = &self.events.webhook_url {
             anyhow::ensure!(
                 u.starts_with("http://") || u.starts_with("https://"),
                 "events.webhook_url must be an http(s) URL"
             );
         }
-        self.events.nats.validate()?;
         Ok(())
     }
+}
 
+impl Config {
     /// Store prefix normalized to either "" or "something/".
     pub fn store_prefix(&self) -> String {
         let p = self.store.prefix.trim_matches('/');
@@ -1823,31 +1631,30 @@ webhook_secret = "s"
     }
 
     #[test]
-    fn events_nats_section_parses_and_validates() {
-        let d = Config::parse("").unwrap().events.nats;
-        assert_eq!((d.stream.as_str(), d.start), ("WALGIT_EVENTS", NatsStart::Oldest));
+    fn the_server_skips_events_nats_without_parsing_or_validating_it() {
         let c = Config::parse(
-            r#"
-[events.nats]
-urls = ["nats://a:4222", "nats://b:4222"]
-start = "head"
-subject_prefix = "acme.git"
-"#,
+            "[events]\nsweep_interval = \"1m\"\n[events.nats]\nurls = []\nnot_a_key = 1\n",
         )
         .unwrap();
-        assert_eq!(c.events.nats.start, NatsStart::Head);
-        assert_eq!(c.events.nats.urls.len(), 2);
-        for bad in [
-            "subject_prefix = \"a.*\"",
-            "subject_prefix = \"a..b\"",
-            "notify_subject = \"x.>\"",
-            "stream = \"a.b\"",
-            "queue_group = \"\"",
-            "urls = []",
-        ] {
-            let err = Config::parse(&format!("[events.nats]\n{bad}\n")).unwrap_err();
-            assert!(err.to_string().contains("events.nats"), "{bad}: {err}");
-        }
+        assert_eq!(c.events.sweep_interval, Duration::from_mins(1));
+        let err = Config::parse("[events]\nswep_interval = \"1m\"\n").unwrap_err();
+        assert!(format!("{err:#}").contains("swep_interval"), "{err:#}");
+    }
+
+    #[test]
+    fn the_server_skips_nats_env_overrides_silently() {
+        let mut c = Config::default();
+        let ignored = c
+            .apply_env_report(
+                vec![
+                    ("WALGIT__EVENTS__NATS__STREAM".to_string(), "X".to_string()),
+                    ("WALGIT__EVENTS__NOPE".to_string(), "1".to_string()),
+                ]
+                .into_iter(),
+            )
+            .unwrap();
+        assert_eq!(ignored.len(), 1, "{ignored:?}");
+        assert!(ignored[0].0.ends_with("NOPE"));
     }
 }
 

@@ -1,4 +1,4 @@
-//! What `walgit nats` needs from the stream it publishes into. The operator provisions the stream
+//! What `walgit-nats` needs from the stream it publishes into. The operator provisions the stream
 //! (`docs/EVENTS.md`); walgit only checks it, so it never needs the permission to create one.
 
 use std::fmt;

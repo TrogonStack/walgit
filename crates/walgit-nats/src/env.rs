@@ -1,4 +1,4 @@
-//! How `walgit nats` reaches NATS, read from the same `NATS_*` environment variables the `nats` CLI
+//! How `walgit-nats` reaches NATS, read from the same `NATS_*` environment variables the `nats` CLI
 //! reads and combined the way it combines them, so one shell environment drives both and secrets
 //! never sit in `walgit.toml`.
 
@@ -107,7 +107,7 @@ impl NatsEnv {
         for unsupported in [ENV_NATS_CONTEXT, ENV_NATS_SOCKS_PROXY] {
             anyhow::ensure!(
                 var(unsupported).is_none(),
-                "{unsupported} is set but walgit nats does not support it; unset it and use the other NATS_* variables"
+                "{unsupported} is set but walgit-nats does not support it; unset it and use the other NATS_* variables"
             );
         }
         let home = var("HOME");

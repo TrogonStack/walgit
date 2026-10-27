@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 
 use async_nats::jetstream;
 use futures::StreamExt;
-use walgit_config::{Config, NatsStart};
+use walgit_config::{Config, NatsConfig, NatsStart};
 use walgit_events::refs_from_entries;
 use walgit_git::{ObjectFormat, RepoId};
 use walgit_nats::env::NatsEnv;
@@ -29,6 +29,7 @@ const C: &str = "3333333333333333333333333333333333333333";
 
 struct Rig {
     cfg: Arc<Config>,
+    nats: NatsConfig,
     store: Arc<walgit_store::memory::MemoryStore>,
     registry: Arc<walgit_wal::Registry>,
     client: async_nats::Client,
@@ -56,18 +57,24 @@ impl Rig {
         let mut cfg = Config::default();
         cfg.store.backend = walgit_config::StoreBackend::Memory;
         cfg.cache.dir = cache.path().to_path_buf();
-        cfg.events.nats.urls = vec![nats.url.clone()];
-        cfg.events.nats.start = start;
         let cfg = Arc::new(cfg);
+        let mut nats_cfg = NatsConfig {
+            store: cfg.store.clone(),
+            cache: cfg.cache.clone(),
+            ..NatsConfig::default()
+        };
+        nats_cfg.events.nats.urls = vec![nats.url.clone()];
+        nats_cfg.events.nats.start = start;
         let store = Arc::new(walgit_store::memory::MemoryStore::new());
         let registry = walgit_wal::Registry::new(store.clone(), cfg.clone());
-        let client = walgit_nats::connect(&cfg.events.nats, &NatsEnv::default()).await.unwrap();
+        let client = walgit_nats::connect(&nats_cfg.events.nats, &NatsEnv::default()).await.unwrap();
         let js = jetstream::ContextBuilder::new()
             .timeout(Duration::from_secs(3))
             .build(client.clone());
-        let prefix = SubjectPrefix::new(&cfg.events.nats.subject_prefix).unwrap();
+        let prefix = SubjectPrefix::new(&nats_cfg.events.nats.subject_prefix).unwrap();
         Rig {
             cfg,
+            nats: nats_cfg,
             store,
             registry,
             client,
@@ -79,12 +86,12 @@ impl Rig {
     }
 
     async fn provision(&self) {
-        provision_stream(&self.js, &self.cfg.events.nats, self.window).await;
+        provision_stream(&self.js, &self.nats.events.nats, self.window).await;
     }
 
     /// A publisher with no memory of earlier ones, as after a restart.
     async fn publisher(&self, start: NatsStart) -> Arc<Publisher> {
-        let stream = walgit_nats::open_stream(&self.js, &self.cfg.events.nats, &self.prefix)
+        let stream = walgit_nats::open_stream(&self.js, &self.nats.events.nats, &self.prefix)
             .await
             .unwrap();
         Publisher::new(
@@ -96,22 +103,22 @@ impl Rig {
         )
     }
 
-    /// What `walgit nats` runs: its own registry over the same store (it never sees the
+    /// What `walgit-nats` runs: its own registry over the same store (it never sees the
     /// writer's pushes except through the bucket) on the operator's `[wal]` settings, as
     /// `run` adapts them. Returns the registry's cache dir guard too.
     async fn operator_publisher(
         &self,
-        operator: impl FnOnce(&mut Config),
+        operator: impl FnOnce(&mut NatsConfig),
     ) -> (Arc<Publisher>, Arc<walgit_wal::Registry>, tempfile::TempDir) {
         let cache = tempfile::tempdir().unwrap();
-        let mut cfg = (*self.cfg).clone();
+        let mut cfg = self.nats.clone();
         cfg.cache.dir = cache.path().to_path_buf();
         operator(&mut cfg);
         let registry = walgit_wal::Registry::new(
             self.store.clone(),
             Arc::new(walgit_nats::publisher_config(&cfg)),
         );
-        let stream = walgit_nats::open_stream(&self.js, &self.cfg.events.nats, &self.prefix)
+        let stream = walgit_nats::open_stream(&self.js, &self.nats.events.nats, &self.prefix)
             .await
             .unwrap();
         let publisher = Publisher::new(
@@ -208,7 +215,7 @@ impl Rig {
     }
 
     async fn spawn_notify(&self, publisher: &Arc<Publisher>) -> tokio::task::JoinHandle<anyhow::Result<()>> {
-        let nats_cfg = &self.cfg.events.nats;
+        let nats_cfg = &self.nats.events.nats;
         let sub = walgit_nats::wake::subscribe(
             &self.client,
             nats_cfg.notify_subject.clone(),
@@ -224,7 +231,7 @@ impl Rig {
     }
 
     async fn spawn_service(&self, publisher: &Arc<Publisher>) -> tokio::task::JoinHandle<anyhow::Result<()>> {
-        let queue_group = &self.cfg.events.nats.queue_group;
+        let queue_group = &self.nats.events.nats.queue_group;
         let registered =
             walgit_nats::service::register(&self.client, &self.prefix, queue_group, publisher)
                 .await
@@ -234,14 +241,14 @@ impl Rig {
 
     async fn notify(&self, body: &str) {
         self.client
-            .publish(self.cfg.events.nats.notify_subject.clone(), body.to_string().into())
+            .publish(self.nats.events.nats.notify_subject.clone(), body.to_string().into())
             .await
             .unwrap();
     }
 
     async fn stream(&self) -> jetstream::stream::Stream {
         self.js
-            .get_stream(&self.cfg.events.nats.stream)
+            .get_stream(&self.nats.events.nats.stream)
             .await
             .unwrap()
     }
@@ -418,7 +425,7 @@ async fn notifications_and_the_service_api_wake_the_publisher() {
     rig.registry.create(&id, ObjectFormat::Sha1).await.unwrap();
     let publisher = rig.publisher(NatsStart::Oldest).await;
 
-    let nats_cfg = &rig.cfg.events.nats;
+    let nats_cfg = &rig.nats.events.nats;
     let notify = rig.spawn_notify(&publisher).await;
     let service = rig.spawn_service(&publisher).await;
 
@@ -625,7 +632,7 @@ async fn a_wiped_stream_is_republished_on_the_next_catch_up() {
     assert_eq!(rig.message_count().await, 0, "PINNED: a purge inside the window loses the republish");
 
     // Deleted: nothing to publish into (an error, not a silent skip) ...
-    rig.js.delete_stream(&rig.cfg.events.nats.stream).await.unwrap();
+    rig.js.delete_stream(&rig.nats.events.nats.stream).await.unwrap();
     assert!(publisher.catch_up(&id).await.is_err());
     // ... and recreated, the window is republished again.
     rig.provision().await;
@@ -774,7 +781,7 @@ async fn notifications_that_name_nothing_are_ignored_and_the_loop_survives() {
     ] {
         rig.notify(body).await;
     }
-    rig.client.publish(rig.cfg.events.nats.notify_subject.clone(), vec![0xff, 0xfe, 0x00].into()).await.unwrap();
+    rig.client.publish(rig.nats.events.nats.notify_subject.clone(), vec![0xff, 0xfe, 0x00].into()).await.unwrap();
     rig.client.flush().await.unwrap();
     tokio::time::sleep(Duration::from_secs(1)).await;
     assert!(!notify.is_finished(), "the notify loop must survive garbage");
@@ -1098,7 +1105,7 @@ async fn the_publisher_never_prefetches_packs_whatever_the_operator_configured()
 async fn a_missing_stream_fails_clearly_and_is_never_created() {
     let Some(nats) = start_nats().await else { return };
     let rig = Rig::unprovisioned(&nats, NatsStart::Oldest, Duration::from_hours(1)).await;
-    let err = walgit_nats::open_stream(&rig.js, &rig.cfg.events.nats, &rig.prefix).await.unwrap_err();
+    let err = walgit_nats::open_stream(&rig.js, &rig.nats.events.nats, &rig.prefix).await.unwrap_err();
     let text = format!("{err:#}");
     assert!(
         text.contains("WALGIT_EVENTS") && text.contains("never creates it"),
@@ -1121,7 +1128,7 @@ async fn a_misshapen_stream_fails_at_boot_and_is_never_altered() {
         .await
         .unwrap();
 
-    let err = walgit_nats::open_stream(&rig.js, &rig.cfg.events.nats, &rig.prefix).await.unwrap_err();
+    let err = walgit_nats::open_stream(&rig.js, &rig.nats.events.nats, &rig.prefix).await.unwrap_err();
     let text = format!("{err:#}");
     assert!(
         text.contains("WALGIT_EVENTS")
@@ -1148,7 +1155,7 @@ async fn an_existing_stream_with_other_settings_is_reused_not_clobbered() {
     };
     rig.js.create_stream(existing).await.unwrap();
 
-    let stream = walgit_nats::open_stream(&rig.js, &rig.cfg.events.nats, &rig.prefix)
+    let stream = walgit_nats::open_stream(&rig.js, &rig.nats.events.nats, &rig.prefix)
         .await
         .unwrap();
     let config = stream.cached_info().config.clone();

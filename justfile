@@ -149,8 +149,12 @@ sim:
 
 # Standalone CLI/server against memory; add WALGIT_TEST_S3_ENDPOINT for the local rig.
 smoke:
-    {{t15}} cargo build -p walgit-cli
-    WALGIT="$(realpath "${CARGO_TARGET_DIR:-target}/debug/walgit")" {{t15}} tests/e2e.sh
+    {{t15}} cargo build -p walgit-cli -p walgit-nats
+    WALGIT="$(realpath "${CARGO_TARGET_DIR:-target}/debug/walgit")" WALGIT_NATS="$(realpath "${CARGO_TARGET_DIR:-target}/debug/walgit-nats")" {{t15}} tests/e2e.sh
+
+# Build the OCI image of one binary (walgit or walgit-nats) with podman; the Containerfile has a target per binary.
+image target="walgit":
+    podman build --target {{target}} -t {{target}} -f Containerfile .
 
 # Slow tier: #[ignore]d benches/soaks (20k-ref push, 466k-ref render, ...).
 test-slow:

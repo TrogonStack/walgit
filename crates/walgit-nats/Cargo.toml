@@ -4,12 +4,19 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[[bin]]
+name = "walgit-nats"
+path = "src/bin/walgit-nats.rs"
+
 [dependencies]
 walgit-events.workspace = true
 walgit-config.workspace = true
 walgit-store.workspace = true
 walgit-git.workspace = true
 walgit-wal.workspace = true
+walgit-telemetry.workspace = true
+clap.workspace = true
+mimalloc.workspace = true
 async-nats.workspace = true
 nkeys.workspace = true
 percent-encoding.workspace = true

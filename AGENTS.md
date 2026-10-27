@@ -495,6 +495,22 @@ full cold-read/resource acceptance gates listed in `docs/spec/README.md`.
   crate shared with the webhook bridge, whose bucket cursor (`events/cursor.json`) is unchanged. Wake-ups
   arrive over NATS and the periodic sweep stays the backstop; the service API is the NATS micro protocol, no HTTP.
 
+- **D51 (2026-10-27): The JetStream sink ships as its own `walgit-nats` binary.** This amends D9's one-binary
+  rule for this sink only: it carries no HTTP server or web UI and depends on neither `walgit-server` nor
+  `walgit-cli`. It shares config loading and telemetry with the other binaries through `walgit-telemetry`, and
+  reads the same `walgit.toml` as serve or a smaller file holding only the sections it uses (`docs/EVENTS.md`).
+
+- **D52 (2026-10-27): Each binary owns its configuration type, over one `walgit.toml` and one `WALGIT__` prefix.**
+  `walgit-nats` loads `walgit_config::NatsConfig` (`[store]`, `[cache]`, `[wal]`, `[telemetry]`, and under
+  `[events]` only `sweep_interval` and `[events.nats]`); the server keeps `Config`. Both implement
+  `walgit_config::Settings`, which lists the key paths another binary owns (`FOREIGN`). Those are dropped from the
+  parsed file and from `WALGIT__` overrides before the typed parse, so there is no dead field and no shim, a shared
+  file works for both, an invalid `[server.auth]` cannot stop `walgit-nats`, and the server no longer validates
+  `[events.nats]`. Sections a binary reads keep `deny_unknown_fields`, so typos there still fail. Overrides for a
+  foreign section are skipped without a warning because one environment legitimately configures both binaries.
+  `walgit-telemetry` takes `&TelemetryConfig` and any `Settings`, not the server `Config`. The registry's full
+  `Config` is built from `NatsConfig` in `walgit_nats::publisher_config`.
+
 ## 5. Working rules
 
 - **No backwards compatibility (pre-1.0, banner at top):** change the shape and delete the old one in the same

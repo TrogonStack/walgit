@@ -1,7 +1,7 @@
 // Test fixtures use panics to fail the test, including shared helper functions.
 #![allow(clippy::indexing_slicing, clippy::unwrap_used)]
 
-//! Events (docs/EVENTS.md, `walgit nats`): real `git push`es against the harness server, published
+//! Events (docs/EVENTS.md, `walgit-nats`): real `git push`es against the harness server, published
 //! into a real `nats-server -js` by a `walgit_nats` publisher over the same registry. Skips (passes)
 //! when `nats-server` is not on PATH.
 mod harness;

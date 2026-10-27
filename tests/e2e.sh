@@ -14,8 +14,9 @@
 #   tests/e2e.sh
 #   WALGIT_TEST_S3_ENDPOINT=http://localhost:9000 tests/e2e.sh
 #   WALGIT=/absolute/path/to/freshly/built/walgit tests/e2e.sh
+#   WALGIT_NATS=/absolute/path/to/freshly/built/walgit-nats (phase 3; default target/release/walgit-nats)
 #
-# Phase 3 (S3/rustfs plus `nats-server` and the `nats` CLI on PATH): `walgit nats` as a process next to
+# Phase 3 (S3/rustfs plus `nats-server` and the `nats` CLI on PATH): `walgit-nats` as a process next to
 # `walgit serve`; real pushes become JetStream events; a restart republishes nothing; wake-ups work.
 #
 # Requires: cargo, git, curl, python3 (for random port), ripgrep (S3 maintenance receipt).
@@ -25,6 +26,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 WALGIT="${WALGIT:-}"
+WALGIT_NATS="${WALGIT_NATS:-}"
 
 # --- helpers -----------------------------------------------------------------
 
@@ -71,8 +73,11 @@ step "e2e: walgit end-to-end test"
 
 if [[ -z "$WALGIT" ]]; then
     step "building walgit (release)..."
-    (cd "$ROOT" && cargo build -p walgit-cli --release)
+    (cd "$ROOT" && cargo build -p walgit-cli -p walgit-nats --release)
     WALGIT="$ROOT/target/release/walgit"
+fi
+if [[ -z "$WALGIT_NATS" ]]; then
+    WALGIT_NATS="$ROOT/target/release/walgit-nats"
 fi
 [[ -x "$WALGIT" ]] || fail "WALGIT must name an executable built from this checkout"
 
@@ -348,17 +353,19 @@ EOF
     kill "$SERVER_A_PID" "$SERVER_B_PID" 2>/dev/null || true
 fi
 
-# --- phase 3: `walgit nats` as processes (optional, local only) --------------
+# --- phase 3: `walgit-nats` as processes (optional, local only) --------------
 
-# Real processes end to end: nats-server -js, `walgit serve` and `walgit nats` sharing the rustfs
-# bucket, real git pushes, assertions through the `nats` CLI. The first walgit nats is woken by the
+# Real processes end to end: nats-server -js, `walgit serve` and `walgit-nats` sharing the rustfs
+# bucket, real git pushes, assertions through the `nats` CLI. The first walgit-nats is woken by the
 # sweep (and one notification); after a kill and restart the sweep is off, so a push there can only
 # arrive through the notify subject.
 if [[ -z "${WALGIT_E2E_BASE_URL:-}" && -n "${WALGIT_TEST_S3_ENDPOINT:-}" ]]; then
     if ! command -v nats-server >/dev/null 2>&1 || ! command -v nats >/dev/null 2>&1; then
-        step "phase 3: walgit nats (skipped: nats-server and the nats CLI must be on PATH)"
+        step "phase 3: walgit-nats (skipped: nats-server and the nats CLI must be on PATH)"
+    elif [[ ! -x "$WALGIT_NATS" ]]; then
+        fail "phase 3 needs the walgit-nats binary: build it (cargo build -p walgit-nats --release) or set WALGIT_NATS"
     else
-        step "phase 3: walgit nats against nats-server -js ($WALGIT_TEST_S3_ENDPOINT)"
+        step "phase 3: walgit-nats against nats-server -js ($WALGIT_TEST_S3_ENDPOINT)"
         export AWS_ACCESS_KEY_ID="${AWS_ACCESS_KEY_ID:-walgit-dev}" AWS_SECRET_ACCESS_KEY="${AWS_SECRET_ACCESS_KEY:-walgit-dev-secret}"
 
         NATS_PORT="$(rand_port)"
@@ -436,15 +443,15 @@ print(m["subject"], body["action"], body["ref_type"], body["ref_name"], body["_w
             local log="$1"; shift
             : > "$log"
             RUST_LOG=info env "WALGIT__CACHE__DIR=$TMP/cache-nats-pub" "$@" \
-                "$WALGIT" --config "$TMP/cfg-nats.toml" nats > "$log" 2>&1 &
+                "$WALGIT_NATS" --config "$TMP/cfg-nats.toml" > "$log" 2>&1 &
             NATS_PUB_PID=$!
             PIDS+=("$NATS_PUB_PID")
             for ((i=0; i<30; i++)); do
-                kill -0 "$NATS_PUB_PID" 2>/dev/null || { cat "$log"; fail "walgit nats exited"; }
+                kill -0 "$NATS_PUB_PID" 2>/dev/null || { cat "$log"; fail "walgit-nats exited"; }
                 grep -q "service ready" "$log" && return 0
                 sleep 1
             done
-            cat "$log"; fail "walgit nats did not become ready"
+            cat "$log"; fail "walgit-nats did not become ready"
         }
 
         RUST_LOG=info env "WALGIT__CACHE__DIR=$TMP/cache-nats-serve" \
@@ -453,7 +460,7 @@ print(m["subject"], body["action"], body["ref_type"], body["ref_name"], body["_w
         PIDS+=("$SERVER_N_PID")
         wait_http "$BASE_N/healthz" 15 || fail "walgit serve (nats phase) not ready"
         start_walgit_nats "$TMP/walgit-nats-1.log"
-        pass "walgit serve on $PORT_N and walgit nats ready"
+        pass "walgit serve on $PORT_N and walgit-nats ready"
 
         curl_auth -sf -X PUT "$BASE_N/$REPO3.git" -o /dev/null || fail "create $REPO3"
         git clone -q "$SYNTH_DIR" "$TMP/work-nats"
@@ -480,7 +487,7 @@ print(m["subject"], body["action"], body["ref_type"], body["ref_name"], body["_w
         [[ "$(echo "$EVENTS" | sed -n 4p)" == "$SUBJECT3 delete tag refs/tags/v1.0.0 4 $REPO3:4:refs/tags/v1.0.0" ]] || fail "event 4"
         pass "create, update, tag create and delete on $SUBJECT3, in WAL order"
 
-        step "nats: kill walgit nats, restart (sweep off): no duplicates, a new push arrives by notification"
+        step "nats: kill walgit-nats, restart (sweep off): no duplicates, a new push arrives by notification"
         kill "$NATS_PUB_PID" 2>/dev/null || true
         wait "$NATS_PUB_PID" 2>/dev/null || true
         start_walgit_nats "$TMP/walgit-nats-2.log" WALGIT__EVENTS__SWEEP_INTERVAL=0s
@@ -508,20 +515,20 @@ r = json.load(sys.stdin)
 assert r["repo"] == sys.argv[1] and r["head_seq"] == 5 and r["emitted"] == 0, r' "$REPO3" || fail "catch-up report"
         pass "catch-up reports head 5, nothing to emit"
 
-        step "nats: SIGTERM makes walgit nats exit 0 promptly"
+        step "nats: SIGTERM makes walgit-nats exit 0 promptly"
         kill -TERM "$NATS_PUB_PID"
         for ((i=0; i<50; i++)); do
             kill -0 "$NATS_PUB_PID" 2>/dev/null || break
             sleep 0.1
         done
         if kill -0 "$NATS_PUB_PID" 2>/dev/null; then
-            cat "$TMP/walgit-nats-2.log"; fail "walgit nats still running 5s after SIGTERM"
+            cat "$TMP/walgit-nats-2.log"; fail "walgit-nats still running 5s after SIGTERM"
         fi
         NATS_RC=0
         wait "$NATS_PUB_PID" 2>/dev/null || NATS_RC=$?
-        [[ "$NATS_RC" -eq 0 ]] || { cat "$TMP/walgit-nats-2.log"; fail "walgit nats exited $NATS_RC after SIGTERM"; }
+        [[ "$NATS_RC" -eq 0 ]] || { cat "$TMP/walgit-nats-2.log"; fail "walgit-nats exited $NATS_RC after SIGTERM"; }
         grep -q "shutting down" "$TMP/walgit-nats-2.log" || fail "no shutdown line after SIGTERM"
-        pass "SIGTERM: walgit nats exited 0 within 5s"
+        pass "SIGTERM: walgit-nats exited 0 within 5s"
 
         kill "$SERVER_N_PID" 2>/dev/null || true
         curl_auth -s -X DELETE "$BASE_N/$REPO3.git" -o /dev/null || true

@@ -121,6 +121,9 @@ with its reasoning, the invariants, and the cost model (round trips to the bucke
 # build (needs rust per rust-toolchain.toml, protoc, node 24 + pnpm for the web UI)
 just web-build && cargo build --release -p walgit-cli
 # or: nix build .#walgit        or: podman build -t walgit -f Containerfile .
+# the JetStream sink is its own binary and image, without the web UI:
+#     cargo build --release -p walgit-nats
+# or: nix build .#walgit-nats   or: podman build --target walgit-nats -t walgit-nats -f Containerfile .
 
 # one box, TLS by walgit itself, a local S3 store (rustfs in a container)
 just dev-store
@@ -130,8 +133,9 @@ open https://walgit.localhost:8080/
 
 * `walgit.standalone.toml` — the one-machine shape (self-signed TLS, rustfs, every role). Start here.
 * `walgit.example.toml` — every key with its default and a comment.
-* `Containerfile`, `flake.nix` — an OCI image and a Nix package/devshell. Every green push to `main` publishes
-  that image to `ghcr.io/<owner>/walgit` as `canary` (moving) and `sha-<40>` (immutable: what a rollback pins to).
+* `Containerfile`, `flake.nix`: one OCI image per binary (`walgit`, the default target, and `walgit-nats`) and the
+  matching Nix packages and devshell. Every green push to `main` publishes the `walgit` image to
+  `ghcr.io/<owner>/walgit` as `canary` (moving) and `sha-<40>` (immutable: what a rollback pins to).
 * `deploy/nginx.conf.example` — an optional nginx in front: public TLS, one `auth_request` per credential, and
   **byte offload**: walgit answers LFS downloads with `X-Accel-Redirect` and nginx streams + caches the
   object from the bucket itself (S3 presigned or GCS with walgit's bearer). The file documents the contract.
