@@ -16,7 +16,7 @@ use std::sync::Arc;
 
 use anyhow::Context;
 use async_nats::jetstream::{self, stream};
-use walgit_config::{Config, NatsEventsConfig};
+use walgit_config::{Config, NatsConfig, NatsEventsConfig};
 
 use crate::env::{NatsEnv, Servers};
 use crate::publisher::Publisher;
@@ -84,26 +84,35 @@ async fn shutdown_signal() {
     let _ = tokio::signal::ctrl_c().await;
 }
 
-/// The config the publisher's registry runs on. This process never applies a push itself, so a
-/// wake-up must always see the manifest as it is in the bucket (`freshness_ttl` would let it
+/// The full config the publisher's registry runs on, built from the sections this binary reads
+/// (the rest stay at their defaults, never consulted). This process never applies a push itself,
+/// so a wake-up must always see the manifest as it is in the bucket (`freshness_ttl` would let it
 /// skip the GET and miss the push it was woken for), and it only reads manifest and log, so
 /// pack prefetch would pull bytes nobody reads. Both hold whatever `[wal]` says. Its local copies
 /// live under `<cache.dir>/.nats` (no repository owner starts with `.`), so a `walgit serve` on the
 /// same `walgit.toml` never shares a working directory with it.
-pub fn publisher_config(cfg: &Config) -> Config {
-    let mut cfg = cfg.clone();
-    cfg.wal.freshness_ttl = std::time::Duration::ZERO;
-    cfg.wal.prefetch_packs = false;
-    cfg.cache.dir = cfg.cache.dir.join(".nats");
-    cfg
+pub fn publisher_config(cfg: &NatsConfig) -> Config {
+    let mut registry = Config {
+        store: cfg.store.clone(),
+        cache: cfg.cache.clone(),
+        wal: cfg.wal.clone(),
+        telemetry: cfg.telemetry.clone(),
+        ..Config::default()
+    };
+    registry.wal.freshness_ttl = std::time::Duration::ZERO;
+    registry.wal.prefetch_packs = false;
+    registry.cache.dir = registry.cache.dir.join(".nats");
+    registry
 }
 
 /// `walgit-nats`: publish until SIGTERM/ctrl-c, or fail when a worker stops.
-pub async fn run(cfg: Arc<Config>) -> anyhow::Result<()> {
+pub async fn run(cfg: NatsConfig) -> anyhow::Result<()> {
     let nats = &cfg.events.nats;
     let prefix = SubjectPrefix::new(&nats.subject_prefix)?;
-    let store = walgit_store::open_store(&cfg).await?;
-    let registry = walgit_wal::Registry::new(store, Arc::new(publisher_config(&cfg)));
+    let registry_cfg = Arc::new(publisher_config(&cfg));
+    let store = walgit_store::open_store(&registry_cfg).await?;
+    let store_prefix = registry_cfg.store_prefix();
+    let registry = walgit_wal::Registry::new(store, registry_cfg);
 
     let client = crate::connect(nats, &NatsEnv::from_process_env()?).await?;
     let js = async_nats::jetstream::new(client.clone());
@@ -116,7 +125,7 @@ pub async fn run(cfg: Arc<Config>) -> anyhow::Result<()> {
     tracing::info!(stream = %nats.stream, prefix = %prefix, start = ?nats.start, "walgit-nats ready");
 
     let mut tasks = tokio::task::JoinSet::new();
-    tasks.spawn(crate::wake::notify_loop(sub, cfg.store_prefix(), publisher.clone()));
+    tasks.spawn(crate::wake::notify_loop(sub, store_prefix, publisher.clone()));
     tasks.spawn(crate::service::serve(registered, publisher.clone()));
     tasks.spawn({
         let publisher = publisher.clone();
@@ -147,10 +156,27 @@ mod tests {
     #[test]
     fn the_publisher_never_shares_local_copies_with_serve() {
         let serve = Config::default();
+        let nats_cfg = NatsConfig { cache: serve.cache.clone(), ..NatsConfig::default() };
         let repo = walgit_git::RepoId::new("acme", "repo").unwrap();
-        let nats = publisher_config(&serve);
+        let nats = publisher_config(&nats_cfg);
         assert_eq!(nats.cache.dir, serve.cache.dir.join(".nats"));
         assert_ne!(repo.local_dir(&nats.cache.dir), repo.local_dir(&serve.cache.dir));
         assert!(walgit_git::RepoId::new(".nats", "repo").is_err(), "no owner can claim the directory");
+    }
+
+    #[test]
+    fn the_registry_config_keeps_what_the_operator_set_and_adapts_the_rest() {
+        let mut cfg = NatsConfig::default();
+        cfg.store.bucket = "acme".into();
+        cfg.store.prefix = "p".into();
+        cfg.wal.freshness_ttl = std::time::Duration::from_mins(10);
+        cfg.wal.prefetch_packs = true;
+        cfg.wal.max_batch = 3;
+        let registry = publisher_config(&cfg);
+        assert_eq!(registry.store_prefix(), "p/");
+        assert_eq!(registry.store.bucket, "acme");
+        assert_eq!(registry.wal.max_batch, 3);
+        assert_eq!(registry.wal.freshness_ttl, std::time::Duration::ZERO);
+        assert!(!registry.wal.prefetch_packs);
     }
 }

@@ -123,8 +123,21 @@ sweep_interval = "5m"
 server and no web UI. The webhook bridge is unchanged and the two can run side by side.
 Like the bridge it is a reader of the WAL, never a step of a push (D32). It keeps its local copies under
 `<cache.dir>/.nats`, so it can share a `walgit.toml` and a host with `walgit serve` without touching serve's.
-`--config` (or `WALGIT_CONFIG`) may name that same file, or a second, smaller one holding only `[store]`,
-`[cache]`, `[wal]`, `[events]` and `[telemetry]`.
+`--config` (or `WALGIT_CONFIG`) may name that same file, or a second, smaller one.
+
+**Which binary reads which sections.** Both binaries read one `walgit.toml` and the same `WALGIT__` environment
+overrides, and each parses and validates only what it reads; the rest is skipped, not rejected. A typo inside a
+section a binary reads still fails it.
+
+| Binary | Reads | Skips |
+|---|---|---|
+| `walgit serve` / `walgit-server` | every section, `[events]` `webhook_url`, `webhook_secret`, `sweep_interval` | `[events.nats]` |
+| `walgit-nats` | `[store]`, `[cache]`, `[wal]`, `[telemetry]`, `[events]` `sweep_interval`, `[events.nats]` | `[server]`, `[packs]`, `[refs]`, `[packfile_uri]`, `[maintenance]`, `[placement]`, `[lfs]`, `[git]`, `[upstream]`, `[events]` `webhook_url` and `webhook_secret` |
+
+So an invalid `[server.auth]` does not stop `walgit-nats`, and a bad `[events.nats]` does not stop the server.
+A `WALGIT__` variable for a section the binary skips (`WALGIT__SERVER__LISTEN` for `walgit-nats`,
+`WALGIT__EVENTS__NATS__STREAM` for the server) is skipped without a warning, so one environment can configure
+both; a key unknown to both is still warned about.
 
 - **The operator provisions the stream; `walgit-nats` never creates it**, so its credentials need no
   stream-admin permission, only stream info and message reads on the stream and publishes on its subjects.
@@ -186,7 +199,8 @@ Like the bridge it is a reader of the WAL, never a step of a push (D32). It keep
   collides with the old incarnation's events.
 - **Config adaptation.** `walgit-nats` always revalidates the manifest (`wal.freshness_ttl` is forced to zero) and
   never prefetches packs (`wal.prefetch_packs` is forced off), whatever `[wal]` says, because it never applies a
-  push itself and only reads manifest and log (`walgit_nats::publisher_config`).
+  push itself and only reads manifest and log (`walgit_nats::publisher_config`, which builds the registry's
+  config from `walgit_config::NatsConfig`).
 - **Cost.** Every wake-up for a repository reads the last message on its subject (one JetStream request) before
   deciding there is nothing to do, so a wiped stream is noticed without a restart.
 

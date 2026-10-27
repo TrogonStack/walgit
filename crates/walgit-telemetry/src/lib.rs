@@ -53,7 +53,7 @@ use tracing_subscriber::{
     registry::LookupSpan,
 };
 
-use walgit_config::{Config, LogFormat};
+use walgit_config::{LogFormat, Settings, TelemetryConfig};
 
 // ---------------------------------------------------------------------------
 // Project ID resolution
@@ -61,8 +61,8 @@ use walgit_config::{Config, LogFormat};
 
 /// Resolve the GCP project id for trace correlation.
 /// Priority: config → `GOOGLE_CLOUD_PROJECT` env → metadata server → None.
-fn resolve_project_id(cfg: &Config) -> Option<String> {
-    if let Some(p) = &cfg.telemetry.trace_project {
+fn resolve_project_id(cfg: &TelemetryConfig) -> Option<String> {
+    if let Some(p) = &cfg.trace_project {
         return Some(p.clone());
     }
     if let Ok(p) = std::env::var("GOOGLE_CLOUD_PROJECT")
@@ -510,7 +510,7 @@ static PROJECT_ID: OnceLock<Option<String>> = OnceLock::new();
 /// * `log_filter` is the default `EnvFilter`; `RUST_LOG` overrides it entirely.
 /// * When JSON, installs a [`CloudLoggingLayer`] that emits structured JSON
 ///   with Cloud Logging trace correlation and span-close performance lines.
-pub fn tracing_init(cfg: &Config) {
+pub fn tracing_init(cfg: &TelemetryConfig) {
     use tracing_subscriber::prelude::*;
     // Idempotent: tests (and anything else) may call this more than once per process.
     static INIT: OnceLock<()> = OnceLock::new();
@@ -519,13 +519,13 @@ pub fn tracing_init(cfg: &Config) {
     }
 
     let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new(&cfg.telemetry.log_filter));
+        .unwrap_or_else(|_| EnvFilter::new(&cfg.log_filter));
 
     let project_id = PROJECT_ID.get_or_init(|| resolve_project_id(cfg));
 
     let registry = tracing_subscriber::registry().with(filter);
 
-    match cfg.telemetry.log_format {
+    match cfg.log_format {
         LogFormat::Json => {
             let cloud_layer = CloudLoggingLayer::new(project_id.clone());
             registry.with(cloud_layer).init();
@@ -545,21 +545,21 @@ pub const BUILD_SHA: &str = env!("WALGIT_BUILD_SHA");
 /// The start every walgit binary shares: load `config` (missing file exits 2, unreadable exits 1,
 /// `--config /dev/null` for defaults + `WALGIT__` env), install the rustls crypto provider and
 /// initialise tracing from `[telemetry]`. `bin` names the running binary in messages.
-pub fn startup(config: &std::path::Path, bin: &str) -> Config {
+pub fn startup<C: Settings>(config: &std::path::Path, bin: &str) -> C {
     // Install the rustls crypto provider before any TLS code runs (GCS gRPC, reqwest).
     // Required for rustls 0.23+: multiple providers in the dep tree; select one.
     rustls::crypto::aws_lc_rs::default_provider()
         .install_default()
         .expect("install rustls aws_lc_rs provider");
 
-    let cfg = load_config(config, bin);
-    tracing_init(&cfg);
+    let cfg: C = load_config(config, bin);
+    tracing_init(cfg.telemetry());
     cfg
 }
 
-fn load_config(path: &std::path::Path, bin: &str) -> Config {
+fn load_config<C: Settings>(path: &std::path::Path, bin: &str) -> C {
     if path.exists() {
-        match Config::load(path) {
+        match C::load(path) {
             Ok(c) => c,
             Err(e) => {
                 eprintln!("{bin}: error loading config from {}: {e:#}", path.display());
