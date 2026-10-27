@@ -17,7 +17,7 @@ use walgit_nats::env::NatsEnv;
 use walgit_nats::message::EventMessage;
 use walgit_nats::publisher::Publisher;
 use walgit_nats::subject::{RepoSubject, SubjectPrefix};
-use walgit_nats::testing::{NatsServer, start_nats};
+use walgit_nats::testing::{NatsServer, provision_stream, start_nats};
 use walgit_proto::v1::{RefTransaction, RefUpdate};
 use async_nats::jetstream::message::PublishMessage;
 
@@ -33,25 +33,30 @@ struct Rig {
     client: async_nats::Client,
     js: jetstream::Context,
     prefix: SubjectPrefix,
+    window: Duration,
     _cache: tempfile::TempDir,
 }
 
 impl Rig {
     async fn new(nats: &NatsServer, start: NatsStart) -> Self {
-        Self::with_window(nats, start, None).await
+        Self::with_window(nats, start, Duration::from_hours(1)).await
     }
 
-    /// `window`: the stream's `duplicate_window` (default: the config's one hour).
-    async fn with_window(nats: &NatsServer, start: NatsStart, window: Option<Duration>) -> Self {
+    /// `window`: the provisioned stream's `duplicate_window`.
+    async fn with_window(nats: &NatsServer, start: NatsStart, window: Duration) -> Self {
+        let rig = Self::unprovisioned(nats, start, window).await;
+        rig.provision().await;
+        rig
+    }
+
+    /// A rig whose stream the test provisions itself.
+    async fn unprovisioned(nats: &NatsServer, start: NatsStart, window: Duration) -> Self {
         let cache = tempfile::tempdir().unwrap();
         let mut cfg = Config::default();
         cfg.store.backend = walgit_config::StoreBackend::Memory;
         cfg.cache.dir = cache.path().to_path_buf();
         cfg.events.nats.urls = vec![nats.url.clone()];
         cfg.events.nats.start = start;
-        if let Some(window) = window {
-            cfg.events.nats.duplicate_window = window;
-        }
         let cfg = Arc::new(cfg);
         let store = Arc::new(walgit_store::memory::MemoryStore::new());
         let registry = walgit_wal::Registry::new(store.clone(), cfg.clone());
@@ -67,8 +72,13 @@ impl Rig {
             client,
             js,
             prefix,
+            window,
             _cache: cache,
         }
+    }
+
+    async fn provision(&self) {
+        provision_stream(&self.js, &self.cfg.events.nats, self.window).await;
     }
 
     /// A publisher with no memory of earlier ones, as after a restart.
@@ -469,7 +479,7 @@ async fn after_the_dedup_window_a_republish_lands_twice() {
     // At-least-once, documented: JetStream only dedups inside `duplicate_window`, so a consumer
     // must dedup on (repo, _walgit.seq, ref_name) itself.
     let Some(nats) = start_nats().await else { return };
-    let rig = Rig::with_window(&nats, NatsStart::Oldest, Some(Duration::from_millis(200))).await;
+    let rig = Rig::with_window(&nats, NatsStart::Oldest, Duration::from_millis(200)).await;
     let id = repo_with_three_events(&rig, "t", "r").await;
     assert_eq!(rig.publisher(NatsStart::Oldest).await.catch_up(&id).await.unwrap().emitted, 3);
     rig.inject(&id, 2, "refs/heads/not-in-the-entry").await;
@@ -512,7 +522,7 @@ async fn a_wiped_stream_is_republished_on_the_next_catch_up() {
     rig.js.delete_stream(&rig.cfg.events.nats.stream).await.unwrap();
     assert!(publisher.catch_up(&id).await.is_err());
     // ... and recreated, the window is republished again.
-    walgit_nats::open_stream(&rig.js, &rig.cfg.events.nats, &rig.prefix).await.unwrap();
+    rig.provision().await;
     let r = publisher.catch_up(&id).await.unwrap();
     assert_eq!(r.emitted, 3, "a recreated stream is republished: {r:?}");
     assert_eq!(rig.ids().await, original);
@@ -525,7 +535,7 @@ async fn a_wiped_stream_is_republished_on_the_next_catch_up() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_purged_stream_heals_once_the_dedup_window_has_passed() {
     let Some(nats) = start_nats().await else { return };
-    let rig = Rig::with_window(&nats, NatsStart::Oldest, Some(Duration::from_millis(200))).await;
+    let rig = Rig::with_window(&nats, NatsStart::Oldest, Duration::from_millis(200)).await;
     let id = repo_with_three_events(&rig, "t", "r").await;
     let publisher = rig.publisher(NatsStart::Oldest).await;
     assert_eq!(publisher.catch_up(&id).await.unwrap().emitted, 3);
@@ -785,29 +795,57 @@ async fn the_publisher_never_prefetches_packs_whatever_the_operator_configured()
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_missing_stream_with_ensure_stream_off_fails_clearly_and_creates_nothing() {
+async fn a_missing_stream_fails_clearly_and_is_never_created() {
     let Some(nats) = start_nats().await else { return };
-    let rig = Rig::new(&nats, NatsStart::Oldest).await;
-    let mut cfg = rig.cfg.events.nats.clone();
-    cfg.ensure_stream = false;
-    let err = walgit_nats::open_stream(&rig.js, &cfg, &rig.prefix).await.unwrap_err();
+    let rig = Rig::unprovisioned(&nats, NatsStart::Oldest, Duration::from_hours(1)).await;
+    for verify in [true, false] {
+        let mut cfg = rig.cfg.events.nats.clone();
+        cfg.verify_stream = verify;
+        let err = walgit_nats::open_stream(&rig.js, &cfg, &rig.prefix).await.unwrap_err();
+        let text = format!("{err:#}");
+        assert!(
+            text.contains("WALGIT_EVENTS") && text.contains("never creates it"),
+            "the error must name the stream and say who provisions it: {text}"
+        );
+    }
+    assert!(rig.js.get_stream("WALGIT_EVENTS").await.is_err(), "nothing was created");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_misshapen_stream_fails_at_boot_unless_verification_is_off() {
+    let Some(nats) = start_nats().await else { return };
+    let rig = Rig::unprovisioned(&nats, NatsStart::Oldest, Duration::from_hours(1)).await;
+    rig.js
+        .create_stream(jetstream::stream::Config {
+            name: "WALGIT_EVENTS".into(),
+            subjects: vec!["walgit.ref.*".into()],
+            storage: jetstream::stream::StorageType::Memory,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+    let err = walgit_nats::open_stream(&rig.js, &rig.cfg.events.nats, &rig.prefix).await.unwrap_err();
     let text = format!("{err:#}");
     assert!(
-        text.contains("WALGIT_EVENTS") && text.contains("ensure_stream is off"),
-        "the error must name the stream and the setting: {text}"
+        text.contains("WALGIT_EVENTS")
+            && text.contains("storage is Memory")
+            && text.contains("do not capture walgit.ref.>")
+            && text.contains("verify_stream = false"),
+        "every shortfall and the way out: {text}"
     );
-    assert!(rig.js.get_stream("WALGIT_EVENTS").await.is_err(), "nothing was created");
 
-    cfg.ensure_stream = true;
+    let mut cfg = rig.cfg.events.nats.clone();
+    cfg.verify_stream = false;
     walgit_nats::open_stream(&rig.js, &cfg, &rig.prefix).await.unwrap();
-    cfg.ensure_stream = false;
-    walgit_nats::open_stream(&rig.js, &cfg, &rig.prefix).await.unwrap();
+    let config = rig.stream().await.cached_info().config.clone();
+    assert_eq!(config.storage, jetstream::stream::StorageType::Memory, "never altered");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_existing_stream_with_other_settings_is_reused_not_clobbered() {
     let Some(nats) = start_nats().await else { return };
-    let rig = Rig::new(&nats, NatsStart::Oldest).await;
+    let rig = Rig::unprovisioned(&nats, NatsStart::Oldest, Duration::from_hours(1)).await;
     let existing = jetstream::stream::Config {
         name: "WALGIT_EVENTS".into(),
         subjects: vec!["walgit.ref.>".into(), "other.>".into()],
@@ -1043,7 +1081,7 @@ async fn a_recreated_repository_colliding_with_the_old_ids_heals_after_the_dedup
     // (`t/r:1:refs/heads/main`), so inside the window the broker swallows it, the catch-up is not
     // confirmed and the repository stays open until the window has passed.
     let Some(nats) = start_nats().await else { return };
-    let rig = Rig::with_window(&nats, NatsStart::Oldest, Some(Duration::from_secs(2))).await;
+    let rig = Rig::with_window(&nats, NatsStart::Oldest, Duration::from_secs(2)).await;
     let publisher = rig.publisher(NatsStart::Oldest).await;
     let id = published_then_recreated(&rig, &publisher).await;
     rig.push(&id, &[("refs/heads/main", ZERO, A)]).await;

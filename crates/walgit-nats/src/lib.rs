@@ -5,6 +5,7 @@
 pub mod env;
 pub mod message;
 pub mod publisher;
+pub mod stream_shape;
 pub mod subject;
 #[cfg(feature = "testing")]
 pub mod testing;
@@ -35,28 +36,31 @@ pub async fn connect(cfg: &NatsEventsConfig, env: &NatsEnv) -> anyhow::Result<as
         .with_context(|| format!("connecting to NATS (auth: {auth})"))
 }
 
-/// The stream holding the events: created when missing (file storage, `<prefix>.ref.>`,
-/// `duplicate_window`) if `ensure_stream`, otherwise it must exist.
+/// The stream holding the events, provisioned by the operator. With `verify_stream` it must also
+/// be shaped as the publisher needs ([`stream_shape::problems`]), so a wrong stream fails at boot.
 pub async fn open_stream(
     js: &jetstream::Context,
     cfg: &NatsEventsConfig,
     prefix: &SubjectPrefix,
 ) -> anyhow::Result<stream::Stream> {
-    if cfg.ensure_stream {
-        js.get_or_create_stream(stream::Config {
-            name: cfg.stream.clone(),
-            subjects: vec![prefix.stream_filter()],
-            storage: stream::StorageType::File,
-            duplicate_window: cfg.duplicate_window,
-            ..stream::Config::default()
-        })
-        .await
-        .with_context(|| format!("ensuring stream {}", cfg.stream))
-    } else {
-        js.get_stream(&cfg.stream)
-            .await
-            .with_context(|| format!("stream {} (events.nats.ensure_stream is off)", cfg.stream))
+    let stream = js.get_stream(&cfg.stream).await.with_context(|| {
+        format!(
+            "stream {} (walgit nats never creates it; provision it as docs/EVENTS.md shows)",
+            cfg.stream
+        )
+    })?;
+    if cfg.verify_stream {
+        let problems = stream_shape::problems(&stream.cached_info().config, prefix);
+        if !problems.is_empty() {
+            let problems: Vec<String> = problems.iter().map(ToString::to_string).collect();
+            anyhow::bail!(
+                "stream {} is not usable: {} (events.nats.verify_stream = false skips this check)",
+                cfg.stream,
+                problems.join("; ")
+            );
+        }
     }
+    Ok(stream)
 }
 
 /// The config the publisher's registry runs on. This process never applies a push itself, so a

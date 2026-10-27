@@ -107,3 +107,27 @@ pub async fn start_nats_with(args: &[&str]) -> Option<NatsServer> {
     wait_ready(port).await;
     Some(server)
 }
+
+/// What an operator provisions (`docs/EVENTS.md`): the stream `cfg` names, file storage, limits
+/// retention, `<subject_prefix>.ref.>`, deduplicating within `duplicate_window`.
+///
+/// # Panics
+/// When the stream cannot be created.
+#[allow(clippy::expect_used)]
+pub async fn provision_stream(
+    js: &async_nats::jetstream::Context,
+    cfg: &walgit_config::NatsEventsConfig,
+    duplicate_window: Duration,
+) -> async_nats::jetstream::stream::Stream {
+    use async_nats::jetstream::stream;
+    let prefix = crate::subject::SubjectPrefix::new(&cfg.subject_prefix).expect("subject prefix");
+    js.create_stream(stream::Config {
+        name: cfg.stream.clone(),
+        subjects: vec![prefix.stream_filter()],
+        storage: stream::StorageType::File,
+        duplicate_window,
+        ..stream::Config::default()
+    })
+    .await
+    .expect("provision the events stream")
+}
