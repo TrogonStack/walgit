@@ -62,8 +62,9 @@ impl NatsAuth {
         Self::from_env(|name| std::env::var(name).ok())
     }
 
-    /// Resolve through `var`, in the priority order of [`NatsAuth`].
+    /// Resolve through `var`, in the priority order of [`NatsAuth`]. An empty variable is unset.
     pub fn from_env(var: impl Fn(&str) -> Option<String>) -> Self {
+        let var = |name: &str| var(name).filter(|v| !v.is_empty());
         if let Some(path) = var(ENV_NATS_CREDS) {
             return Self::Credentials(PathBuf::from(path));
         }
@@ -165,6 +166,21 @@ mod tests {
             resolve(&[("NATS_PASSWORD", "pass")]),
             NatsAuth::None
         ));
+    }
+
+    #[test]
+    fn empty_variables_are_unset() {
+        let auth = resolve(&[
+            ("NATS_CREDS", ""),
+            ("NATS_NKEY", ""),
+            ("NATS_USER", "u"),
+            ("NATS_PASSWORD", "p"),
+            ("NATS_TOKEN", "t"),
+        ]);
+        assert!(matches!(auth, NatsAuth::UserPassword { .. }), "{auth:?}");
+        let auth = resolve(&[("NATS_USER", "u"), ("NATS_PASSWORD", ""), ("NATS_TOKEN", "t")]);
+        assert!(matches!(auth, NatsAuth::Token(_)), "{auth:?}");
+        assert!(matches!(resolve(&[("NATS_TOKEN", "")]), NatsAuth::None));
     }
 
     #[test]
