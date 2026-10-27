@@ -189,6 +189,7 @@ Each behaviour above has a test against a real `nats-server -js` (`crates/walgit
 | Concurrent publishers leave each event once | `a_second_publisher_that_moved_first_stops_this_one`, `racing_publishers_leave_each_event_exactly_once` |
 | Losing the stream republishes the WAL window | `a_wiped_stream_is_republished_on_the_next_catch_up`, `a_purged_stream_heals_once_the_dedup_window_has_passed` |
 | A log gap is counted, readable entries still published | `entries_folded_before_publishing_are_a_counted_gap` |
+| A gap is counted once while nothing moves the subject | `a_gap_is_counted_once_while_nothing_moves_the_subject` |
 | Bucket notifications wake it; junk is ignored | `bucket_notifications_wake_the_publisher_without_a_catch_up_call`, `notifications_that_name_nothing_are_ignored_and_the_loop_survives` |
 | The sweep finds what nobody notified | `the_periodic_sweep_finds_a_push_nobody_notified` |
 | Service API: catch-up, errors, stats | `notifications_and_the_service_api_wake_the_publisher`, `the_catch_up_endpoint_reports_a_real_repository`, `the_service_answers_bad_requests_and_reports_the_counters` |

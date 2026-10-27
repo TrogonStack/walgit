@@ -675,6 +675,35 @@ async fn entries_folded_before_publishing_are_a_counted_gap() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_gap_is_counted_once_while_nothing_moves_the_subject() {
+    let Some(nats) = start_nats().await else { return };
+    let rig = Rig::new(&nats, NatsStart::Oldest).await;
+    let id = RepoId::new("t", "r").unwrap();
+    rig.registry.create(&id, ObjectFormat::Sha1).await.unwrap();
+    rig.push(&id, &[("refs/heads/main", ZERO, A)]).await;
+    let publisher = rig.publisher(NatsStart::Oldest).await;
+    assert_eq!(publisher.catch_up(&id).await.unwrap().emitted, 1);
+
+    rig.push(&id, &[("refs/heads/main", A, B)]).await;
+    rig.push(&id, &[("refs/heads/main", B, C)]).await;
+    let handle = rig.registry.open(&id).await.unwrap();
+    handle.write_checkpoint().await.unwrap();
+    let r = publisher.catch_up(&id).await.unwrap();
+    assert_eq!((r.gap, r.emitted), (Some([2, 3]), 0), "{r:?}");
+
+    handle.publish_settings("", "test", "moves the head without a ref event").await.unwrap();
+    let r = publisher.catch_up(&id).await.unwrap();
+    assert!(r.head_seq > 3, "{r:?}");
+    assert_eq!((r.gap, r.emitted), (None, 0), "the same gap is not reported again: {r:?}");
+    assert_eq!(publisher.counters.snapshot()["gap_entries"], 2);
+
+    rig.push(&id, &[("refs/heads/main", C, A)]).await;
+    let r = publisher.catch_up(&id).await.unwrap();
+    assert_eq!((r.gap, r.emitted), (None, 1), "{r:?}");
+    assert_eq!(publisher.counters.snapshot()["gap_entries"], 2);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_outage_mid_catch_up_loses_and_duplicates_nothing() {
     const REFS: usize = 1500;
     let Some(mut nats) = start_nats().await else { return };
@@ -933,6 +962,11 @@ async fn the_periodic_sweep_finds_a_push_nobody_notified() {
     // No notification for this push: only the periodic sweep can find it.
     rig.push(&id, &[("refs/heads/main", A, B)]).await;
     rig.wait_for_messages(2).await;
+    // The sweep counts what it found once its catch-up returns, after the message is acknowledged.
+    let t0 = Instant::now();
+    while publisher.counters.snapshot()["sweep_found"] == 0 && t0.elapsed() < Duration::from_secs(10) {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
     assert_eq!(publisher.counters.snapshot()["sweep_found"], 1);
     sweeping.abort();
 }

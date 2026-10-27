@@ -85,6 +85,10 @@ pub struct Publisher {
     /// The head a cold repository was first seen at (`start = "head"`), and for a recreated one,
     /// which old incarnation it was seen behind.
     cold_marks: std::sync::Mutex<HashMap<RepoId, ColdMark>>,
+    /// The stream sequence of the message each repository's gap was counted behind: the stream
+    /// keeps no cursor past it, so a head moved only by entries without ref events would otherwise
+    /// count the same gap again.
+    gaps_seen: std::sync::Mutex<HashMap<RepoId, u64>>,
     pub counters: Counters,
 }
 
@@ -118,6 +122,7 @@ impl Publisher {
             serial: tokio::sync::Mutex::new(()),
             done: std::sync::Mutex::default(),
             cold_marks: std::sync::Mutex::default(),
+            gaps_seen: std::sync::Mutex::default(),
             counters: Counters::default(),
         })
     }
@@ -204,7 +209,9 @@ impl Publisher {
                 // The newest published entry is already folded away: what follows it up to the
                 // log window is lost to us.
                 let published = l.id.seq();
-                if published < readable_from {
+                let first_sighting = published < readable_from
+                    && locked(&self.gaps_seen).insert(id.clone(), l.stream_seq) != Some(l.stream_seq);
+                if first_sighting {
                     report.gap = Some([published + 1, readable_from]);
                     self.counters
                         .gap_entries
