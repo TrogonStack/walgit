@@ -673,9 +673,6 @@ pub struct NatsEventsConfig {
     pub urls: Vec<String>,
     /// The `JetStream` stream holding the events (subjects `<subject_prefix>.ref.>`).
     pub stream: String,
-    /// Fail at boot unless the stream has file storage, limits retention, a subject capturing
-    /// `<subject_prefix>.ref.>` and a duplicate window. Off, it only has to exist.
-    pub verify_stream: bool,
     /// Events go to `<subject_prefix>.ref.<owner>.<repo>`.
     pub subject_prefix: String,
     /// Core subject bucket notifications are published to (S3 event JSON, `{"key"}` or `{"repo"}`).
@@ -690,7 +687,6 @@ impl Default for NatsEventsConfig {
         NatsEventsConfig {
             urls: vec!["nats://127.0.0.1:4222".into()],
             stream: "WALGIT_EVENTS".into(),
-            verify_stream: true,
             subject_prefix: "walgit".into(),
             notify_subject: "walgit.notify".into(),
             queue_group: "walgit-events".into(),

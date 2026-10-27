@@ -798,21 +798,17 @@ async fn the_publisher_never_prefetches_packs_whatever_the_operator_configured()
 async fn a_missing_stream_fails_clearly_and_is_never_created() {
     let Some(nats) = start_nats().await else { return };
     let rig = Rig::unprovisioned(&nats, NatsStart::Oldest, Duration::from_hours(1)).await;
-    for verify in [true, false] {
-        let mut cfg = rig.cfg.events.nats.clone();
-        cfg.verify_stream = verify;
-        let err = walgit_nats::open_stream(&rig.js, &cfg, &rig.prefix).await.unwrap_err();
-        let text = format!("{err:#}");
-        assert!(
-            text.contains("WALGIT_EVENTS") && text.contains("never creates it"),
-            "the error must name the stream and say who provisions it: {text}"
-        );
-    }
+    let err = walgit_nats::open_stream(&rig.js, &rig.cfg.events.nats, &rig.prefix).await.unwrap_err();
+    let text = format!("{err:#}");
+    assert!(
+        text.contains("WALGIT_EVENTS") && text.contains("never creates it"),
+        "the error must name the stream and say who provisions it: {text}"
+    );
     assert!(rig.js.get_stream("WALGIT_EVENTS").await.is_err(), "nothing was created");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_misshapen_stream_fails_at_boot_unless_verification_is_off() {
+async fn a_misshapen_stream_fails_at_boot_and_is_never_altered() {
     let Some(nats) = start_nats().await else { return };
     let rig = Rig::unprovisioned(&nats, NatsStart::Oldest, Duration::from_hours(1)).await;
     rig.js
@@ -831,13 +827,10 @@ async fn a_misshapen_stream_fails_at_boot_unless_verification_is_off() {
         text.contains("WALGIT_EVENTS")
             && text.contains("storage is Memory")
             && text.contains("do not capture walgit.ref.>")
-            && text.contains("verify_stream = false"),
+            && text.contains("docs/EVENTS.md"),
         "every shortfall and the way out: {text}"
     );
 
-    let mut cfg = rig.cfg.events.nats.clone();
-    cfg.verify_stream = false;
-    walgit_nats::open_stream(&rig.js, &cfg, &rig.prefix).await.unwrap();
     let config = rig.stream().await.cached_info().config.clone();
     assert_eq!(config.storage, jetstream::stream::StorageType::Memory, "never altered");
 }

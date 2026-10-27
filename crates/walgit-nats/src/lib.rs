@@ -36,8 +36,8 @@ pub async fn connect(cfg: &NatsEventsConfig, env: &NatsEnv) -> anyhow::Result<as
         .with_context(|| format!("connecting to NATS (auth: {auth})"))
 }
 
-/// The stream holding the events, provisioned by the operator. With `verify_stream` it must also
-/// be shaped as the publisher needs ([`stream_shape::problems`]), so a wrong stream fails at boot.
+/// The stream holding the events, provisioned by the operator and shaped as the publisher needs
+/// ([`stream_shape::problems`]), so a wrong stream fails at boot.
 pub async fn open_stream(
     js: &jetstream::Context,
     cfg: &NatsEventsConfig,
@@ -49,16 +49,14 @@ pub async fn open_stream(
             cfg.stream
         )
     })?;
-    if cfg.verify_stream {
-        let problems = stream_shape::problems(&stream.cached_info().config, prefix);
-        if !problems.is_empty() {
-            let problems: Vec<String> = problems.iter().map(ToString::to_string).collect();
-            anyhow::bail!(
-                "stream {} is not usable: {} (events.nats.verify_stream = false skips this check)",
-                cfg.stream,
-                problems.join("; ")
-            );
-        }
+    let problems = stream_shape::problems(&stream.cached_info().config, prefix);
+    if !problems.is_empty() {
+        let problems: Vec<String> = problems.iter().map(ToString::to_string).collect();
+        anyhow::bail!(
+            "stream {} is not usable: {} (provision it as docs/EVENTS.md shows)",
+            cfg.stream,
+            problems.join("; ")
+        );
     }
     Ok(stream)
 }
