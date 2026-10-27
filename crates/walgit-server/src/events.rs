@@ -1,6 +1,6 @@
 //! The webhook sink of the events bridge (`crate::bridge`). The event model
 //! (`RefEvent`, `refs_from_entries`, notification parsing) lives in `walgit-events`
-//! so other sinks can share it. Contract: `docs/EVENTS.md`.
+//! so the `JetStream` publisher shares it. Contract: `docs/EVENTS.md`.
 
 use walgit_events::RefEvent;
 

@@ -5928,6 +5928,7 @@ dependencies = [
  "tracing-subscriber",
  "walgit-config",
  "walgit-git",
+ "walgit-nats",
  "walgit-proto",
  "walgit-server",
  "walgit-store",
@@ -6043,6 +6044,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-compression",
+ "async-nats",
  "async-trait",
  "axum",
  "base64",
@@ -6097,6 +6099,7 @@ dependencies = [
  "walgit-config",
  "walgit-events",
  "walgit-git",
+ "walgit-nats",
  "walgit-proto",
  "walgit-store",
  "walgit-wal",

@@ -109,6 +109,8 @@ enum Command {
         #[command(subcommand)]
         action: RepoAction,
     },
+    /// Publish the WAL's ref events into NATS `JetStream` (`[events.nats]`, `docs/EVENTS.md`).
+    Nats,
     /// WAL inspection and rewind.
     Wal {
         #[command(subcommand)]
@@ -471,6 +473,7 @@ async fn dispatch(command: Command, cfg: Config) -> Result<()> {
         } => compact::run(repo, all, once, base, &cfg).await,
         Command::Repo { action } => repo::run(action, &cfg).await,
         Command::Wal { action } => wal_cmd::run(action, &cfg).await,
+        Command::Nats => walgit_nats::run(cfg.clone()).await,
         Command::Mirror {
             from,
             to,
