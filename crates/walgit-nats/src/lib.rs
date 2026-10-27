@@ -109,21 +109,15 @@ pub async fn run(cfg: Arc<Config>) -> anyhow::Result<()> {
     let js = async_nats::jetstream::new(client.clone());
     let stream = crate::open_stream(&js, nats, &prefix).await?;
     let publisher = Publisher::new(registry, js, stream, prefix.clone(), nats.start);
+    let sub = crate::wake::subscribe(&client, nats.notify_subject.clone(), nats.queue_group.clone())
+        .await?;
+    let registered =
+        crate::service::register(&client, &prefix, &nats.queue_group, &publisher).await?;
     tracing::info!(stream = %nats.stream, prefix = %prefix, start = ?nats.start, "walgit-nats ready");
 
     let mut tasks = tokio::task::JoinSet::new();
-    tasks.spawn(crate::wake::notify_loop(
-        client.clone(),
-        nats.notify_subject.clone(),
-        nats.queue_group.clone(),
-        cfg.store_prefix(),
-        publisher.clone(),
-    ));
-    tasks.spawn({
-        let (client, queue_group, publisher) =
-            (client.clone(), nats.queue_group.clone(), publisher.clone());
-        async move { crate::service::serve(client, &prefix, &queue_group, publisher).await }
-    });
+    tasks.spawn(crate::wake::notify_loop(sub, cfg.store_prefix(), publisher.clone()));
+    tasks.spawn(crate::service::serve(registered, publisher.clone()));
     tasks.spawn({
         let publisher = publisher.clone();
         let every = cfg.events.sweep_interval;

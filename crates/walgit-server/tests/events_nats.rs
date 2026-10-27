@@ -120,11 +120,16 @@ impl Rig {
         out
     }
 
-    fn spawn_notify_loop(&self, publisher: &Arc<Publisher>) -> tokio::task::JoinHandle<anyhow::Result<()>> {
-        tokio::spawn(walgit_nats::wake::notify_loop(
-            self.client.clone(),
+    async fn spawn_notify_loop(&self, publisher: &Arc<Publisher>) -> tokio::task::JoinHandle<anyhow::Result<()>> {
+        let sub = walgit_nats::wake::subscribe(
+            &self.client,
             self.nats_cfg.notify_subject.clone(),
             self.nats_cfg.queue_group.clone(),
+        )
+        .await
+        .unwrap();
+        tokio::spawn(walgit_nats::wake::notify_loop(
+            sub,
             self.server.state.cfg.store_prefix(),
             publisher.clone(),
         ))
@@ -139,12 +144,6 @@ async fn clone_of(server: &Server, owner: &str, repo: &str) -> anyhow::Result<Te
     git_in(&src, &["branch", "-M", "main"])?;
     git_in(&src, &["remote", "add", "origin", &server.repo_url(owner, repo)])?;
     Ok(src)
-}
-
-/// Let a notified catch-up (a queue subscription, no reply) settle: the loop is subscribed once a
-/// published probe reaches it, which a short sleep approximates for a fresh subscription.
-async fn subscribed() {
-    tokio::time::sleep(Duration::from_millis(500)).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -279,8 +278,7 @@ async fn bucket_notifications_wake_the_publisher_without_a_catch_up_call() -> Te
     let Some(rig) = Rig::new().await? else { return Ok(()) };
     let src = clone_of(&rig.server, "t", "r").await?;
     let publisher = rig.publisher().await?;
-    let notify = rig.spawn_notify_loop(&publisher);
-    subscribed().await;
+    let notify = rig.spawn_notify_loop(&publisher).await;
 
     // An S3 bucket notification naming the manifest, as the object store publishes it.
     git_in(&src, &["push", "origin", "main"])?;
@@ -353,12 +351,14 @@ async fn the_catch_up_endpoint_reports_a_real_repository() -> TestResult {
     let src = clone_of(&rig.server, "t", "r").await?;
     git_in(&src, &["push", "origin", "main"])?;
     let publisher = rig.publisher().await?;
-    let service = tokio::spawn({
-        let (client, prefix, publisher) = (rig.client.clone(), rig.prefix.clone(), publisher.clone());
-        let queue_group = rig.nats_cfg.queue_group.clone();
-        async move { walgit_nats::service::serve(client, &prefix, &queue_group, publisher).await }
-    });
-    subscribed().await;
+    let registered = walgit_nats::service::register(
+        &rig.client,
+        &rig.prefix,
+        &rig.nats_cfg.queue_group,
+        &publisher,
+    )
+    .await?;
+    let service = tokio::spawn(walgit_nats::service::serve(registered, publisher.clone()));
 
     let reply = rig
         .client
