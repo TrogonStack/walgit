@@ -29,7 +29,9 @@ use chrono::Utc;
 use walgit_git::RepoId;
 use walgit_store::{ObjectStoreExt, PutMode, StoreError};
 
-use crate::events::{self, RefEvent, Sink};
+use walgit_events::{RefEvent, manifest_repo, notified_keys, refs_from_entries};
+
+use crate::events::{self, Sink};
 
 const CURSOR_KEY: &str = "events/cursor.json";
 
@@ -141,7 +143,7 @@ impl Bridge {
         if head > from {
             let entries = handle.read_log(&manifest, from + 1, Some(head)).await?;
             let mut batch = Vec::new();
-            events::refs_from_entries(id, &entries, &mut batch);
+            refs_from_entries(id, &entries, &mut batch);
             // A failing sink returns here: cursor untouched, retried on the
             // next wake-up.
             self.publish(&batch).await?;
@@ -205,7 +207,7 @@ impl Bridge {
     /// A GCS notification: `…/repos/<o>/<r>/manifest.pb` finalized ⇒ that
     /// repo committed something. Everything else is ignored.
     pub async fn object_finalized(&self, object: &str) -> anyhow::Result<Option<CatchUp>> {
-        let Some(id) = self.manifest_repo(object) else {
+        let Some(id) = manifest_repo(object, &self.store_prefix) else {
             return Ok(None);
         };
         match self.catch_up(&id).await {
@@ -221,19 +223,6 @@ impl Bridge {
             }
             r => r.map(Some),
         }
-    }
-
-    /// `prefix/repos/<o>/<r>/manifest.pb` → `o/r`.
-    fn manifest_repo(&self, object: &str) -> Option<RepoId> {
-        let rel = object
-            .strip_prefix(self.store_prefix.as_str())?
-            .strip_prefix("repos/")?
-            .strip_suffix("/manifest.pb")?;
-        let (owner, name) = rel.split_once('/')?;
-        if name.contains('/') {
-            return None;
-        }
-        RepoId::new(owner, name).ok()
     }
 
     async fn publish(&self, batch: &[RefEvent]) -> anyhow::Result<()> {
@@ -257,55 +246,6 @@ impl Bridge {
         }
         Ok(())
     }
-}
-
-/// The bucket object keys a notification body names, `store.prefix` included as the
-/// notifications carry it. Store-agnostic.
-fn notified_keys(v: &serde_json::Value, store_prefix: &str) -> Vec<String> {
-    let mut keys = Vec::new();
-    // GCS → Pub/Sub push envelope.
-    let attrs = &v["message"]["attributes"];
-    if attrs["eventType"] == "OBJECT_FINALIZE"
-        && let Some(k) = attrs["objectId"].as_str()
-    {
-        keys.push(k.to_string());
-    }
-    // S3 event notification (also what MinIO/rustfs/Ceph emit).
-    if let Some(records) = v["Records"].as_array() {
-        for r in records {
-            if r["eventName"]
-                .as_str()
-                .is_some_and(|e| e.starts_with("ObjectCreated"))
-                && let Some(k) = r["s3"]["object"]["key"].as_str()
-            {
-                // S3 URL-encodes keys in notifications.
-                keys.push(
-                    k.replace('+', " ")
-                        .split('%')
-                        .enumerate()
-                        .map(|(i, part)| {
-                            if i == 0 {
-                                return part.to_string();
-                            }
-                            match u8::from_str_radix(part.get(..2).unwrap_or(""), 16) {
-                                Ok(b) => format!("{}{}", b as char, &part[2..]),
-                                Err(_) => format!("%{part}"),
-                            }
-                        })
-                        .collect(),
-                );
-            }
-        }
-    }
-    // Plain shapes for your own glue.
-    if let Some(k) = v["key"].as_str() {
-        keys.push(k.to_string());
-    }
-    // A repository id names no object: use the key its manifest has in this bucket.
-    if let Some(r) = v["repo"].as_str() {
-        keys.push(format!("{store_prefix}repos/{r}/manifest.pb"));
-    }
-    keys
 }
 
 /// `POST /_events/notify`: a bucket notification naming a finalized `manifest.pb`.
@@ -372,53 +312,4 @@ pub fn spawn_sweeper(state: Arc<crate::AppState>) {
             bridge.sweep().await;
         }
     });
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn manifest_object_names() {
-        let b = Bridge {
-            registry: walgit_wal::Registry::new(
-                Arc::new(walgit_store::memory::MemoryStore::new()),
-                Arc::new(walgit_config::Config::default()),
-            ),
-            store_prefix: "prefix/".into(),
-            sinks: Vec::new(),
-            serial: tokio::sync::Mutex::new(()),
-        };
-        let id = b
-            .manifest_repo("prefix/repos/acme/monorepo/manifest.pb")
-            .unwrap();
-        assert_eq!(id.to_string(), "acme/monorepo");
-        // Every body shape names the same repository under a non-empty prefix.
-        for body in [
-            serde_json::json!({"repo": "acme/monorepo"}),
-            serde_json::json!({"key": "prefix/repos/acme/monorepo/manifest.pb"}),
-            serde_json::json!({"message": {"attributes": {
-                "eventType": "OBJECT_FINALIZE",
-                "objectId": "prefix/repos/acme/monorepo/manifest.pb"}}}),
-            serde_json::json!({"Records": [{"eventName": "ObjectCreated:Put",
-                "s3": {"object": {"key": "prefix/repos/acme/monorepo/manifest.pb"}}}]}),
-        ] {
-            let ids: Vec<_> = notified_keys(&body, &b.store_prefix)
-                .iter()
-                .filter_map(|k| b.manifest_repo(k))
-                .map(|id| id.to_string())
-                .collect();
-            assert_eq!(ids, ["acme/monorepo"], "{body}");
-        }
-        for other in [
-            "repos/t/r/manifest.pb",
-            "prefix/repos/t/r/wal/abc.pack",
-            "prefix/repos/t/r/events/cursor.json",
-            "walgit-go/repos/t/r/manifest.pb",
-            "prefix/repos/t/manifest.pb",
-            "prefix/repos/t/r/x/manifest.pb",
-        ] {
-            assert!(b.manifest_repo(other).is_none(), "{other}");
-        }
-    }
 }

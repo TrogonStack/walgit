@@ -5819,6 +5819,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "walgit-events"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "walgit-git",
+ "walgit-proto",
+]
+
+[[package]]
 name = "walgit-git"
 version = "0.1.0"
 dependencies = [
@@ -5928,6 +5938,7 @@ dependencies = [
  "tracing-subscriber",
  "uuid",
  "walgit-config",
+ "walgit-events",
  "walgit-git",
  "walgit-proto",
  "walgit-store",
