@@ -1,0 +1,36 @@
+[package]
+name = "walgit-nats"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "walgit-nats"
+path = "src/main.rs"
+
+[dependencies]
+walgit-events.workspace = true
+walgit-config.workspace = true
+walgit-store.workspace = true
+walgit-git.workspace = true
+walgit-wal.workspace = true
+async-nats.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+bytes.workspace = true
+futures.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+clap.workspace = true
+mimalloc.workspace = true
+rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std", "tls12", "logging"] }
+
+[dev-dependencies]
+walgit-proto.workspace = true
+tempfile.workspace = true
+
+[lints]
+workspace = true

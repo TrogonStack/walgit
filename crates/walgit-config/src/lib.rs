@@ -637,6 +637,8 @@ pub struct EventsConfig {
     /// warns when a sweep finds unpublished entries. `0` = off.
     #[serde(with = "humantime_serde")]
     pub sweep_interval: Duration,
+    /// The `JetStream` publisher (`walgit-nats`, `docs/EVENTS.md`). Read only by that binary.
+    pub nats: NatsEventsConfig,
 }
 
 impl Default for EventsConfig {
@@ -645,7 +647,95 @@ impl Default for EventsConfig {
             webhook_url: None,
             webhook_secret: None,
             sweep_interval: Duration::from_mins(5),
+            nats: NatsEventsConfig::default(),
         }
+    }
+}
+
+/// Where a cold repository (no message on its subject yet) starts publishing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum NatsStart {
+    /// The oldest readable seq (`min_seq - 1`), as the webhook bridge does.
+    #[default]
+    Oldest,
+    /// Nothing older than the head the publisher first sees.
+    Head,
+}
+
+/// `[events.nats]`: the `walgit-nats` binary publishes the bridge's `ref` events into `JetStream`.
+/// The resume cursor is the last message on each repository's subject, so there is no cursor
+/// object in the bucket.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct NatsEventsConfig {
+    /// Server URLs (`nats://host:4222`); the client connects to the first reachable one.
+    pub urls: Vec<String>,
+    /// A `.creds` or `NKey` seed file. Never logged.
+    pub credentials_file: Option<std::path::PathBuf>,
+    /// The `JetStream` stream holding the events (subjects `<subject_prefix>.ref.>`).
+    pub stream: String,
+    /// Create the stream when missing (file storage, `duplicate_window`). An existing stream is used as is.
+    pub ensure_stream: bool,
+    /// Deduplication window of a created stream (`Nats-Msg-Id`).
+    #[serde(with = "humantime_serde")]
+    pub duplicate_window: Duration,
+    /// Events go to `<subject_prefix>.ref.<owner>.<repo>`.
+    pub subject_prefix: String,
+    /// Core subject bucket notifications are published to (S3 event JSON, `{"key"}` or `{"repo"}`).
+    pub notify_subject: String,
+    /// Queue group of the notify subscription and the service endpoints: instances share the work.
+    pub queue_group: String,
+    pub start: NatsStart,
+}
+
+impl Default for NatsEventsConfig {
+    fn default() -> Self {
+        NatsEventsConfig {
+            urls: vec!["nats://127.0.0.1:4222".into()],
+            credentials_file: None,
+            stream: "WALGIT_EVENTS".into(),
+            ensure_stream: true,
+            duplicate_window: Duration::from_hours(1),
+            subject_prefix: "walgit".into(),
+            notify_subject: "walgit.notify".into(),
+            queue_group: "walgit-events".into(),
+            start: NatsStart::Oldest,
+        }
+    }
+}
+
+impl NatsEventsConfig {
+    fn validate(&self) -> Result<()> {
+        anyhow::ensure!(!self.urls.is_empty(), "events.nats.urls must not be empty");
+        anyhow::ensure!(
+            self.urls.iter().all(|u| !u.trim().is_empty()),
+            "events.nats.urls must not contain empty entries"
+        );
+        let plain = |s: &str| {
+            !s.is_empty()
+                && !s
+                    .chars()
+                    .any(|c| c.is_whitespace() || c.is_control() || matches!(c, '*' | '>'))
+        };
+        let dotted = |s: &str| plain(s) && s.split('.').all(|t| !t.is_empty());
+        anyhow::ensure!(
+            plain(&self.stream) && !self.stream.contains(['.', '/', '\\']),
+            "events.nats.stream must be a stream name (no '.', '/', '\\', '*', '>' or whitespace)"
+        );
+        anyhow::ensure!(
+            dotted(&self.subject_prefix),
+            "events.nats.subject_prefix must be dot-separated tokens (no '*', '>' or whitespace)"
+        );
+        anyhow::ensure!(
+            dotted(&self.notify_subject),
+            "events.nats.notify_subject must be a literal subject (no '*', '>' or whitespace)"
+        );
+        anyhow::ensure!(
+            plain(&self.queue_group),
+            "events.nats.queue_group must not be empty or contain '*', '>' or whitespace"
+        );
+        Ok(())
     }
 }
 
@@ -1252,6 +1342,7 @@ impl Config {
                 "events.webhook_url must be an http(s) URL"
             );
         }
+        self.events.nats.validate()?;
         Ok(())
     }
 
@@ -1739,6 +1830,34 @@ webhook_secret = "s"
         assert_eq!(c.events.webhook_secret.as_deref(), Some("s"));
         let err = Config::parse("[events]\nwebhook_url = \"ftp://x\"\n").unwrap_err();
         assert!(err.to_string().contains("webhook_url"), "{err}");
+    }
+
+    #[test]
+    fn events_nats_section_parses_and_validates() {
+        let d = Config::parse("").unwrap().events.nats;
+        assert_eq!((d.stream.as_str(), d.start), ("WALGIT_EVENTS", NatsStart::Oldest));
+        let c = Config::parse(
+            r#"
+[events.nats]
+urls = ["nats://a:4222", "nats://b:4222"]
+start = "head"
+subject_prefix = "acme.git"
+"#,
+        )
+        .unwrap();
+        assert_eq!(c.events.nats.start, NatsStart::Head);
+        assert_eq!(c.events.nats.urls.len(), 2);
+        for bad in [
+            "subject_prefix = \"a.*\"",
+            "subject_prefix = \"a..b\"",
+            "notify_subject = \"x.>\"",
+            "stream = \"a.b\"",
+            "queue_group = \"\"",
+            "urls = []",
+        ] {
+            let err = Config::parse(&format!("[events.nats]\n{bad}\n")).unwrap_err();
+            assert!(err.to_string().contains("events.nats"), "{bad}: {err}");
+        }
     }
 }
 

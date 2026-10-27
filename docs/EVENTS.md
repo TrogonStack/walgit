@@ -115,6 +115,47 @@ webhook_secret = "…"          # env: WALGIT__EVENTS__WEBHOOK_SECRET
 sweep_interval = "5m"
 ```
 
+## Delivery: NATS JetStream (`walgit-nats`)
+
+`walgit-nats` is a second sink for the same `ref` events, a separate binary
+(`walgit-nats --config walgit.toml`, `[events.nats]`) that depends on `walgit-events` (the shared event
+model) and never on `walgit-server`. The webhook bridge is unchanged and the two can run side by side.
+Like the bridge it is a reader of the WAL, never a step of a push (D32).
+
+- **The stream is the cursor (D50).** For each repository the publisher reads the last message on the
+  repository's subject, takes its `Walgit-Seq` header and resumes from that seq, inclusive. Events already in
+  the stream are dropped, so a crash in the middle of a multi-ref entry completes only the rest of that entry. A repository with no message yet starts at `events.nats.start`: `oldest` (the oldest
+  readable seq, as the bridge does) or `head` (only pushes made after the publisher first saw it).
+- **Subjects.** `<subject_prefix>.ref.<owner>.<repo>`. Bytes outside `[A-Za-z0-9_-]` in a name are written
+  `%XX`, so `acme.io/mono.repo` is `walgit.ref.acme%2Eio.mono%2Erepo` and the mapping is reversible.
+  Subscribe to `walgit.ref.>` for everything, `walgit.ref.acme.>` for one owner.
+- **Message.** The body is one `ref` event JSON object (not an array). Headers: `Walgit-Seq`, `Walgit-Repo`
+  and `Nats-Msg-Id = <repo>:<seq>:<ref_name>`, which makes JetStream drop a republished event inside the
+  stream's duplicate window. The publisher waits for every PubAck before the next message, so order within
+  a repository is `_walgit.seq` order.
+- **Concurrent publishers.** The first publish of a catch-up sets `Nats-Expected-Last-Subject-Sequence`.
+  If another instance moved the subject first, this one stops, logs and lets the next wake-up retry from the
+  new last message. Delivery is at least once; consumers still dedup on `(repo, _walgit.seq, ref_name)`.
+- **Wake-ups.** A queue-group subscription on `events.nats.notify_subject` accepts the same notification
+  shapes as `POST /_events/notify` (S3 event JSON, a GCS envelope, `{"key": ...}`, `{"repo": ...}`), and
+  `events.sweep_interval` is the backstop with the same warning when it finds unpublished entries.
+  Gap detection matches the bridge: a log gap is logged and the entries that are readable are published.
+- **Service API.** The binary registers a NATS micro service `walgit-events` (`$SRV.PING|INFO|STATS`, built in)
+  with one endpoint, `<subject_prefix>.events.catch-up`. Request `{"repo": "o/r"}`, reply the catch-up report
+  (`repo`, `from_seq`, `head_seq`, `emitted`, `conflict`); an unknown repository is a 404 service error.
+  Gap, conflict and sweep counters are in the stats response. There is no HTTP listener.
+- **Losing the stream.** Wiping the stream republishes the WAL window on the next wake-up; history older than
+  the oldest readable entry is not in the WAL and is backfilled with `walgit wal ls`. Wiping walgit loses nothing.
+
+```toml
+[events]
+sweep_interval = "5m"
+[events.nats]
+urls = ["nats://nats.internal:4222"]
+credentials_file = "/etc/walgit/nats.creds"
+start = "oldest"
+```
+
 ## Consumer checklist
 
 1. Verify `X-Walgit-Signature` (if you set a secret), then parse the array.
