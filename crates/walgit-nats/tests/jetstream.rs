@@ -14,6 +14,7 @@ use futures::StreamExt;
 use walgit_config::{Config, NatsStart};
 use walgit_events::refs_from_entries;
 use walgit_git::{ObjectFormat, RepoId};
+use walgit_nats::auth::NatsAuth;
 use walgit_nats::message::EventMessage;
 use walgit_nats::publisher::Publisher;
 use walgit_nats::subject::{RepoSubject, SubjectPrefix};
@@ -55,7 +56,7 @@ impl Rig {
         let cfg = Arc::new(cfg);
         let store = Arc::new(walgit_store::memory::MemoryStore::new());
         let registry = walgit_wal::Registry::new(store.clone(), cfg.clone());
-        let client = walgit_nats::connect(&cfg.events.nats).await.unwrap();
+        let client = walgit_nats::connect(&cfg.events.nats, &NatsAuth::None).await.unwrap();
         let js = jetstream::ContextBuilder::new()
             .timeout(Duration::from_secs(3))
             .build(client.clone());
@@ -1112,7 +1113,7 @@ async fn an_unparsable_server_url_fails_to_connect_naming_the_setting() {
         urls: vec!["nats://bad host:not-a-port".into()],
         ..Default::default()
     };
-    let err = walgit_nats::connect(&cfg).await.unwrap_err();
+    let err = walgit_nats::connect(&cfg, &NatsAuth::None).await.unwrap_err();
     assert!(format!("{err:#}").contains("events.nats.urls"), "{err:#}");
 }
 
@@ -1207,6 +1208,37 @@ async fn a_recreated_repository_is_published_as_a_new_one() {
     let again = publisher.catch_up(&id).await.unwrap();
     assert_eq!(again.emitted, 0, "steady afterwards, not rewound again");
     assert_eq!(publisher.counters.snapshot()["rewinds"], 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_recreated_repository_under_head_start_publishes_pushes_after_its_first_sighting() {
+    let Some(nats) = start_nats().await else { return };
+    let rig = Rig::new(&nats, NatsStart::Head).await;
+    let publisher = rig.publisher(NatsStart::Head).await;
+    let id = RepoId::new("t", "r").unwrap();
+    rig.registry.create(&id, ObjectFormat::Sha1).await.unwrap();
+    assert_eq!(publisher.catch_up(&id).await.unwrap().emitted, 0, "first sighting at head 0");
+    let mut prev = ZERO.to_string();
+    for i in 1..=3usize {
+        let next = format!("{i:040x}");
+        rig.push(&id, &[("refs/heads/main", &prev, &next)]).await;
+        prev = next;
+    }
+    assert_eq!(publisher.catch_up(&id).await.unwrap().emitted, 3);
+    rig.registry.delete(&id).await.unwrap();
+    rig.registry.create(&id, ObjectFormat::Sha1).await.unwrap();
+
+    rig.push(&id, &[("refs/heads/before", ZERO, A)]).await;
+    let r = publisher.catch_up(&id).await.unwrap();
+    assert_eq!(r.emitted, 0, "head start: what the new incarnation held when first seen is skipped");
+    assert_eq!(publisher.counters.snapshot()["rewinds"], 1);
+
+    rig.push(&id, &[("refs/heads/after", ZERO, B)]).await;
+    let r = publisher.catch_up(&id).await.unwrap();
+    assert_eq!((r.emitted, r.conflict), (1, false), "{r:?}");
+    assert_eq!(rig.ids().await.last().unwrap(), &msg_id(&id, 2, "refs/heads/after"));
+    assert_eq!(publisher.counters.snapshot()["rewinds"], 1, "the same rewind is not counted twice");
+    assert_eq!(publisher.catch_up(&id).await.unwrap().emitted, 0);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

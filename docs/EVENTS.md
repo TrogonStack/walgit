@@ -158,7 +158,8 @@ Like the bridge it is a reader of the WAL, never a step of a push (D32).
 - **Deleting and recreating a repository.** The manifest has no incarnation id, so the only signal is the stream
   being ahead of the WAL: when the last message on a subject names a seq above the repository's `head_seq`, the
   publisher warns, counts it (`rewinds` in the service stats), ignores that message as a cursor (the first seq
-  follows `events.nats.start`) and still guards the first publish with the subject's real last stream sequence, so
+  follows `events.nats.start`; with `"head"` the new incarnation's head at that first sighting is kept while the
+  old message still tops the subject, so later pushes are published) and still guards the first publish with the subject's real last stream sequence, so
   it does not conflict. The new incarnation's `Nats-Msg-Id` (`<repo>:<seq>:<ref>`) can equal the old one's: inside
   `duplicate_window` the broker swallows it, the catch-up is not confirmed, the repository stays open and the
   event lands on the first wake-up after the window (pinned by a test). Limitation: a recreated repository whose
@@ -201,7 +202,7 @@ Each behaviour above has a test against a real `nats-server -js` (`crates/walgit
 | A bad server URL fails to connect naming the setting | `an_unparsable_server_url_fails_to_connect_naming_the_setting` |
 | Tags, deletes and non-branch refs carry `ref_type` and zero OIDs | `tags_and_deletes_carry_their_ref_type_and_zero_oids` |
 | Many pushes land in seq order across catch-ups | `many_sequential_pushes_land_in_seq_order_across_catch_ups` |
-| A deleted and recreated repository is detected and published as new; an id collision heals after the dedup window | `a_recreated_repository_is_published_as_a_new_one`, `a_recreated_repository_colliding_with_the_old_ids_heals_after_the_dedup_window` |
+| A deleted and recreated repository is detected and published as new; an id collision heals after the dedup window | `a_recreated_repository_is_published_as_a_new_one`, `a_recreated_repository_under_head_start_publishes_pushes_after_its_first_sighting`, `a_recreated_repository_colliding_with_the_old_ids_heals_after_the_dedup_window` |
 | SIGTERM exits 0 | `tests/e2e.sh` phase 3 |
 
 Not covered: Prometheus metrics (the service stats are the only counters), multi-node JetStream clusters, and
@@ -212,9 +213,12 @@ the Containerfile / flake packaging.
 sweep_interval = "5m"
 [events.nats]
 urls = ["nats://nats.internal:4222"]
-credentials_file = "/etc/walgit/nats.creds"
 start = "oldest"
 ```
+
+Authentication is never in `walgit.toml`: `walgit nats` reads the standard NATS variables and uses the
+first that is set, `NATS_CREDS` (a `.creds` file), `NATS_NKEY` (a seed), `NATS_USER` with `NATS_PASSWORD`,
+then `NATS_TOKEN`; with none set it connects without credentials. Only the method is logged.
 
 ## Consumer checklist
 

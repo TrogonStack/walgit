@@ -82,9 +82,19 @@ pub struct Publisher {
     /// last message for its subject. A wake-up that finds both unchanged spares the log read. The
     /// stream half is what notices a purged or recreated stream. Never a source of truth.
     done: std::sync::Mutex<HashMap<RepoId, (u64, Option<LastPublished>)>>,
-    /// `start = "head"`: the head a cold repository was first seen at.
-    cold_marks: std::sync::Mutex<HashMap<RepoId, u64>>,
+    /// The head a cold repository was first seen at (`start = "head"`), and for a recreated one,
+    /// which old incarnation it was seen behind.
+    cold_marks: std::sync::Mutex<HashMap<RepoId, ColdMark>>,
     pub counters: Counters,
+}
+
+/// A cold repository's first sighting. `behind` is the stream sequence of the old incarnation's
+/// last message when the repository was recreated: the same rewind seen again keeps its mark, so
+/// pushes after the first sighting are published while the old message still tops the subject.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ColdMark {
+    head: u64,
+    behind: Option<u64>,
 }
 
 fn locked<T>(m: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -173,9 +183,15 @@ impl Publisher {
         // rewound). What is on the subject belongs to the old incarnation, so it names no cursor;
         // its stream sequence still guards the first publish.
         let rewound = last.as_ref().is_some_and(|l| l.id.seq() > head);
-        if rewound {
+        let behind = last.as_ref().filter(|_| rewound).map(|l| l.stream_seq);
+        let seen = ColdMark { head, behind };
+        let first_sighting = rewound
+            && locked(&self.cold_marks)
+                .get(id)
+                .is_none_or(|mark| mark.behind != behind);
+        if first_sighting {
             self.counters.rewinds.fetch_add(1, Ordering::Relaxed);
-            locked(&self.cold_marks).remove(id);
+            locked(&self.cold_marks).insert(id.clone(), seen);
             tracing::warn!(repo = %id, published = last.as_ref().map_or(0, |l| l.id.seq()), head,
                 "the stream is ahead of the WAL: the repository was recreated; publishing it as a new one");
         }
@@ -201,7 +217,7 @@ impl Publisher {
             None => match self.start {
                 NatsStart::Oldest => (lowest, None),
                 NatsStart::Head => {
-                    let mark = *locked(&self.cold_marks).entry(id.clone()).or_insert(head);
+                    let mark = locked(&self.cold_marks).entry(id.clone()).or_insert(seen).head;
                     (mark.saturating_add(1).max(lowest), None)
                 }
             },
