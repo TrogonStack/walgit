@@ -924,7 +924,7 @@ async fn the_service_answers_bad_requests_and_reports_the_counters() {
     let report: serde_json::Value = serde_json::from_slice(&reply.payload).unwrap();
     assert_eq!((report["emitted"].as_u64(), report["head_seq"].as_u64()), (Some(3), Some(2)));
 
-    // deduplicated: 2, from forcing a republish of the entry inside the window.
+    // deduplicated: 3, from forcing a republish of the repository inside the window.
     rig.inject(&id, 2, "refs/heads/not-in-the-entry").await;
     let restarted = rig.publisher(NatsStart::Oldest).await;
     restarted.catch_up(&id).await.unwrap();
@@ -952,7 +952,7 @@ async fn the_service_answers_bad_requests_and_reports_the_counters() {
     assert_eq!(data["gap_entries"], 3);
     assert_eq!(data["conflicts"], 0);
     assert_eq!(data["sweep_found"], 0);
-    assert_eq!(restarted.counters.snapshot()["deduplicated"], 2);
+    assert_eq!(restarted.counters.snapshot()["deduplicated"], 3);
     service.abort();
 }
 
