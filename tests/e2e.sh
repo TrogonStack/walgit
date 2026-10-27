@@ -376,6 +376,8 @@ if [[ -z "${WALGIT_E2E_BASE_URL:-}" && -n "${WALGIT_TEST_S3_ENDPOINT:-}" ]]; the
         for ((i=0; i<30; i++)); do nats -s "$NATS_URL" rtt >/dev/null 2>&1 && break; sleep 1; done
         nats -s "$NATS_URL" rtt >/dev/null 2>&1 || fail "nats-server did not start"
         pass "nats-server ready on $NATS_PORT"
+        nats -s "$NATS_URL" stream add "$STREAM" --subjects 'walgit.ref.>' --storage file \
+            --retention limits --dupe-window 1h --defaults >/dev/null || fail "provisioning stream $STREAM"
 
         # A fresh store prefix keeps the repositories earlier runs left in the bucket out of the stream.
         cat > "$TMP/cfg-nats.toml" <<EOF
