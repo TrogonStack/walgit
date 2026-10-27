@@ -6,12 +6,25 @@ license.workspace = true
 
 [dependencies]
 walgit-events.workspace = true
+walgit-config.workspace = true
 walgit-git.workspace = true
 async-nats.workspace = true
 anyhow.workspace = true
 thiserror.workspace = true
 bytes.workspace = true
+tokio.workspace = true
+tracing.workspace = true
 serde_json.workspace = true
+tempfile = { workspace = true, optional = true }
+
+[features]
+# `testing::start_nats`: a throwaway `nats-server -js` for integration tests.
+testing = ["dep:tempfile"]
+
+[dev-dependencies]
+walgit-nats = { path = ".", features = ["testing"] }
+nkeys.workspace = true
+tempfile.workspace = true
 
 [lints]
 workspace = true

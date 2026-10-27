@@ -6004,10 +6004,16 @@ dependencies = [
  "anyhow",
  "async-nats",
  "bytes",
+ "nkeys",
  "serde_json",
+ "tempfile",
  "thiserror",
+ "tokio",
+ "tracing",
+ "walgit-config",
  "walgit-events",
  "walgit-git",
+ "walgit-nats",
 ]
 
 [[package]]
