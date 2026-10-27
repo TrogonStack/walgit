@@ -16,7 +16,7 @@ use walgit_config::{NatsEventsConfig, NatsStart};
 use walgit_git::RepoId;
 use walgit_nats::publisher::Publisher;
 use walgit_nats::subject::SubjectPrefix;
-use walgit_nats::testing::{NatsServer, start_nats};
+use walgit_nats::testing::{NatsServer, provision_stream, start_nats};
 
 type TestResult = anyhow::Result<()>;
 
@@ -55,6 +55,7 @@ impl Rig {
         let client = walgit_nats::connect(&nats_cfg, &walgit_nats::env::NatsEnv::default()).await?;
         let js = jetstream::new(client.clone());
         let prefix = SubjectPrefix::new(&nats_cfg.subject_prefix)?;
+        provision_stream(&js, &nats_cfg, Duration::from_hours(1)).await;
         Ok(Rig {
             server,
             nats_cfg,
