@@ -55,16 +55,16 @@ FROM rust AS build-walgit
 COPY --from=web /src/web/dist ./web/dist
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/target,id=walgit-target \
-    cargo build --release --locked -p walgit-cli \
-    && install -D target/release/walgit /out/bin/walgit \
-    && install -D target/release/walgit-server /out/bin/walgit-server
+    cargo build --profile dist --locked -p walgit-cli \
+    && install -D target/dist/walgit /out/bin/walgit \
+    && install -D target/dist/walgit-server /out/bin/walgit-server
 
 # ---- 3b. walgit-nats (no web stage) -----------------------------------------------------
 FROM rust AS build-nats
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/target,id=walgit-nats-target \
-    cargo build --release --locked -p walgit-nats \
-    && install -D target/release/walgit-nats /out/bin/walgit-nats
+    cargo build --profile dist --locked -p walgit-nats \
+    && install -D target/dist/walgit-nats /out/bin/walgit-nats
 
 # ---- 4a. walgit-nats runtime ------------------------------------------------------------
 FROM docker.io/library/debian:trixie-slim AS walgit-nats
