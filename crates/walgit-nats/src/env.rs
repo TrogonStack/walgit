@@ -341,7 +341,11 @@ fn scheme(value: &str) -> Option<&str> {
 fn file_location(name: &str, value: &str, home: Option<&str>) -> anyhow::Result<PathBuf> {
     let path = match scheme(value) {
         None => value,
-        Some(s) if s.eq_ignore_ascii_case("file") => value.get(s.len() + 3..).unwrap_or_default(),
+        Some(s) if s.eq_ignore_ascii_case("file") => value
+            .get(..7)
+            .filter(|prefix| prefix.eq_ignore_ascii_case("file://"))
+            .and_then(|_| value.get(7..))
+            .with_context(|| format!("{name}: write a file URI as file://<path>"))?,
         Some(s) => anyhow::bail!("{name}: the {s}:// scheme is not supported; give a file path"),
     };
     Ok(match (path.strip_prefix("~/"), home) {
@@ -476,6 +480,12 @@ mod tests {
         );
         let err = resolve(&[("NATS_CREDS", "op://vault/item")]).unwrap_err();
         assert!(format!("{err}").contains("NATS_CREDS"), "{err}");
+        for short in ["file:/etc/a.creds", "file:relative"] {
+            let err = resolve(&[("NATS_CREDS", short)]).unwrap_err();
+            assert!(format!("{err}").contains("file://"), "{err}");
+        }
+        let id = identity(&[("NATS_CREDS", "FILE:///etc/a.creds")]);
+        assert!(matches!(id, Some(Identity::Credentials(p)) if p == Path::new("/etc/a.creds")));
     }
 
     #[test]
