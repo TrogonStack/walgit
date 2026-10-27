@@ -157,7 +157,8 @@ impl NatsEnv {
 
         let certificate = match (location(ENV_NATS_CERT)?, location(ENV_NATS_KEY)?) {
             (Some(cert), Some(key)) => Some((cert, key)),
-            _ => None,
+            (None, None) => None,
+            _ => anyhow::bail!("{ENV_NATS_CERT} and {ENV_NATS_KEY} must be set together"),
         };
         Ok(Self {
             servers,
@@ -335,13 +336,13 @@ fn take_credentials(
     Ok((async_nats::ServerAddr::from_url(url)?, Some(credentials)))
 }
 
-/// `url` with whatever precedes an `@` in its authority hidden, for a URL that did not parse.
+/// `url` with whatever precedes its last `@` hidden. A password may hold an unencoded `/`, `?`
+/// or `#`, so the authority's end cannot be trusted to bound it.
 fn redacted(url: &str) -> String {
     let (scheme, rest) = url.split_once("://").map_or(("", url), |(s, r)| (s, r));
-    let (authority, tail) = rest.split_at(rest.find(['/', '?', '#']).unwrap_or(rest.len()));
-    match authority.rsplit_once('@') {
-        Some((_, host)) if scheme.is_empty() => format!("<redacted>@{host}{tail}"),
-        Some((_, host)) => format!("{scheme}://<redacted>@{host}{tail}"),
+    match rest.rsplit_once('@') {
+        Some((_, host)) if scheme.is_empty() => format!("<redacted>@{host}"),
+        Some((_, host)) => format!("{scheme}://<redacted>@{host}"),
         None => url.to_owned(),
     }
 }
@@ -563,6 +564,14 @@ mod tests {
         let msg = format!("{err:#}");
         assert!(msg.contains("NATS_URL: nats://<redacted>@[bad"), "{msg}");
         assert!(!msg.contains("hidden"), "{msg}");
+        for url in ["nats://u:hid#den@h:4222", "nats://u:hid/den@h:4222", "nats://u:hid?den@h:4222"] {
+            let err = servers(&[url]).unwrap_err();
+            let msg = format!("{err:#}");
+            assert!(msg.contains("nats://<redacted>@h:4222"), "{msg}");
+            assert!(!msg.contains("hid"), "{msg}");
+            let env = resolve(&[("NATS_URL", url)]).unwrap();
+            assert!(!format!("{env:?}").contains("hid"), "{env:?}");
+        }
     }
 
     #[test]
@@ -581,7 +590,11 @@ mod tests {
 
     #[test]
     fn tls_needs_both_certificate_and_key_and_the_ca_stands_alone() {
-        let env = resolve(&[("NATS_CERT", "/c.pem"), ("NATS_CA", "/ca.pem")]).unwrap();
+        for half in [("NATS_CERT", "/c.pem"), ("NATS_KEY", "/k.pem")] {
+            let err = resolve(&[half, ("NATS_CA", "/ca.pem")]).unwrap_err();
+            assert!(format!("{err:#}").contains("must be set together"), "{err:#}");
+        }
+        let env = resolve(&[("NATS_CA", "/ca.pem")]).unwrap();
         assert!(env.tls.certificate.is_none());
         assert_eq!(env.tls.ca, Some(Path::new("/ca.pem").to_path_buf()));
         let env = resolve(&[("NATS_CERT", "/c.pem"), ("NATS_KEY", "/k.pem")]).unwrap();
