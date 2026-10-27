@@ -131,9 +131,9 @@ Like the bridge it is a reader of the WAL, never a step of a push (D32). It keep
   nats stream add WALGIT_EVENTS --subjects 'walgit.ref.>' --storage file --retention limits --dupe-window 1h --defaults
   ```
 
-  At boot it fails when the stream is missing and, with `verify_stream = true` (the default), when the stream
-  is not file storage with limits retention, a subject capturing `<subject_prefix>.ref.>` and a duplicate
-  window, naming every shortfall. Limits, replicas and placement stay the operator's choice.
+  At boot it fails when the stream is missing or is not file storage with limits retention, a subject
+  capturing `<subject_prefix>.ref.>` and a duplicate window, naming every shortfall. Limits, replicas and
+  placement stay the operator's choice.
 - **The stream is the cursor (D50).** For each repository the publisher reads the last message on the
   repository's subject, takes its `Walgit-Seq` header and resumes from that seq, inclusive. Events already in
   the stream are dropped, so a crash in the middle of a multi-ref entry completes only the rest of that entry. A repository with no message yet starts at `events.nats.start`: `oldest` (the oldest
@@ -212,7 +212,7 @@ Each behaviour above has a test against a real `nats-server -js` (`crates/walgit
 | A notification inside `wal.freshness_ttl` still publishes the push; no pack prefetch | `a_notification_inside_the_freshness_ttl_still_publishes_the_push`, `the_publisher_never_prefetches_packs_whatever_the_operator_configured` |
 | Subject tokens round-trip odd names and never carry `.`, `*`, `>` | `odd_names_round_trip_and_never_carry_a_metacharacter`, `every_single_byte_string_round_trips` (unit, `subject.rs`) |
 | Notification shapes: S3 multi-record, GCS finalize only, `store.prefix` | `an_s3_event_with_several_records_names_each_repo_once`, `a_gcs_envelope_counts_only_finalize_events`, `the_store_prefix_scopes_what_is_notified` (unit, `wake.rs`) |
-| A missing stream fails clearly and is never created; a misshapen one fails at boot unless `verify_stream = false`; an existing one is reused as is | `a_missing_stream_fails_clearly_and_is_never_created`, `a_misshapen_stream_fails_at_boot_unless_verification_is_off`, `an_existing_stream_with_other_settings_is_reused_not_clobbered` |
+| A missing stream fails clearly and is never created; a misshapen one fails at boot and is never altered; an existing one is reused as is | `a_missing_stream_fails_clearly_and_is_never_created`, `a_misshapen_stream_fails_at_boot_and_is_never_altered`, `an_existing_stream_with_other_settings_is_reused_not_clobbered` |
 | A bad server URL fails to connect naming the setting | `an_unparsable_server_url_fails_to_connect_naming_the_setting` |
 | Tags, deletes and non-branch refs carry `ref_type` and zero OIDs | `tags_and_deletes_carry_their_ref_type_and_zero_oids` |
 | Many pushes land in seq order across catch-ups | `many_sequential_pushes_land_in_seq_order_across_catch_ups` |
