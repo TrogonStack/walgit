@@ -5916,7 +5916,6 @@ dependencies = [
  "parking_lot",
  "rand 0.9.5",
  "reqwest 0.12.28",
- "rustls 0.23.45",
  "serde",
  "serde_json",
  "sha1 0.10.7",
@@ -5925,12 +5924,13 @@ dependencies = [
  "tokio-util",
  "toml",
  "tracing",
- "tracing-subscriber",
  "walgit-config",
  "walgit-git",
+ "walgit-nats",
  "walgit-proto",
  "walgit-server",
  "walgit-store",
+ "walgit-telemetry",
  "walgit-wal",
 ]
 
@@ -6004,6 +6004,7 @@ dependencies = [
  "anyhow",
  "async-nats",
  "bytes",
+ "futures",
  "nkeys",
  "percent-encoding",
  "rcgen",
@@ -6042,6 +6043,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-compression",
+ "async-nats",
  "async-trait",
  "axum",
  "base64",
@@ -6096,8 +6098,10 @@ dependencies = [
  "walgit-config",
  "walgit-events",
  "walgit-git",
+ "walgit-nats",
  "walgit-proto",
  "walgit-store",
+ "walgit-telemetry",
  "walgit-wal",
 ]
 
@@ -6136,6 +6140,23 @@ dependencies = [
  "uuid",
  "walgit-config",
  "walgit-proto",
+]
+
+[[package]]
+name = "walgit-telemetry"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "http 1.5.0",
+ "parking_lot",
+ "rand 0.9.5",
+ "reqwest 0.12.28",
+ "rustls 0.23.45",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "walgit-config",
 ]
 
 [[package]]

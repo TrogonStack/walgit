@@ -99,7 +99,7 @@ pub async fn request_id(
 
     // Extract trace context for Cloud Logging correlation (a serverless host's LB
     // always sets X-Cloud-Trace-Context; the layer mints one otherwise).
-    let trace_id = crate::telemetry::extract_trace_id(req.headers());
+    let trace_id = walgit_telemetry::extract_trace_id(req.headers());
     let user_agent = req
         .headers()
         .get(axum::http::header::USER_AGENT)

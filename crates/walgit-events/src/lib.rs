@@ -1,6 +1,6 @@
 //! `ref` event shapes and the WAL → event conversion. Contract:
 //! `docs/EVENTS.md`. Shared by the producers (the webhook bridge in
-//! `walgit-server`): they tail each
+//! `walgit-server`, the `JetStream` publisher in `walgit-nats`): they tail each
 //! repo's WAL from a durable cursor and convert committed PUSH / `REF_UPDATE`
 //! entries with [`refs_from_entries`]. Nothing on the push path knows events
 //! exist, and neither does the WAL crate (D32).

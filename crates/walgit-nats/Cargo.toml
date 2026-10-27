@@ -16,6 +16,7 @@ percent-encoding.workspace = true
 anyhow.workspace = true
 thiserror.workspace = true
 bytes.workspace = true
+futures.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 serde.workspace = true

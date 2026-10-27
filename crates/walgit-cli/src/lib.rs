@@ -48,12 +48,11 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 
 use walgit_config::Config;
-use walgit_server::telemetry::tracing_init;
 
 #[derive(Parser)]
 #[command(
     name = "walgit",
-    version = walgit_server::health::BUILD_SHA,
+    version = walgit_telemetry::BUILD_SHA,
     about = "Git at any scale, on object storage, in Rust"
 )]
 struct Cli {
@@ -73,7 +72,7 @@ struct Cli {
 
 /// `walgit-server`: the server and nothing else.
 #[derive(Parser)]
-#[command(name = "walgit-server", version = walgit_server::health::BUILD_SHA, about = "walgit, standalone: git at any scale on an object-storage bucket")]
+#[command(name = "walgit-server", version = walgit_telemetry::BUILD_SHA, about = "walgit, standalone: git at any scale on an object-storage bucket")]
 struct ServerCli {
     /// Path to the configuration file.
     #[arg(
@@ -109,6 +108,8 @@ enum Command {
         #[command(subcommand)]
         action: RepoAction,
     },
+    /// Publish the WAL's ref events into NATS `JetStream` (`[events.nats]`, `docs/EVENTS.md`).
+    Nats,
     /// WAL inspection and rewind.
     Wal {
         #[command(subcommand)]
@@ -400,30 +401,6 @@ enum SynthSize {
     L,
 }
 
-fn load_config(path: &std::path::Path) -> Config {
-    if path.exists() {
-        match Config::load(path) {
-            Ok(c) => c,
-            Err(e) => {
-                eprintln!(
-                    "walgit: error loading config from {}: {e:#}",
-                    path.display()
-                );
-                std::process::exit(1);
-            }
-        }
-    } else {
-        // Never run against defaults by accident: a typo'd --config would open the
-        // default bucket with whatever credentials are around. Defaults + WALGIT__
-        // env on purpose: `--config /dev/null`.
-        eprintln!(
-            "walgit: config file {} not found (pass --config PATH or WALGIT_CONFIG; `--config /dev/null` for defaults + WALGIT__ env)",
-            path.display()
-        );
-        std::process::exit(2);
-    }
-}
-
 pub fn main() -> Result<()> {
     let cli = Cli::parse();
     run(&cli.config, cli.command.unwrap_or(Command::Serve))
@@ -435,14 +412,7 @@ pub fn main_server() -> Result<()> {
 }
 
 fn run(config: &std::path::Path, command: Command) -> Result<()> {
-    // Install the rustls crypto provider before any TLS code runs (GCS gRPC, reqwest).
-    // Required for rustls 0.23+ — multiple providers in the dep tree; select one.
-    rustls::crypto::aws_lc_rs::default_provider()
-        .install_default()
-        .expect("install rustls aws_lc_rs provider");
-
-    let cfg = load_config(config);
-    tracing_init(&cfg);
+    let cfg = walgit_telemetry::startup(config, "walgit");
 
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -471,6 +441,7 @@ async fn dispatch(command: Command, cfg: Config) -> Result<()> {
         } => compact::run(repo, all, once, base, &cfg).await,
         Command::Repo { action } => repo::run(action, &cfg).await,
         Command::Wal { action } => wal_cmd::run(action, &cfg).await,
+        Command::Nats => walgit_nats::run(cfg.clone()).await,
         Command::Mirror {
             from,
             to,

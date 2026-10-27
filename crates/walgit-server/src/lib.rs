@@ -58,7 +58,6 @@ pub mod smart;
 pub mod sse;
 pub mod static_object;
 pub mod stream;
-pub mod telemetry;
 pub mod tls;
 pub mod web;
 

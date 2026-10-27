@@ -2,14 +2,15 @@
 #![allow(clippy::indexing_slicing, clippy::unwrap_used, clippy::expect_used)]
 
 //! The `JetStream` publisher against a real `nats-server -js` and the in-memory walgit store:
-//! the stream is the cursor (resume without republishing) and crash-mid-entry completion.
-//! Skips (passes) when `nats-server` is not on PATH.
+//! the stream is the cursor (resume without republishing), crash-mid-entry completion, the
+//! wake-ups and the service API. Skips (passes) when `nats-server` is not on PATH.
 
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use async_nats::jetstream;
+use futures::StreamExt;
 use walgit_config::{Config, NatsStart};
 use walgit_events::refs_from_entries;
 use walgit_git::{ObjectFormat, RepoId};
@@ -206,6 +207,38 @@ impl Rig {
         }
     }
 
+    async fn spawn_notify(&self, publisher: &Arc<Publisher>) -> tokio::task::JoinHandle<anyhow::Result<()>> {
+        let nats_cfg = &self.cfg.events.nats;
+        let sub = walgit_nats::wake::subscribe(
+            &self.client,
+            nats_cfg.notify_subject.clone(),
+            nats_cfg.queue_group.clone(),
+        )
+        .await
+        .unwrap();
+        tokio::spawn(walgit_nats::wake::notify_loop(
+            sub,
+            self.cfg.store_prefix(),
+            publisher.clone(),
+        ))
+    }
+
+    async fn spawn_service(&self, publisher: &Arc<Publisher>) -> tokio::task::JoinHandle<anyhow::Result<()>> {
+        let queue_group = &self.cfg.events.nats.queue_group;
+        let registered =
+            walgit_nats::service::register(&self.client, &self.prefix, queue_group, publisher)
+                .await
+                .unwrap();
+        tokio::spawn(walgit_nats::service::serve(registered, publisher.clone()))
+    }
+
+    async fn notify(&self, body: &str) {
+        self.client
+            .publish(self.cfg.events.nats.notify_subject.clone(), body.to_string().into())
+            .await
+            .unwrap();
+    }
+
     async fn stream(&self) -> jetstream::stream::Stream {
         self.js
             .get_stream(&self.cfg.events.nats.stream)
@@ -217,6 +250,13 @@ impl Rig {
         self.stream().await.get_info().await.unwrap().state.messages
     }
 
+    async fn wait_for_messages(&self, n: u64) {
+        let t0 = Instant::now();
+        while self.message_count().await < n {
+            assert!(t0.elapsed() < Duration::from_secs(10), "timed out waiting for {n} messages");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -370,8 +410,74 @@ async fn a_second_publisher_that_moved_first_stops_this_one() {
     assert_eq!(rig.message_count().await, 1);
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn notifications_and_the_service_api_wake_the_publisher() {
+    let Some(nats) = start_nats().await else { return };
+    let rig = Rig::new(&nats, NatsStart::Oldest).await;
+    let id = RepoId::new("t", "r").unwrap();
+    rig.registry.create(&id, ObjectFormat::Sha1).await.unwrap();
+    let publisher = rig.publisher(NatsStart::Oldest).await;
+
+    let nats_cfg = &rig.cfg.events.nats;
+    let notify = rig.spawn_notify(&publisher).await;
+    let service = rig.spawn_service(&publisher).await;
+
+    // An S3 bucket notification, as the object store publishes it.
+    rig.push(&id, &[("refs/heads/main", ZERO, A)]).await;
+    let s3 = serde_json::json!({"Records": [{"eventName": "s3:ObjectCreated:Put",
+        "s3": {"object": {"key": "repos/t/r/manifest.pb"}}}]});
+    rig.client
+        .publish(nats_cfg.notify_subject.clone(), s3.to_string().into())
+        .await
+        .unwrap();
+    rig.wait_for_messages(1).await;
+
+    // {"repo": ...} through the same subject.
+    rig.push(&id, &[("refs/heads/main", A, B)]).await;
+    rig.client
+        .publish(nats_cfg.notify_subject.clone(), r#"{"repo":"t/r"}"#.into())
+        .await
+        .unwrap();
+    rig.wait_for_messages(2).await;
+
+    // The service endpoint.
+    rig.push(&id, &[("refs/heads/main", B, C)]).await;
+    let reply = rig
+        .client
+        .request("walgit.events.catch-up", r#"{"repo":"t/r"}"#.into())
+        .await
+        .unwrap();
+    let report: serde_json::Value = serde_json::from_slice(&reply.payload).unwrap();
+    assert_eq!((report["repo"].as_str(), report["emitted"].as_u64()), (Some("t/r"), Some(1)));
+    assert_eq!(rig.message_count().await, 3);
+
+    let missing = rig
+        .client
+        .request("walgit.events.catch-up", r#"{"repo":"t/none"}"#.into())
+        .await
+        .unwrap();
+    let code = missing.headers.as_ref().and_then(|h| h.get("Nats-Service-Error-Code"));
+    assert_eq!(code.map(|c| c.as_str().to_string()), Some("404".into()));
+
+    // The micro protocol's built-ins answer too.
+    let mut pings = rig.client.subscribe("inbox.ping").await.unwrap();
+    rig.client
+        .publish_with_reply("$SRV.PING.walgit-events", "inbox.ping", "".into())
+        .await
+        .unwrap();
+    let pong = tokio::time::timeout(Duration::from_secs(5), pings.next())
+        .await
+        .unwrap()
+        .unwrap();
+    let pong: serde_json::Value = serde_json::from_slice(&pong.payload).unwrap();
+    assert_eq!(pong["name"], "walgit-events");
+
+    notify.abort();
+    service.abort();
+}
+
 // ---------------------------------------------------------------------------------------------
-// Dedup, races, wipes, gaps and outages.
+// Dedup, races, wipes, gaps, outages and the wake-ups that must be ignored.
 // ---------------------------------------------------------------------------------------------
 
 async fn repo_with_three_events(rig: &Rig, owner: &str, name: &str) -> RepoId {
@@ -643,6 +749,47 @@ async fn an_outage_mid_catch_up_loses_and_duplicates_nothing() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn notifications_that_name_nothing_are_ignored_and_the_loop_survives() {
+    let Some(nats) = start_nats().await else { return };
+    let rig = Rig::new(&nats, NatsStart::Oldest).await;
+    let id = RepoId::new("t", "r").unwrap();
+    rig.registry.create(&id, ObjectFormat::Sha1).await.unwrap();
+    rig.push(&id, &[("refs/heads/main", ZERO, A)]).await;
+    let publisher = rig.publisher(NatsStart::Oldest).await;
+    let notify = rig.spawn_notify(&publisher).await;
+
+    for body in [
+        r#"{"key":"repos/t/r/wal/abc.pack"}"#,
+        r#"{"key":"somewhere/else/manifest.pb"}"#,
+        r#"{"repo":"t/ghost"}"#,
+        r#"{"key":"repos/t/ghost/manifest.pb"}"#,
+        r#"{"repo":"not a repo id"}"#,
+        r#"{"Records":[{"s3":{"object":{"key":"repos/t/ghost/manifest.pb"}}}]}"#,
+        "not json",
+        "{",
+        "",
+        "[]",
+        "null",
+        "\"a string\"",
+    ] {
+        rig.notify(body).await;
+    }
+    rig.client.publish(rig.cfg.events.nats.notify_subject.clone(), vec![0xff, 0xfe, 0x00].into()).await.unwrap();
+    rig.client.flush().await.unwrap();
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert!(!notify.is_finished(), "the notify loop must survive garbage");
+    assert_eq!(rig.message_count().await, 0, "nothing was published for any of them");
+    let repos: Vec<String> = rig.registry.list().await.unwrap().iter().map(ToString::to_string).collect();
+    assert_eq!(repos, ["t/r"], "an unknown repository is not created by being notified");
+
+    // A later valid notification still works.
+    rig.notify(r#"{"repo":"t/r"}"#).await;
+    rig.wait_for_messages(1).await;
+    assert!(!notify.is_finished());
+    notify.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn known_limitation_head_start_skips_pushes_made_while_the_publisher_was_down() {
     // PINNED: docs/EVENTS.md says `start = "head"` publishes only pushes made after the publisher
     // first saw the repository. The mark is in memory, so a restart before the repository's first
@@ -693,6 +840,159 @@ async fn a_foreign_message_on_a_repo_subject_fails_every_catch_up_with_a_clear_e
     rig.registry.create(&other, ObjectFormat::Sha1).await.unwrap();
     rig.push(&other, &[("refs/heads/main", ZERO, A)]).await;
     assert_eq!(publisher.catch_up(&other).await.unwrap().emitted, 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_nats_server_restart_keeps_the_stream_the_subscriptions_and_the_service() {
+    let Some(mut nats) = start_nats().await else { return };
+    let rig = Rig::new(&nats, NatsStart::Oldest).await;
+    let id = RepoId::new("t", "r").unwrap();
+    rig.registry.create(&id, ObjectFormat::Sha1).await.unwrap();
+    rig.push(&id, &[("refs/heads/main", ZERO, A)]).await;
+    let publisher = rig.publisher(NatsStart::Oldest).await;
+    let notify = rig.spawn_notify(&publisher).await;
+    let service = rig.spawn_service(&publisher).await;
+    rig.notify(r#"{"repo":"t/r"}"#).await;
+    rig.wait_for_messages(1).await;
+
+    nats.restart().await;
+    rig.wait_connected().await;
+    assert_eq!(rig.message_count().await, 1, "the stream survives the restart");
+
+    // The queue subscription is back: a notification after the restart triggers a catch-up.
+    rig.push(&id, &[("refs/heads/main", A, B)]).await;
+    rig.notify(r#"{"repo":"t/r"}"#).await;
+    rig.wait_for_messages(2).await;
+    assert_eq!(rig.ids().await, [msg_id(&id, 1, "refs/heads/main"), msg_id(&id, 2, "refs/heads/main")]);
+    assert!(!notify.is_finished() && !service.is_finished());
+
+    // The $SRV service is back too.
+    rig.push(&id, &[("refs/heads/main", B, C)]).await;
+    let reply = tokio::time::timeout(
+        Duration::from_secs(5),
+        rig.client.request("walgit.events.catch-up", r#"{"repo":"t/r"}"#.into()),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let report: serde_json::Value = serde_json::from_slice(&reply.payload).unwrap();
+    assert_eq!(report["emitted"], 1, "{report}");
+    assert_eq!(rig.message_count().await, 3, "nothing was republished");
+    notify.abort();
+    service.abort();
+}
+
+fn error_code(reply: &async_nats::Message) -> Option<String> {
+    reply
+        .headers
+        .as_ref()
+        .and_then(|h| h.get("Nats-Service-Error-Code"))
+        .map(|c| c.as_str().to_string())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_service_answers_bad_requests_and_reports_the_counters() {
+    let Some(nats) = start_nats().await else { return };
+    let rig = Rig::new(&nats, NatsStart::Oldest).await;
+    let id = repo_with_three_events(&rig, "t", "r").await;
+    let publisher = rig.publisher(NatsStart::Oldest).await;
+    let service = rig.spawn_service(&publisher).await;
+
+    for (body, code) in [
+        ("not json", "400"),
+        ("{}", "400"),
+        (r#"{"repo":42}"#, "400"),
+        (r#"{"repo":"no-slash"}"#, "400"),
+        (r#"{"repo":"a/b/c"}"#, "400"),
+        (r#"{"repo":"t/none"}"#, "404"),
+    ] {
+        let reply = rig.client.request("walgit.events.catch-up", body.into()).await.unwrap();
+        assert_eq!(error_code(&reply).as_deref(), Some(code), "{body}");
+    }
+
+    // published: 3 through the endpoint.
+    let reply = rig.client.request("walgit.events.catch-up", r#"{"repo":"t/r"}"#.into()).await.unwrap();
+    let report: serde_json::Value = serde_json::from_slice(&reply.payload).unwrap();
+    assert_eq!((report["emitted"].as_u64(), report["head_seq"].as_u64()), (Some(3), Some(2)));
+
+    // deduplicated: 3, from forcing a republish of the repository inside the window.
+    rig.inject(&id, 2, "refs/heads/not-in-the-entry").await;
+    let restarted = rig.publisher(NatsStart::Oldest).await;
+    restarted.catch_up(&id).await.unwrap();
+
+    // gap_entries: 3, on a second repository.
+    let gap = RepoId::new("t", "gap").unwrap();
+    rig.registry.create(&gap, ObjectFormat::Sha1).await.unwrap();
+    rig.push(&gap, &[("refs/heads/main", ZERO, A)]).await;
+    assert_eq!(publisher.catch_up(&gap).await.unwrap().emitted, 1);
+    for (old, new) in [(A, B), (B, C), (C, A)] {
+        rig.push(&gap, &[("refs/heads/main", old, new)]).await;
+    }
+    rig.registry.open(&gap).await.unwrap().write_checkpoint().await.unwrap();
+    rig.push(&gap, &[("refs/heads/main", A, B)]).await;
+    assert_eq!(publisher.catch_up(&gap).await.unwrap().gap, Some([2, 4]));
+
+    // The service's publisher is `publisher`: its counters are what $SRV.STATS reports.
+    let stats = rig.client.request("$SRV.STATS.walgit-events", "".into()).await.unwrap();
+    let stats: serde_json::Value = serde_json::from_slice(&stats.payload).unwrap();
+    eprintln!("stats: {stats}");
+    let data = &stats["endpoints"][0]["data"];
+    assert_eq!(stats["endpoints"][0]["subject"], "walgit.events.catch-up");
+    assert_eq!(data["published"], 5, "3 + 1 + 1");
+    assert_eq!(data["deduplicated"], 0, "the duplicates were counted by the other publisher");
+    assert_eq!(data["gap_entries"], 3);
+    assert_eq!(data["conflicts"], 0);
+    assert_eq!(data["sweep_found"], 0);
+    assert_eq!(restarted.counters.snapshot()["deduplicated"], 3);
+    service.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_periodic_sweep_finds_a_push_nobody_notified() {
+    let Some(nats) = start_nats().await else { return };
+    let rig = Rig::new(&nats, NatsStart::Oldest).await;
+    let id = RepoId::new("t", "r").unwrap();
+    rig.registry.create(&id, ObjectFormat::Sha1).await.unwrap();
+    rig.push(&id, &[("refs/heads/main", ZERO, A)]).await;
+    let publisher = rig.publisher(NatsStart::Oldest).await;
+    let sweeping = tokio::spawn(walgit_nats::wake::sweep_loop(publisher.clone(), Duration::from_millis(300)));
+
+    // The startup sweep legitimately finds work and does not count it.
+    rig.wait_for_messages(1).await;
+    assert_eq!(publisher.counters.snapshot()["sweep_found"], 0);
+
+    // No notification for this push: only the periodic sweep can find it.
+    rig.push(&id, &[("refs/heads/main", A, B)]).await;
+    rig.wait_for_messages(2).await;
+    // The sweep counts what it found once its catch-up returns, after the message is acknowledged.
+    let t0 = Instant::now();
+    while publisher.counters.snapshot()["sweep_found"] == 0 && t0.elapsed() < Duration::from_secs(10) {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(publisher.counters.snapshot()["sweep_found"], 1);
+    sweeping.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_notification_inside_the_freshness_ttl_still_publishes_the_push() {
+    let Some(nats) = start_nats().await else { return };
+    let rig = Rig::new(&nats, NatsStart::Oldest).await;
+    let id = RepoId::new("t", "r").unwrap();
+    rig.registry.create(&id, ObjectFormat::Sha1).await.unwrap();
+    rig.push(&id, &[("refs/heads/main", ZERO, A)]).await;
+    let (publisher, _registry, _cache) = rig
+        .operator_publisher(|c| c.wal.freshness_ttl = Duration::from_mins(10))
+        .await;
+    let notify = rig.spawn_notify(&publisher).await;
+    rig.notify(r#"{"repo":"t/r"}"#).await;
+    rig.wait_for_messages(1).await;
+
+    // Pushed through another registry: the publisher only learns of it from the bucket.
+    rig.push(&id, &[("refs/heads/main", A, B)]).await;
+    rig.notify(r#"{"repo":"t/r"}"#).await;
+    rig.wait_for_messages(2).await;
+    assert_eq!(rig.ids().await, [msg_id(&id, 1, "refs/heads/main"), msg_id(&id, 2, "refs/heads/main")]);
+    notify.abort();
 }
 
 fn pack_files(dir: &std::path::Path) -> Vec<std::path::PathBuf> {

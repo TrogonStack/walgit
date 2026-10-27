@@ -487,6 +487,14 @@ full cold-read/resource acceptance gates listed in `docs/spec/README.md`.
   and candidate external-boundary proof remain separate obligations; local loose objects and retired
   download membership cannot justify retirement. See the cost and remaining-evidence rows in the linked docs.
 
+- **D50 (2026-10-26): The JetStream sink's cursor lives in its own stream.** `walgit nats` publishes the
+  `ref` events of D32 into NATS JetStream and resumes from the last message on each repository's subject
+  (`Walgit-Seq` header, inclusive, then drop what the stream already holds). That cursor is the sink's state,
+  not walgit's: Principle I holds because wiping every walgit instance loses nothing, and wiping the stream
+  republishes the WAL window with older history backfilled from the WAL. The event model is the `walgit-events`
+  crate shared with the webhook bridge, whose bucket cursor (`events/cursor.json`) is unchanged. Wake-ups
+  arrive over NATS and the periodic sweep stays the backstop; the service API is the NATS micro protocol, no HTTP.
+
 ## 5. Working rules
 
 - **No backwards compatibility (pre-1.0, banner at top):** change the shape and delete the old one in the same

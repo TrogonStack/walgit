@@ -1,20 +1,25 @@
-//! `walgit nats`: the WAL's `ref` events (`docs/EVENTS.md`) published into NATS `JetStream`,
-//! with the cursor in the stream.
+//! `walgit nats`: the WAL's `ref` events (`docs/EVENTS.md`) published into NATS `JetStream`, with
+//! the cursor in the stream, wake-ups over NATS and a `$SRV` service API instead of HTTP.
 //! The event model is shared with the webhook bridge through `walgit-events`.
 
 pub mod env;
 pub mod message;
 pub mod publisher;
+pub mod service;
 pub mod stream_shape;
 pub mod subject;
 #[cfg(feature = "testing")]
 pub mod testing;
+pub mod wake;
+
+use std::sync::Arc;
 
 use anyhow::Context;
 use async_nats::jetstream::{self, stream};
 use walgit_config::{Config, NatsEventsConfig};
 
 use crate::env::{NatsEnv, Servers};
+use crate::publisher::Publisher;
 use crate::subject::SubjectPrefix;
 
 /// Connect to `NATS_URL`, or `[events.nats] urls` when it is unset, as `env` says. Only the
@@ -61,6 +66,24 @@ pub async fn open_stream(
     Ok(stream)
 }
 
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        match signal(SignalKind::terminate()) {
+            Ok(mut term) => {
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => {}
+                    _ = term.recv() => {}
+                }
+                return;
+            }
+            Err(e) => tracing::warn!(error = %e, "no SIGTERM handler"),
+        }
+    }
+    let _ = tokio::signal::ctrl_c().await;
+}
+
 /// The config the publisher's registry runs on. This process never applies a push itself, so a
 /// wake-up must always see the manifest as it is in the bucket (`freshness_ttl` would let it
 /// skip the GET and miss the push it was woken for), and it only reads manifest and log, so
@@ -73,6 +96,48 @@ pub fn publisher_config(cfg: &Config) -> Config {
     cfg.wal.prefetch_packs = false;
     cfg.cache.dir = cfg.cache.dir.join(".nats");
     cfg
+}
+
+/// `walgit nats`: publish until SIGTERM/ctrl-c, or fail when a worker stops.
+pub async fn run(cfg: Arc<Config>) -> anyhow::Result<()> {
+    let nats = &cfg.events.nats;
+    let prefix = SubjectPrefix::new(&nats.subject_prefix)?;
+    let store = walgit_store::open_store(&cfg).await?;
+    let registry = walgit_wal::Registry::new(store, Arc::new(publisher_config(&cfg)));
+
+    let client = crate::connect(nats, &NatsEnv::from_process_env()?).await?;
+    let js = async_nats::jetstream::new(client.clone());
+    let stream = crate::open_stream(&js, nats, &prefix).await?;
+    let publisher = Publisher::new(registry, js, stream, prefix.clone(), nats.start);
+    let sub = crate::wake::subscribe(&client, nats.notify_subject.clone(), nats.queue_group.clone())
+        .await?;
+    let registered =
+        crate::service::register(&client, &prefix, &nats.queue_group, &publisher).await?;
+    tracing::info!(stream = %nats.stream, prefix = %prefix, start = ?nats.start, "walgit-nats ready");
+
+    let mut tasks = tokio::task::JoinSet::new();
+    tasks.spawn(crate::wake::notify_loop(sub, cfg.store_prefix(), publisher.clone()));
+    tasks.spawn(crate::service::serve(registered, publisher.clone()));
+    tasks.spawn({
+        let publisher = publisher.clone();
+        let every = cfg.events.sweep_interval;
+        async move {
+            crate::wake::sweep_loop(publisher, every).await;
+            std::future::pending::<anyhow::Result<()>>().await
+        }
+    });
+
+    tokio::select! {
+        () = shutdown_signal() => tracing::info!("shutting down"),
+        Some(done) = tasks.join_next() => {
+            // A loop ending is a failure: the subscription or the service closed under us.
+            done.context("worker panicked")?.context("worker stopped")?;
+            anyhow::bail!("a worker stopped unexpectedly");
+        }
+    }
+    tasks.shutdown().await;
+    client.flush().await.ok();
+    Ok(())
 }
 
 #[cfg(test)]
