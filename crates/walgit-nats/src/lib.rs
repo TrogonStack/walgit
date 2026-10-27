@@ -62,10 +62,28 @@ pub async fn open_stream(
 /// The config the publisher's registry runs on. This process never applies a push itself, so a
 /// wake-up must always see the manifest as it is in the bucket (`freshness_ttl` would let it
 /// skip the GET and miss the push it was woken for), and it only reads manifest and log, so
-/// pack prefetch would pull bytes nobody reads. Both hold whatever `[wal]` says.
+/// pack prefetch would pull bytes nobody reads. Both hold whatever `[wal]` says. Its local copies
+/// live under `<cache.dir>/.nats` (no repository owner starts with `.`), so a `walgit serve` on the
+/// same `walgit.toml` never shares a working directory with it.
 pub fn publisher_config(cfg: &Config) -> Config {
     let mut cfg = cfg.clone();
     cfg.wal.freshness_ttl = std::time::Duration::ZERO;
     cfg.wal.prefetch_packs = false;
+    cfg.cache.dir = cfg.cache.dir.join(".nats");
     cfg
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_publisher_never_shares_local_copies_with_serve() {
+        let serve = Config::default();
+        let repo = walgit_git::RepoId::new("acme", "repo").unwrap();
+        let nats = publisher_config(&serve);
+        assert_eq!(nats.cache.dir, serve.cache.dir.join(".nats"));
+        assert_ne!(repo.local_dir(&nats.cache.dir), repo.local_dir(&serve.cache.dir));
+        assert!(walgit_git::RepoId::new(".nats", "repo").is_err(), "no owner can claim the directory");
+    }
 }
