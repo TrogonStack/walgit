@@ -115,15 +115,18 @@ webhook_secret = "…"          # env: WALGIT__EVENTS__WEBHOOK_SECRET
 sweep_interval = "5m"
 ```
 
-## Delivery: NATS JetStream (`walgit nats`)
+## Delivery: NATS JetStream (`walgit-nats`)
 
-`walgit nats` is a second sink for the same `ref` events, a subcommand of the normal CLI
-(`walgit nats --config walgit.toml`, `[events.nats]`) built on the `walgit-nats` crate, which depends on
-`walgit-events` (the shared event model) and never on `walgit-server`. The webhook bridge is unchanged and the two can run side by side.
+`walgit-nats` is a second sink for the same `ref` events, its own binary (`walgit-nats --config walgit.toml`,
+`[events.nats]`) built from the `walgit-nats` crate. It depends on `walgit-events` (the shared event model) and
+`walgit-telemetry` (config loading and logging), never on `walgit-server` or `walgit-cli`, so it carries no HTTP
+server and no web UI. The webhook bridge is unchanged and the two can run side by side.
 Like the bridge it is a reader of the WAL, never a step of a push (D32). It keeps its local copies under
 `<cache.dir>/.nats`, so it can share a `walgit.toml` and a host with `walgit serve` without touching serve's.
+`--config` (or `WALGIT_CONFIG`) may name that same file, or a second, smaller one holding only `[store]`,
+`[cache]`, `[wal]`, `[events]` and `[telemetry]`.
 
-- **The operator provisions the stream; `walgit nats` never creates it**, so its credentials need no
+- **The operator provisions the stream; `walgit-nats` never creates it**, so its credentials need no
   stream-admin permission, only stream info and message reads on the stream and publishes on its subjects.
   The stream it expects, for the default `stream` and `subject_prefix`:
 
@@ -152,7 +155,7 @@ Like the bridge it is a reader of the WAL, never a step of a push (D32). It keep
   shapes as `POST /_events/notify` (S3 event JSON, a GCS envelope, `{"key": ...}`, `{"repo": ...}`), and
   `events.sweep_interval` is the backstop with the same warning when it finds unpublished entries.
   Gap detection matches the bridge: a log gap is logged and the entries that are readable are published.
-- **Service API.** `walgit nats` registers a NATS micro service `walgit-events` (`$SRV.PING|INFO|STATS`, built in)
+- **Service API.** `walgit-nats` registers a NATS micro service `walgit-events` (`$SRV.PING|INFO|STATS`, built in)
   with one endpoint, `<subject_prefix>.events.catch-up`. Request `{"repo": "o/r"}`, reply the catch-up report
   (`repo`, `from_seq`, `head_seq`, `emitted`, `conflict`); an unknown repository is a 404 service error.
   Gap, conflict and sweep counters are in the stats response. There is no HTTP listener.
@@ -181,19 +184,19 @@ Like the bridge it is a reader of the WAL, never a step of a push (D32). It keep
   The webhook bridge has the same ambiguity from the other side: its cursor lives under the repository's prefix and
   is deleted with it, so the new incarnation is published from seq 1 and the dedup key `(repo, seq, ref_name)`
   collides with the old incarnation's events.
-- **Config adaptation.** `walgit nats` always revalidates the manifest (`wal.freshness_ttl` is forced to zero) and
+- **Config adaptation.** `walgit-nats` always revalidates the manifest (`wal.freshness_ttl` is forced to zero) and
   never prefetches packs (`wal.prefetch_packs` is forced off), whatever `[wal]` says, because it never applies a
   push itself and only reads manifest and log (`walgit_nats::publisher_config`).
 - **Cost.** Every wake-up for a repository reads the last message on its subject (one JetStream request) before
   deciding there is nothing to do, so a wiped stream is noticed without a restart.
 
 Each behaviour above has a test against a real `nats-server -js` (`crates/walgit-nats/tests/jetstream.rs`, and
-`crates/walgit-server/tests/events_nats.rs` with real git pushes); `tests/e2e.sh` runs `walgit nats` as a process.
+`crates/walgit-server/tests/events_nats.rs` with real git pushes); `tests/e2e.sh` runs `walgit-nats` as a process.
 
 | Behaviour | Test |
 |---|---|
 | Push becomes one message per ref with the bridge's event shape | `pushes_become_events_with_the_right_shape`, `an_atomic_multi_ref_push_is_one_message_per_ref_in_order` |
-| The webhook bridge and `walgit nats` emit the same events | `the_webhook_bridge_and_the_jetstream_publisher_agree` |
+| The webhook bridge and `walgit-nats` emit the same events | `the_webhook_bridge_and_the_jetstream_publisher_agree` |
 | Names are encoded in the subject | `a_dotted_repository_name_is_encoded_in_the_subject` |
 | The stream is the cursor; a restart resumes from it | `stream_is_the_cursor`, `a_restarted_publisher_resumes_from_the_stream` |
 | A crash mid-entry finishes that entry only | `a_crash_mid_entry_finishes_that_entry_only` |
@@ -231,8 +234,8 @@ urls = ["nats://nats.internal:4222"]
 start = "oldest"
 ```
 
-Credentials are never in `walgit.toml`. `walgit nats` reads the variables the `nats` CLI reads and combines
-them the way it does, so a shell where `nats` works runs `walgit nats` against the same server as the same
+Credentials are never in `walgit.toml`. `walgit-nats` reads the variables the `nats` CLI reads and combines
+them the way it does, so a shell where `nats` works runs `walgit-nats` against the same server as the same
 user. An empty variable counts as unset.
 
 | Variable | Effect |
@@ -247,7 +250,7 @@ user. An empty variable counts as unset.
 
 The identity is the first of user and password, `NATS_CREDS`, `NATS_NKEY`, then `NATS_JWT`, the order `nats`
 uses. A server URL written `user:password@host` or `token@host` replaces the user, password and token, as in
-`nats`; servers that carry credentials must carry the same ones. `NATS_CONTEXT` and `NATS_SOCKS_PROXY` stop `walgit nats` at startup: it reads no context files and has no
+`nats`; servers that carry credentials must carry the same ones. `NATS_CONTEXT` and `NATS_SOCKS_PROXY` stop `walgit-nats` at startup: it reads no context files and has no
 SOCKS dialer, and ignoring either would connect differently from `nats`. `NATS_TIMEOUT` and `NATS_COLOR` shape
 the CLI's own requests and output and have no effect here. Only the methods and the URLs without their
 credentials are logged, never a secret.

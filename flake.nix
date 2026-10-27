@@ -2,7 +2,7 @@
   # walgit — a git server that is one binary in front of an object store.
   #
   #   nix run github:<you>/walgit -- --config walgit.toml      # run it
-  #   nix build .#walgit                                       # result/bin/{walgit,walgit-server}
+  #   nix build .#walgit                                       # result/bin/{walgit,walgit-server,walgit-nats}
   #   nix build .#image && podman load < result                # an OCI image (same bytes as the Containerfile)
   #   nix develop                                              # rust, protobuf, pnpm, git, just, rustfs-compatible tools
   #
@@ -86,7 +86,7 @@
           src = rustSrc;
           strictDeps = true;
           nativeBuildInputs = with pkgs; [ protobuf pkg-config cmake perl python3 ];
-          cargoExtraArgs = "-p walgit-cli --locked";
+          cargoExtraArgs = "-p walgit-cli -p walgit-nats --locked";
           doCheck = false;
         };
         cargoArtifacts = craneLib.buildDepsOnly commonArgs;
@@ -101,7 +101,7 @@
           # `walgit serve` shells out to git and GNU sort/comm for bounded pack planning.
           nativeBuildInputs = commonArgs.nativeBuildInputs ++ [ pkgs.makeWrapper ];
           postInstall = ''
-            for b in walgit walgit-server; do
+            for b in walgit walgit-server walgit-nats; do
               wrapProgram "$out/bin/$b" --prefix PATH : ${lib.makeBinPath [ pkgs.git pkgs.git-lfs pkgs.coreutils ]}
             done
           '';

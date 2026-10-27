@@ -96,7 +96,7 @@ impl Rig {
         )
     }
 
-    /// What `walgit nats` runs: its own registry over the same store (it never sees the
+    /// What `walgit-nats` runs: its own registry over the same store (it never sees the
     /// writer's pushes except through the bucket) on the operator's `[wal]` settings, as
     /// `run` adapts them. Returns the registry's cache dir guard too.
     async fn operator_publisher(

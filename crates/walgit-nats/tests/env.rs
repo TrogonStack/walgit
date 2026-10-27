@@ -1,4 +1,4 @@
-//! `walgit nats` connects with whatever the `NATS_*` variables resolve to, against a real
+//! `walgit-nats` connects with whatever the `NATS_*` variables resolve to, against a real
 //! `nats-server` that requires it.
 
 use std::time::Duration;

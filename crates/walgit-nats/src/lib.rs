@@ -1,4 +1,4 @@
-//! `walgit nats`: the WAL's `ref` events (`docs/EVENTS.md`) published into NATS `JetStream`, with
+//! `walgit-nats`: the WAL's `ref` events (`docs/EVENTS.md`) published into NATS `JetStream`, with
 //! the cursor in the stream, wake-ups over NATS and a `$SRV` service API instead of HTTP.
 //! The event model is shared with the webhook bridge through `walgit-events`.
 
@@ -50,7 +50,7 @@ pub async fn open_stream(
 ) -> anyhow::Result<stream::Stream> {
     let stream = js.get_stream(&cfg.stream).await.with_context(|| {
         format!(
-            "stream {} (walgit nats never creates it; provision it as docs/EVENTS.md shows)",
+            "stream {} (walgit-nats never creates it; provision it as docs/EVENTS.md shows)",
             cfg.stream
         )
     })?;
@@ -98,7 +98,7 @@ pub fn publisher_config(cfg: &Config) -> Config {
     cfg
 }
 
-/// `walgit nats`: publish until SIGTERM/ctrl-c, or fail when a worker stops.
+/// `walgit-nats`: publish until SIGTERM/ctrl-c, or fail when a worker stops.
 pub async fn run(cfg: Arc<Config>) -> anyhow::Result<()> {
     let nats = &cfg.events.nats;
     let prefix = SubjectPrefix::new(&nats.subject_prefix)?;

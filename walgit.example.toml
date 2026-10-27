@@ -203,7 +203,7 @@ lock_wait_warn = "1s"             # WARN "lock wait" (lock, repo, wait_ms, reque
 # webhook_secret = ""             # X-Walgit-Signature: sha256=<HMAC-SHA256 of the body>; unset = unsigned
 # sweep_interval = "5m"           # backstop + health check (warns when a sweep finds unpublished entries); 0 = off
 
-[events.nats]                     # docs/EVENTS.md: read only by `walgit nats --config walgit.toml`
+[events.nats]                     # docs/EVENTS.md: read only by `walgit-nats --config walgit.toml`
 #   its local copies live under <cache.dir>/.nats, apart from walgit serve's on the same config
 # urls = ["nats://127.0.0.1:4222"]       # the client connects to the first reachable server
 #   the connection reads the `nats` CLI's variables the way it does (empty = unset): NATS_URL replaces urls;
@@ -212,7 +212,7 @@ lock_wait_warn = "1s"             # WARN "lock wait" (lock, repo, wait_ms, reque
 #   user:password@ or token@ in a server URL replaces the user, password and token;
 #   NATS_CERT + NATS_KEY, NATS_CA for TLS; NATS_CONTEXT and NATS_SOCKS_PROXY are refused; secrets are never logged
 # stream = "WALGIT_EVENTS"        # the JetStream stream holding the events (subjects "<subject_prefix>.ref.>"); it is the resume cursor
-#   walgit nats never creates the stream; provision it (docs/EVENTS.md), so it needs no stream-admin permission;
+#   walgit-nats never creates the stream; provision it (docs/EVENTS.md), so it needs no stream-admin permission;
 #   it fails at boot unless the stream is file storage, limits retention, captures the subjects and dedups
 # subject_prefix = "walgit"       # events go to "<subject_prefix>.ref.<owner>.<repo>"; metacharacters in names are %XX encoded
 # notify_subject = "walgit.notify" # core subject bucket notifications are published to (S3 event JSON, {"key"} or {"repo"})

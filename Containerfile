@@ -37,9 +37,10 @@ ARG WALGIT_BUILD_SHA=dev
 ENV WALGIT_BUILD_SHA=${WALGIT_BUILD_SHA}
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/target \
-    cargo build --release --locked -p walgit-cli \
+    cargo build --release --locked -p walgit-cli -p walgit-nats \
     && install -D target/release/walgit /out/bin/walgit \
-    && install -D target/release/walgit-server /out/bin/walgit-server
+    && install -D target/release/walgit-server /out/bin/walgit-server \
+    && install -D target/release/walgit-nats /out/bin/walgit-nats
 
 # ---- 3. runtime -----------------------------------------------------------------------------
 # trixie ships git 2.47+: walgit wants >= 2.47 on the server (pack.writeReverseIndex,
@@ -50,7 +51,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends git git-lfs cor
     && git --version
 RUN useradd --uid 1000 --create-home --shell /bin/sh walgit \
     && mkdir -p /etc/walgit /var/lib/walgit && chown walgit:walgit /var/lib/walgit
-COPY --from=build /out/bin/walgit /out/bin/walgit-server /usr/local/bin/
+COPY --from=build /out/bin/walgit /out/bin/walgit-server /out/bin/walgit-nats /usr/local/bin/
 COPY walgit.example.toml /etc/walgit/walgit.toml
 ENV RUST_LOG=info,walgit=debug \
     WALGIT_CONFIG=/etc/walgit/walgit.toml \

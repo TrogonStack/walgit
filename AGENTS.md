@@ -495,6 +495,11 @@ full cold-read/resource acceptance gates listed in `docs/spec/README.md`.
   crate shared with the webhook bridge, whose bucket cursor (`events/cursor.json`) is unchanged. Wake-ups
   arrive over NATS and the periodic sweep stays the backstop; the service API is the NATS micro protocol, no HTTP.
 
+- **D51 (2026-10-27): The JetStream sink ships as its own `walgit-nats` binary.** This amends D9's one-binary
+  rule for this sink only: it carries no HTTP server or web UI and depends on neither `walgit-server` nor
+  `walgit-cli`. It shares config loading and telemetry with the other binaries through `walgit-telemetry`, and
+  reads the same `walgit.toml` as serve or a smaller file holding only the sections it uses (`docs/EVENTS.md`).
+
 ## 5. Working rules
 
 - **No backwards compatibility (pre-1.0, banner at top):** change the shape and delete the old one in the same

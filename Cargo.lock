@@ -5926,7 +5926,6 @@ dependencies = [
  "tracing",
  "walgit-config",
  "walgit-git",
- "walgit-nats",
  "walgit-proto",
  "walgit-server",
  "walgit-store",
@@ -6004,7 +6003,9 @@ dependencies = [
  "anyhow",
  "async-nats",
  "bytes",
+ "clap",
  "futures",
+ "mimalloc",
  "nkeys",
  "percent-encoding",
  "rcgen",
@@ -6021,6 +6022,7 @@ dependencies = [
  "walgit-nats",
  "walgit-proto",
  "walgit-store",
+ "walgit-telemetry",
  "walgit-wal",
 ]
 

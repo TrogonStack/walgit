@@ -637,7 +637,7 @@ pub struct EventsConfig {
     /// warns when a sweep finds unpublished entries. `0` = off.
     #[serde(with = "humantime_serde")]
     pub sweep_interval: Duration,
-    /// The `JetStream` publisher (`walgit nats`, `docs/EVENTS.md`). Read only by that subcommand.
+    /// The `JetStream` publisher (`walgit-nats`, `docs/EVENTS.md`). Read only by that binary.
     pub nats: NatsEventsConfig,
 }
 
@@ -663,7 +663,7 @@ pub enum NatsStart {
     Head,
 }
 
-/// `[events.nats]`: `walgit nats` publishes the bridge's `ref` events into `JetStream`.
+/// `[events.nats]`: `walgit-nats` publishes the bridge's `ref` events into `JetStream`.
 /// The resume cursor is the last message on each repository's subject, so there is no cursor
 /// object in the bucket.
 #[derive(Debug, Clone, Serialize, Deserialize)]
