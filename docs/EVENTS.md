@@ -220,9 +220,24 @@ urls = ["nats://nats.internal:4222"]
 start = "oldest"
 ```
 
-Authentication is never in `walgit.toml`: `walgit nats` reads the standard NATS variables and uses the
-first that is set, `NATS_CREDS` (a `.creds` file), `NATS_NKEY` (a seed), `NATS_USER` with `NATS_PASSWORD`,
-then `NATS_TOKEN`; with none set it connects without credentials. Only the method is logged.
+Credentials are never in `walgit.toml`. `walgit nats` reads the variables the `nats` CLI reads and combines
+them the way it does, so a shell where `nats` works runs `walgit nats` against the same server as the same
+user. An empty variable counts as unset.
+
+| Variable | Effect |
+|---|---|
+| `NATS_URL` | Comma-separated servers; replaces `urls` |
+| `NATS_USER`, `NATS_PASSWORD` | User and password; `NATS_USER` alone is sent as a token, as in `nats` |
+| `NATS_CREDS` | `.creds` file, a path or `file://` |
+| `NATS_NKEY` | nkey seed file, a path or `file://` |
+| `NATS_JWT`, `NATS_SEED` | User JWT signed with the seed; `NATS_JWT` alone is a bearer JWT. Each is the value itself or `file://` |
+| `NATS_TOKEN` | Token, sent alongside any identity above |
+| `NATS_CERT`, `NATS_KEY`, `NATS_CA` | TLS client certificate and key (both needed), and the CA chain |
+
+The identity is the first of user and password, `NATS_CREDS`, `NATS_NKEY`, then `NATS_JWT`, the order `nats`
+uses. `NATS_CONTEXT` and `NATS_SOCKS_PROXY` stop `walgit nats` at startup: it reads no context files and has no
+SOCKS dialer, and ignoring either would connect differently from `nats`. `NATS_TIMEOUT` and `NATS_COLOR` shape
+the CLI's own requests and output and have no effect here. Only the methods are logged, never a secret.
 
 ## Consumer checklist
 
