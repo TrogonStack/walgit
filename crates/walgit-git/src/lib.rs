@@ -2282,6 +2282,7 @@ impl LocalRepo {
         // of the history pack and made pack generation copy 241 k tree
         // entries through the FUSE-linked base (prod: 23-minute clones with a
         // 2 s enumeration). Blobs still resolve to the base.
+        let _writer = midx::lock_midx_writer(self)?;
         let packs = self.packs()?;
         let history: Vec<&PackInfo> = packs.iter().filter(|p| p.history_of.is_some()).collect();
         let midx = self.objects_pack_dir().join("multi-pack-index");
