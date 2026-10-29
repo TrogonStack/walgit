@@ -71,7 +71,24 @@ pub fn router(state: Arc<AppState>) -> Router {
 
 // ---- CORS (browser lane from other origins) -----------------------------------
 
+/// The canonical serialization of `origin` when it is exactly a serialized
+/// origin (`scheme://host[:port]`). A `?`, `#`, `\\`, path or userinfo makes a
+/// browser read a different origin than a string matcher sees, so anything that
+/// does not round-trip through the URL parser is refused.
+fn serialized_origin(origin: &str) -> Option<String> {
+    let url = url::Url::parse(origin).ok()?;
+    let canonical = url.origin();
+    if !canonical.is_tuple() {
+        return None;
+    }
+    let canonical = canonical.ascii_serialization();
+    (canonical == origin).then_some(canonical)
+}
+
 fn origin_allowed(cfg: &walgit_config::Config, origin: &str) -> bool {
+    let Some(origin) = serialized_origin(origin) else {
+        return false;
+    };
     cfg.server.cors_origins.iter().any(|pat| {
         if let Some((scheme, host)) = pat.split_once("://*.") {
             origin
@@ -79,12 +96,11 @@ fn origin_allowed(cfg: &walgit_config::Config, origin: &str) -> bool {
                 .and_then(|o| o.strip_prefix("://"))
                 .is_some_and(|o| {
                     o.ends_with(host)
-                        && o.len() > host.len()
+                        && o.len() > host.len() + 1
                         && o.as_bytes()[o.len() - host.len() - 1] == b'.'
-                        && !o.contains('/')
                 })
         } else {
-            pat.eq_ignore_ascii_case(origin)
+            pat.eq_ignore_ascii_case(&origin)
         }
     })
 }
@@ -470,5 +486,49 @@ mod tests {
         assert!(!is_cors_api_path("/acme/monorepo.git/info/refs"));
         assert!(!is_cors_api_path("/_auth/check"));
         assert!(!is_cors_api_path("/services/api/owners"));
+    }
+
+    fn cfg_with(origins: &[&str]) -> walgit_config::Config {
+        let mut cfg = walgit_config::Config::default();
+        cfg.server.cors_origins = origins.iter().map(|o| (*o).to_owned()).collect();
+        cfg
+    }
+
+    #[test]
+    fn origin_allowed_matches_exact_and_wildcard_origins() {
+        let cfg = cfg_with(&["https://app.example.org", "https://*.example.com"]);
+        assert!(origin_allowed(&cfg, "https://app.example.org"));
+        assert!(origin_allowed(&cfg, "https://a.example.com"));
+        assert!(origin_allowed(&cfg, "https://a.b.example.com"));
+        assert!(!origin_allowed(&cfg, "https://example.com"));
+        assert!(!origin_allowed(&cfg, "https://.example.com"));
+        assert!(!origin_allowed(&cfg, "http://a.example.com"));
+        assert!(!origin_allowed(&cfg, "https://evilexample.com"));
+        assert!(!origin_allowed(&cfg, "https://other.example.org"));
+    }
+
+    #[test]
+    fn origin_allowed_rejects_origins_a_browser_would_read_differently() {
+        let cfg = cfg_with(&["https://*.example.com", "https://app.example.org"]);
+        for origin in [
+            "https://evil.com?.example.com",
+            "https://evil.com#.example.com",
+            "https://evil.com\\.example.com",
+            "https://evil.com/.example.com",
+            "https://evil.com/?.example.com",
+            "https://user@a.example.com",
+            "https://a.example.com/",
+            "https://a.example.com/path",
+            "https://a.example.com?",
+            "https://a.example.com#",
+            "https://app.example.org/",
+            "https://app.example.org?",
+            "https://app.example.org#x",
+            "",
+            "null",
+            "file:///a.example.com",
+        ] {
+            assert!(!origin_allowed(&cfg, origin), "accepted {origin:?}");
+        }
     }
 }
