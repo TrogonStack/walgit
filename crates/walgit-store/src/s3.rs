@@ -1245,11 +1245,13 @@ mod tests {
             .build();
         (
             S3Store {
-                client: S3Client::from_conf(config),
+                client: S3Client::from_conf(config.clone()),
+                read_client: S3Client::from_conf(config),
                 bucket: "bucket".into(),
                 http: reqwest::Client::new(),
                 multipart_threshold: 1,
                 multipart_part_size: 8,
+                max_retries: 0,
             },
             state,
             task,
