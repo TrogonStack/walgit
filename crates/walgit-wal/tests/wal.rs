@@ -167,6 +167,15 @@ fn make_txn(updates: Vec<(&str, &str, &str)>) -> RefTransaction {
     }
 }
 
+/// For tests that simulate a restart by dropping the registry and opening a new one: a
+/// real restart ends the commit-graph task a push leaves running, an in-process one does
+/// not, and that task would still be writing into the directory the reopen resets.
+fn restart_config(cache_dir: &Path) -> walgit_config::Config {
+    let mut cfg = make_config(cache_dir, 0);
+    cfg.git.commit_graph = false;
+    cfg
+}
+
 fn make_config(cache_dir: &Path, batch_window_ms: u64) -> walgit_config::Config {
     let mut cfg = walgit_config::Config::default();
     cfg.cache.dir = cache_dir.to_path_buf();
@@ -391,7 +400,7 @@ async fn an_open_racing_a_delete_sees_the_repository_gone() {
 async fn open_rebuilds_a_copy_whose_create_landed_without_its_reset() {
     let cache = tempfile::tempdir().unwrap();
     let store = MemoryStore::shared();
-    let cfg = Arc::new(make_config(&cache.path().join("a"), 0));
+    let cfg = Arc::new(restart_config(&cache.path().join("a")));
     let id = repo_id("test", "crashed");
 
     let registry = Registry::new(store.clone(), cfg.clone());
@@ -467,7 +476,7 @@ async fn an_interrupted_rebuild_is_rebuilt_again() {
 async fn a_refused_create_keeps_a_marker_an_earlier_create_left() {
     let cache = tempfile::tempdir().unwrap();
     let store = MemoryStore::shared();
-    let cfg = Arc::new(make_config(&cache.path().join("a"), 0));
+    let cfg = Arc::new(restart_config(&cache.path().join("a")));
     let id = repo_id("test", "remarked");
 
     let registry = Registry::new(store.clone(), cfg.clone());
