@@ -368,24 +368,27 @@ async fn upload_pack_v2(
             let sizes = match access {
                 walgit_wal::ObjectAccess::Local => {
                     let repo = handle.local().gix();
-                    oids.iter()
-                        .map(|oid| {
-                            let Some(oid) = oid else { return None };
-                            if let Some(size) =
-                                st.caches.object_info.get(&repo_key, version.as_ref(), *oid)
-                            {
-                                return size;
-                            }
-                            let size = gix_object::FindHeader::try_header(&repo.objects, oid)
-                                .ok()
-                                .flatten()
-                                .map(|header| header.size);
-                            st.caches
-                                .object_info
-                                .insert(&repo_key, version.as_ref(), *oid, size);
-                            size
-                        })
-                        .collect()
+                    let mut sizes = Vec::with_capacity(oids.len());
+                    for oid in &oids {
+                        let Some(oid) = oid else {
+                            sizes.push(None);
+                            continue;
+                        };
+                        if let Some(size) =
+                            st.caches.object_info.get(&repo_key, version.as_ref(), *oid)
+                        {
+                            sizes.push(size);
+                            continue;
+                        }
+                        let size = gix_object::FindHeader::try_header(&repo.objects, oid)
+                            .map_err(|e| ApiError::Internal(format!("object-info {oid}: {e}")))?
+                            .map(|header| header.size);
+                        st.caches
+                            .object_info
+                            .insert(&repo_key, version.as_ref(), *oid, size);
+                        sizes.push(size);
+                    }
+                    sizes
                 }
                 walgit_wal::ObjectAccess::Remote(packs) => {
                     let results = futures::future::join_all(oids.iter().map(|oid| {
