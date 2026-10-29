@@ -49,30 +49,17 @@ pub trait Settings: Serialize + DeserializeOwned + Default {
     /// Apply `WALGIT__a__b=v` overrides (values parsed as TOML values, falling back to string)
     /// and a serverless host's `PORT`.
     ///
-    /// Config and image are released independently (the ssd-host host follows
-    /// the serving image's version): an override for a key **unknown to this build**
-    /// (or with an unparsable value) is **ignored with a WARN**, never a
-    /// startup failure (2026-08-21: `unknown field disk_high_watermark`
-    /// crash-looped a host running the previous image). The ignored keys are
-    /// returned by [`Settings::apply_env_report`]. An override for a [`Settings::FOREIGN`]
-    /// section is another binary's, set in the same environment on purpose: skipped, not warned.
+    /// Fails closed, like an unknown key in the file (`deny_unknown_fields`): an override this
+    /// build cannot apply (a malformed name, an unknown section or key, a value of the wrong
+    /// type) is an error naming every such variable and the nearest known key, and nothing is
+    /// applied. An override under a [`Settings::FOREIGN`] path is another binary's, set in the
+    /// same environment on purpose: skipped, not refused. Validate an env file against the
+    /// binary that will run: `walgit config check --env-file`.
     fn apply_env(&mut self, vars: impl Iterator<Item = (String, String)>) -> Result<()> {
-        let ignored = self.apply_env_report(vars)?;
-        for (k, why) in &ignored {
-            tracing::warn!(key = %k, reason = %why, "ignoring {k}: unknown in this build");
-        }
-        Ok(())
-    }
-
-    /// [`Settings::apply_env`] returning the `(key, reason)` pairs it had to ignore.
-    fn apply_env_report(
-        &mut self,
-        vars: impl Iterator<Item = (String, String)>,
-    ) -> Result<Vec<(String, String)>> {
         let mut vars_seen: Vec<String> = Vec::new();
         let mut doc: toml::Table = toml::Table::try_from(&*self).context("serializing config")?;
         let mut touched = false;
-        let mut ignored = Vec::new();
+        let mut refused: Vec<String> = Vec::new();
         let mut port_override = None;
         for (k, v) in vars {
             if k == "PORT" {
@@ -83,7 +70,10 @@ pub trait Settings: Serialize + DeserializeOwned + Default {
                 continue;
             };
             let path: Vec<String> = rest.split("__").map(str::to_ascii_lowercase).collect();
-            if path.is_empty() || path.iter().any(std::string::String::is_empty) {
+            if path.iter().any(std::string::String::is_empty) {
+                refused.push(format!(
+                    "{k}: not a configuration path (WALGIT__SECTION__KEY)"
+                ));
                 continue;
             }
             if Self::FOREIGN.iter().any(|f| is_under(&path, f)) {
@@ -91,8 +81,8 @@ pub trait Settings: Serialize + DeserializeOwned + Default {
                 continue;
             }
             vars_seen.push(k.clone());
-            // Apply into a copy and type-check it alone: a bad/unknown key is
-            // dropped (WARN) instead of failing every other override with it.
+            // Apply into a copy and type-check it alone, so every unusable
+            // override is named at once, each with its own reason.
             let apply = |value: toml::Value| {
                 fn set(
                     cur: &mut toml::Table,
@@ -117,12 +107,7 @@ pub trait Settings: Serialize + DeserializeOwned + Default {
                 set(&mut trial, &path, value)?;
                 match trial.clone().try_into::<Self>() {
                     Ok(_) => Ok(trial),
-                    Err(e) => Err(e
-                        .to_string()
-                        .lines()
-                        .next()
-                        .unwrap_or("invalid")
-                        .to_string()),
+                    Err(e) => Err(crate::env_override_error(&path, &e.to_string())),
                 }
             };
             // The TOML reading first, then the text itself: a key that takes text keeps a
@@ -138,9 +123,14 @@ pub trait Settings: Serialize + DeserializeOwned + Default {
                     doc = trial;
                     touched = true;
                 }
-                Err(why) => ignored.push((k, why)),
+                Err(why) => refused.push(format!("{k}: {why}")),
             }
         }
+        anyhow::ensure!(
+            refused.is_empty(),
+            "WALGIT__ environment override(s) this build cannot apply:\n  {}",
+            refused.join("\n  ")
+        );
         // `[placement]` is a host fact set as a GROUP: any WALGIT__PLACEMENT__* override
         // replaces the whole section (unset keys = the section's defaults), never
         // merges with the baked file's. 2026-08-21 07:00Z: the image's toml carried
@@ -162,7 +152,7 @@ pub trait Settings: Serialize + DeserializeOwned + Default {
         if let Some(port) = port_override {
             self.apply_port(port);
         }
-        Ok(ignored)
+        Ok(())
     }
 }
 

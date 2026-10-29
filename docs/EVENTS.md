@@ -137,7 +137,7 @@ section a binary reads still fails it.
 So an invalid `[server.auth]` does not stop `walgit-nats`, and a bad `[events.nats]` does not stop the server.
 A `WALGIT__` variable for a section the binary skips (`WALGIT__SERVER__LISTEN` for `walgit-nats`,
 `WALGIT__EVENTS__NATS__STREAM` for the server) is skipped without a warning, so one environment can configure
-both; a key unknown to both is still warned about.
+both; a key unknown to both, or a wrong-typed value for a key the binary owns, fails startup.
 
 - **The operator provisions the stream; `walgit-nats` never creates it**, so its credentials need no
   stream-admin permission, only stream info and message reads on the stream and publishes on its subjects.
