@@ -948,6 +948,17 @@ async fn process_batch(handle: &RepoHandle, batch: Vec<PublishRequest>) -> Resul
             {
                 let packs = new_packs.clone();
                 tokio::spawn(async move {
+                    let _pack_guard = crate::lockwait::timed(
+                        "pack_mutex",
+                        &arc.id,
+                        arc.cfg.telemetry.lock_wait_warn,
+                        || arc.pack_mutex.try_lock().ok(),
+                        arc.pack_mutex.lock(),
+                    )
+                    .await;
+                    if arc.ensure_live().is_err() {
+                        return;
+                    }
                     let manifest = arc.manifest();
                     crate::sync::maintain_commit_graph(&arc, &manifest, &packs).await;
                 });
