@@ -158,6 +158,89 @@ pub fn refs_from_entries(repo: &RepoId, entries: &[LogEntry], out: &mut Vec<RefE
     }
 }
 
+/// `ref` events for the refs that differ between the last published snapshot
+/// and the refs of the checkpoint that folded the gap.
+///
+/// The bridge uses this when a checkpoint folded log entries it never read: the
+/// original entries are gone, but the cursor stored the refs that were visible
+/// at `published_seq`. `folded` must be the refs at `seq` (the checkpoint), never
+/// newer ones: the readable tail is published from the log afterwards and has to
+/// continue from the state these events end in. The synthetic events carry the
+/// checkpoint's seq, so a consumer's `(repo, seq, ref_name)` dedup still holds on
+/// a retry.
+pub fn refs_from_gap(
+    repo: &RepoId,
+    previous: &[(String, String)],
+    folded: &[(String, String)],
+    seq: u64,
+    out: &mut Vec<RefEvent>,
+) {
+    let previous: std::collections::BTreeMap<&str, &str> = previous
+        .iter()
+        .map(|(name, oid)| (name.as_str(), oid.as_str()))
+        .collect();
+    let current: std::collections::BTreeMap<&str, &str> = folded
+        .iter()
+        .map(|(name, oid)| (name.as_str(), oid.as_str()))
+        .collect();
+    for (name, oid) in &current {
+        match previous.get(*name) {
+            Some(old) if old == oid => {}
+            Some(old) => out.push(snapshot_event(Action::Update, name, old, oid, seq, repo)),
+            None if name.starts_with("refs/") => {
+                out.push(snapshot_event(
+                    Action::Create,
+                    name,
+                    &zero_like(oid),
+                    oid,
+                    seq,
+                    repo,
+                ));
+            }
+            None => {}
+        }
+    }
+    for (name, old) in &previous {
+        if !current.contains_key(*name) {
+            out.push(snapshot_event(
+                Action::Delete,
+                name,
+                old,
+                &zero_like(old),
+                seq,
+                repo,
+            ));
+        }
+    }
+    out.sort_by(|a, b| a.ref_name.cmp(&b.ref_name));
+}
+
+fn snapshot_event(
+    action: Action,
+    name: &str,
+    old: &str,
+    new: &str,
+    seq: u64,
+    repo: &RepoId,
+) -> RefEvent {
+    RefEvent {
+        action,
+        ref_type: ref_type(name),
+        ref_name: name.to_owned(),
+        old: old.to_owned(),
+        new: new.to_owned(),
+        pusher: "walgit".to_owned(),
+        correlation_id: String::new(),
+        repo: repo.to_string(),
+        walgit: WalgitExt {
+            schema_version: 1,
+            seq: seq.to_string(),
+            entry_kind: "ref_update".to_owned(),
+            request_id: String::new(),
+        },
+    }
+}
+
 /// The bucket object keys a notification body names, `store.prefix` included as the
 /// notifications carry it. Store-agnostic.
 pub fn notified_keys(v: &serde_json::Value, store_prefix: &str) -> Vec<String> {
@@ -385,5 +468,54 @@ mod tests {
             (d.old.as_str(), d.new.as_str()),
             (SHA, "0".repeat(40).as_str())
         );
+    }
+
+    #[test]
+    fn gap_events_cover_updates_creates_and_deletes() {
+        let repo = walgit_git::RepoId::new("t", "r").unwrap();
+        let previous = vec![
+            ("refs/heads/main".to_owned(), "aaaa".to_owned()),
+            ("refs/heads/gone".to_owned(), "bbbb".to_owned()),
+        ];
+        let current = vec![
+            ("refs/heads/main".to_owned(), "cccc".to_owned()),
+            ("refs/heads/new".to_owned(), "dddd".to_owned()),
+        ];
+        let mut out = Vec::new();
+        refs_from_gap(&repo, &previous, &current, 7, &mut out);
+        assert_eq!(out.len(), 3);
+        assert!(out.iter().any(|e| {
+            e.action == Action::Update && e.ref_name == "refs/heads/main" && e.new == "cccc"
+        }));
+        assert!(out.iter().any(|e| {
+            e.action == Action::Create
+                && e.ref_name == "refs/heads/new"
+                && e.old.chars().all(|c| c == '0')
+        }));
+        assert!(
+            out.iter()
+                .any(|e| { e.action == Action::Delete && e.ref_name == "refs/heads/gone" })
+        );
+        assert!(out.iter().all(|e| e.walgit.seq == "7"));
+    }
+
+    #[test]
+    fn gap_events_skip_unchanged_refs() {
+        let repo = walgit_git::RepoId::new("t", "r").unwrap();
+        let previous = vec![("refs/heads/main".to_owned(), "aaaa".to_owned())];
+        let current = vec![("refs/heads/main".to_owned(), "aaaa".to_owned())];
+        let mut out = Vec::new();
+        refs_from_gap(&repo, &previous, &current, 8, &mut out);
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn an_empty_snapshot_creates_every_folded_ref() {
+        let repo = walgit_git::RepoId::new("t", "r").unwrap();
+        let folded = vec![("refs/heads/main".to_owned(), "aaaa".to_owned())];
+        let mut out = Vec::new();
+        refs_from_gap(&repo, &[], &folded, 3, &mut out);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].action, Action::Create);
     }
 }

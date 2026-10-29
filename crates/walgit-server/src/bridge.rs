@@ -29,16 +29,28 @@ use chrono::Utc;
 use walgit_git::RepoId;
 use walgit_store::{ObjectStoreExt, PutMode, StoreError};
 
-use walgit_events::{RefEvent, manifest_repo, notified_keys, refs_from_entries};
+use walgit_events::{RefEvent, manifest_repo, notified_keys, refs_from_entries, refs_from_gap};
 
 use crate::events::{self, Sink};
 
 const CURSOR_KEY: &str = "events/cursor.json";
 
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct PublishedRef {
+    name: String,
+    oid: String,
+}
+
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 struct Cursor {
     published_seq: u64,
     updated_at: String,
+    /// Refs as of `published_seq`. `None` is a cursor written before refs were
+    /// stored: the bridge cannot reconstruct a gap from it and records the refs
+    /// on its next successful pass. `Some(vec![])` is a repository that really
+    /// had no refs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    refs: Option<Vec<PublishedRef>>,
 }
 
 /// What one `catch_up` did.
@@ -116,30 +128,50 @@ impl Bridge {
         let (cursor, version) = match store.get_bytes(CURSOR_KEY).await? {
             Some((meta, bytes)) => {
                 let c: Cursor = serde_json::from_slice(&bytes).context("events/cursor.json")?;
-                (Some(c.published_seq), Some(meta.version))
+                (Some(c), Some(meta.version))
             }
             None => (None, None),
         };
-        let mut from = cursor.unwrap_or(readable_from);
+        let current = handle.local().refs().context("events bridge: local refs")?;
+        let mut from = cursor.as_ref().map_or(readable_from, |c| c.published_seq);
+        let mut emitted = 0usize;
         let mut gap = None;
         if from < readable_from {
             gap = Some([from + 1, readable_from]);
             metrics::counter!("events_bridge_gap_total", "repo" => id.to_string())
                 .increment(readable_from - from);
             tracing::warn!(repo = %id, first = from + 1, last = readable_from,
-                "events bridge: entries folded into a checkpoint before they were published; consumers backfill from the WAL");
+                "events bridge: entries folded into a checkpoint before they were published; publishing the refs that changed since the cursor");
+            // The baseline is the checkpoint that folded the gap, not the
+            // current refs: the readable tail is published from the log right
+            // after, and must continue the old/new chain from this state.
+            if let Some(previous) = cursor.as_ref().and_then(|c| c.refs.as_ref()) {
+                let previous = previous
+                    .iter()
+                    .map(|r| (r.name.clone(), r.oid.clone()))
+                    .collect::<Vec<_>>();
+                let folded = handle
+                    .refs_at_seq(&manifest, readable_from)
+                    .await
+                    .context("events bridge: refs at the folding checkpoint")?;
+                let folded = folded
+                    .refs
+                    .into_iter()
+                    .map(|r| (r.name, r.oid))
+                    .collect::<Vec<_>>();
+                let mut batch = Vec::new();
+                refs_from_gap(id, &previous, &folded, readable_from, &mut batch);
+                if !batch.is_empty() {
+                    // A failing sink returns here: cursor untouched, retried on
+                    // the next wake-up with the same synthetic events.
+                    self.publish(&batch).await?;
+                    emitted += batch.len();
+                }
+            }
             from = readable_from;
         }
         metrics::gauge!("events_bridge_lag_entries", "repo" => id.to_string())
             .set((head - from) as f64);
-        let mut report = CatchUp {
-            repo: id.to_string(),
-            from_seq: from,
-            head_seq: head,
-            emitted: 0,
-            gap,
-        };
-
         if head > from {
             let entries = handle.read_log(&manifest, from + 1, Some(head)).await?;
             let mut batch = Vec::new();
@@ -147,13 +179,25 @@ impl Bridge {
             // A failing sink returns here: cursor untouched, retried on the
             // next wake-up.
             self.publish(&batch).await?;
-            report.emitted = batch.len();
+            emitted += batch.len();
         }
 
-        if cursor != Some(head) {
+        let refs = current
+            .refs
+            .iter()
+            .map(|r| PublishedRef {
+                name: r.name.clone(),
+                oid: r.oid.clone(),
+            })
+            .collect::<Vec<_>>();
+        let cursor_moved = cursor
+            .as_ref()
+            .is_none_or(|c| c.published_seq != head || c.refs.as_ref() != Some(&refs));
+        if cursor_moved {
             let body = serde_json::to_vec(&Cursor {
                 published_seq: head,
                 updated_at: Utc::now().to_rfc3339(),
+                refs: Some(refs),
             })?;
             let mode = match version {
                 Some(v) => PutMode::Update(v),
@@ -170,11 +214,17 @@ impl Bridge {
             }
         }
         metrics::gauge!("events_bridge_lag_entries", "repo" => id.to_string()).set(0.0);
-        if report.emitted > 0 {
-            tracing::info!(repo = %id, from = from, head = head, emitted = report.emitted,
+        if emitted > 0 {
+            tracing::info!(repo = %id, from = from, head = head, emitted,
                 "events bridge: published");
         }
-        Ok(report)
+        Ok(CatchUp {
+            repo: id.to_string(),
+            from_seq: from,
+            head_seq: head,
+            emitted,
+            gap,
+        })
     }
 
     /// Every repo (a `list` + one conditional manifest GET each): the backstop
@@ -312,4 +362,25 @@ pub fn spawn_sweeper(state: Arc<crate::AppState>) {
             bridge.sweep().await;
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Cursor;
+
+    #[test]
+    fn a_cursor_without_refs_is_not_an_empty_snapshot() {
+        let legacy: Cursor =
+            serde_json::from_str(r#"{"published_seq":3,"updated_at":"t"}"#).unwrap();
+        assert_eq!(legacy.refs, None);
+        let empty: Cursor =
+            serde_json::from_str(r#"{"published_seq":3,"updated_at":"t","refs":[]}"#).unwrap();
+        assert_eq!(empty.refs, Some(Vec::new()));
+        assert!(
+            serde_json::to_string(&empty)
+                .unwrap()
+                .contains(r#""refs":[]"#)
+        );
+        assert!(!serde_json::to_string(&legacy).unwrap().contains("refs"));
+    }
 }
