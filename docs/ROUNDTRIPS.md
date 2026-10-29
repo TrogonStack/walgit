@@ -42,14 +42,14 @@ right shape. This document is the thinking tool; apply it to every protocol chan
 | Any read (`info/refs`, ls-refs, web refs/resolve) | 1 cond GET (or 0 within `freshness_ttl`) | 1 | `sync.rs::freshness_check` |
 | Cold Refs sync | 1 manifest GET → 1 round (checkpoint refs ∥ log tail segments) | no checkpoint: 1 + tail (2 with one segment); checkpoint: 2 + tail | `registry.rs::open`, `sync.rs` |
 | Old checkpoint without inline refs descriptor | manifest GET → committed checkpoint metadata GET → its refs GET (tail can overlap) | one additional GET compared with a new descriptor; the old address must come from committed metadata, never a guessed sequence path | `snapshots.rs::checkpoint_snapshot` |
-| Push request / publish (`process_batch`) | 1 freshness GET → pack PUT ∥ idx PUT ∥ log PUT (1 round) → manifest CAS (1 round) | request: 5; already-synced publish: 4 | `publish.rs` |
+| Push request / publish (`process_batch`) | 1 freshness GET → pack PUT ∥ idx PUT ∥ log PUT (1 round) → manifest CAS (1 round) | request: 5; already-synced publish: 4. On S3 a pack or idx above `store.multipart_threshold` (64 MiB) and below the 256 MiB striping cut is a multipart Create: CreateMultipartUpload → N sequential UploadPart → conditional CompleteMultipartUpload, so that object costs N+2 requests and N+2 depth (3–8 parts at the default 32 MiB part size) instead of 1; striped packs (`put_file_parallel`) are unchanged | `publish.rs` |
 | Compaction publish | same shape as push | — | `publish.rs::publish_compact_impl` |
 | Conserving lifecycle | acquire lease → captured refs/full sync → each output publishes additively → final seal (lease heartbeat → refs revalidation → immutable log PUT → manifest CAS) | one additive publication per new physical checksum and one final CAS; heartbeat GET/CAS calls and full-sync downloads are additional maintenance costs; no change to ordinary push/read budgets | `pack_lifecycle.rs`, `classification.rs::seal_pack_replacement` |
 | Coverage repair | captured snapshot Create → bounded batches of classification CAS → final certificate CAS | snapshot equality GET only on Create conflict; up to 128 classifications per batch; every certificate rechecks current policy and live membership | `pack_lifecycle.rs::repair_metadata` |
 | Native URI selection | existing fetch sync → exact coverage snapshot GET | normally +1 GET, shared maximum 3 attempts across all groups; current manifest/ref view capture adds no GET; optional index trailers are local bounded reads | `packfile_uri.rs::select`, `snapshots.rs::fetch_view` |
 | Protocol v2 object-info | 1 conditional manifest GET; warm size cache adds 0 reads; a remote miss performs the object's pack range reads, with requested objects in parallel | no LIST or pack materialization; placement and requests above 1,024 OIDs are refused before sync; local objects use header lookup and remote delta sizes may require delta/base headers | `smart.rs`, `cache.rs`, `remote.rs::header` |
 | Static pack/index GET | manifest revalidation → object HEAD → body/range GET | 3 warm requests; conditional 304/HEAD omits the body GET; cold registry open may add its normal snapshot/tail reads; no pack materialization or LIST | `packfile_uri.rs::get`, `static_object.rs` |
-| Checkpoint | 1 cond GET (freshness) → refs PUT ∥ checkpoint PUT → manifest CAS | 3 rounds, 4 requests (was 6/6 until 2026-08-22: a bundle-list GET before the checkpoint PUT and a log GET for provenance times sat in the chain; times now come from the writer's own applied state, `bundle_key` is no longer looked up) | `checkpoint.rs` |
+| Checkpoint | 1 cond GET (freshness) → refs PUT ∥ checkpoint PUT → manifest CAS | 3 rounds, 4 requests (was 6/6 until 2026-08-22: a bundle-list GET before the checkpoint PUT and a log GET for provenance times sat in the chain; times now come from the writer's own applied state, `bundle_key` is no longer looked up). On S3 a checkpoint object above `store.multipart_threshold` is a multipart Create and costs N+2 requests and depth for its N parts | `checkpoint.rs` |
 | Validated remote index admission | warm valid index: 0 store requests; absent/corrupt index: index GET (HEAD first only for old descriptors with unknown size), at most four indexes downloading concurrently | unchanged healthy store depth; corruption now triggers repair instead of admitting bad evidence. Checksums, lock, mmap and cleanup are local work; no LIST. Per-index checksum CPU cost occurs when constructing a new remote inventory, not per object lookup. | `index_cache.rs`, `remote.rs` |
 | Final replacement evidence | coherent refs-level manifest capture → verified current index mappings → conservation/current-tip scan → existing log claim/CAS | warm indexes add 0 store requests; cold/bad evidence adds index GETs (HEAD only for unknown sizes), four concurrent downloads. O(refs) local capture and streaming index-union scan per CAS attempt; no pack download or LIST. This cost is not zero-read or constant-time seal certification. | `classification.rs`, `closure.rs`, `index_cache.rs` |
 | Lost CAS response resolution | fresh manifest GET; only if the exact segment descriptor is listed, GET and compare the claimed log bytes | normally +1 GET on this failure path compared with key/sequence-only resolution; no added successful-push requests. Missing/folded evidence remains unknown. Per-attempt nonce and actual frame sizes are computed locally. | `publish.rs::cas_landed` |
@@ -114,3 +114,19 @@ link, so a scenario can assert "a push on a healthy link is ≤ N requests" as a
 - What moved to the failure path, and how often that path runs (measured or reasoned).
 - Which CAS'd object's write rate changes.
 - Sim scenario(s) covering the new failure mode; `Stats::ops` budget assertion if the hot path changed.
+
+### Conditional storage operations (2026-09-13)
+
+S3 conditional DELETE is one conditional DELETE (formerly HEAD → unconditional DELETE,
+2 requests/depth). A 412 may add one failure-only HEAD to distinguish an absent key on compatible services; successful deletes never probe.
+S3 compose removes its destination existence HEAD; source HEADs/staging are unchanged and
+create/update preconditions apply at the final multipart commit. Large conditional PUTs
+now use bounded multipart staging plus conditional completion instead of a single PUT.
+There is no unconditional retry when a provider refuses the conditional operation.
+GCS invalid update tokens fail locally with zero requests, rather than dropping the
+condition. These preserve C3/C7/B5 at the actual storage commit point.
+
+AWS documents the native conditions for [DELETE](https://docs.aws.amazon.com/AmazonS3/latest/API/API_DeleteObject.html)
+and [multipart completion](https://docs.aws.amazon.com/AmazonS3/latest/API/API_CompleteMultipartUpload.html).
+The SDK-transport tests assert headers, stale-token rejection, surviving rival data and
+multipart aborts. Model/negative controls and witnesses: `StoreConditions`.
