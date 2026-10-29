@@ -41,23 +41,53 @@ fn checked(command: &mut Command, input: Option<&[u8]>) -> Result<(), GitError> 
     Ok(())
 }
 
-/// Remove a `multi-pack-index.lock` left behind by a crashed writer.
-///
-/// Walgit's per-repository lease makes this safe: no other writer can be
-/// active on the same repository. A lock older than an hour is stale.
-fn clear_stale_midx_lock(repo: &LocalRepo) {
-    let lock = repo.path().join("objects/pack/multi-pack-index.lock");
-    let Ok(meta) = std::fs::metadata(&lock) else {
-        return;
-    };
-    let stale = meta
-        .modified()
-        .ok()
-        .and_then(|at| at.elapsed().ok())
-        .is_some_and(|age| age > Duration::from_hours(1));
-    if stale {
-        let _ = std::fs::remove_file(&lock);
+const WRITER_LOCK_WAIT: Duration = Duration::from_secs(30);
+
+/// Exclusive, repository-local ownership of MIDX writing. The kernel drops the
+/// lock when its holder dies, so a `multi-pack-index.lock` found while holding
+/// it was left by a crashed writer and is removed. Age proves nothing: a bitmap
+/// write over a large repository can outlive any fixed timeout.
+pub(crate) struct MidxWriterLock(std::fs::File);
+
+impl Drop for MidxWriterLock {
+    fn drop(&mut self) {
+        let _ = self.0.unlock();
     }
+}
+
+pub(crate) fn lock_midx_writer(repo: &LocalRepo) -> Result<MidxWriterLock, GitError> {
+    lock_midx_writer_for(repo, WRITER_LOCK_WAIT)
+}
+
+fn lock_midx_writer_for(repo: &LocalRepo, wait: Duration) -> Result<MidxWriterLock, GitError> {
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(repo.path().join("walgit-midx.lock"))?;
+    let start = std::time::Instant::now();
+    loop {
+        match file.try_lock() {
+            Ok(()) => break,
+            Err(std::fs::TryLockError::WouldBlock) if start.elapsed() < wait => {
+                std::thread::sleep(Duration::from_millis(25));
+            }
+            Err(std::fs::TryLockError::WouldBlock) => {
+                return Err(GitError::Io(std::io::Error::new(
+                    std::io::ErrorKind::WouldBlock,
+                    "another MIDX writer is active; retry",
+                )));
+            }
+            Err(std::fs::TryLockError::Error(error)) => return Err(error.into()),
+        }
+    }
+    match std::fs::remove_file(repo.path().join("objects/pack/multi-pack-index.lock")) {
+        Ok(()) => warn!("removed multi-pack-index.lock left by a crashed writer"),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    Ok(MidxWriterLock(file))
 }
 
 /// Regenerate the commit-graph before building the MIDX bitmap.
@@ -212,7 +242,7 @@ impl LocalRepo {
                     ));
                 }
             }
-            clear_stale_midx_lock(&repo);
+            let _writer = lock_midx_writer(&repo)?;
             refresh_commit_graph(&repo)?;
             let input = format!("{}\n", names.join("\n"));
             checked(
@@ -258,5 +288,45 @@ impl LocalRepo {
         })
         .await
         .map_err(|e| GitError::Protocol(format!("bitmap task: {e}")))?
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+    use crate::{ObjectFormat, RepoId};
+
+    fn repo() -> (tempfile::TempDir, LocalRepo) {
+        let root = tempfile::tempdir().unwrap();
+        let repo = LocalRepo::init(
+            root.path(),
+            &RepoId::new("test", "midx-lock").unwrap(),
+            ObjectFormat::Sha1,
+        )
+        .unwrap();
+        (root, repo)
+    }
+
+    #[test]
+    fn lock_left_by_a_dead_writer_is_removed_whatever_its_age() {
+        let (_root, repo) = repo();
+        let stale = repo.path().join("objects/pack/multi-pack-index.lock");
+        std::fs::write(&stale, b"").unwrap();
+        let _held = lock_midx_writer_for(&repo, Duration::from_millis(50)).unwrap();
+        assert!(!stale.exists());
+    }
+
+    #[test]
+    fn live_writer_keeps_its_lock_and_excludes_a_second_writer() {
+        let (_root, repo) = repo();
+        let live = repo.path().join("objects/pack/multi-pack-index.lock");
+        let held = lock_midx_writer_for(&repo, Duration::from_millis(50)).unwrap();
+        std::fs::write(&live, b"").unwrap();
+        assert!(lock_midx_writer_for(&repo, Duration::from_millis(50)).is_err());
+        assert!(live.exists());
+        drop(held);
+        let _next = lock_midx_writer_for(&repo, Duration::from_millis(50)).unwrap();
+        assert!(!live.exists());
     }
 }
