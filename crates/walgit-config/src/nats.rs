@@ -268,22 +268,38 @@ unknown_to_nobody = 1
     #[test]
     fn env_overrides_apply_and_foreign_ones_are_skipped() {
         let mut c = NatsConfig::default();
-        let ignored = c
-            .apply_env_report(vars(&[
-                ("WALGIT__EVENTS__NATS__STREAM", "ACME"),
-                ("WALGIT__STORE__BUCKET", "env-bucket"),
-                ("WALGIT__EVENTS__NATS__START", "head"),
-                ("WALGIT__SERVER__LISTEN", "0.0.0.0:1"),
-                ("WALGIT__SERVER__AUTH__MODE", "none"),
-                ("WALGIT__EVENTS__WEBHOOK_URL", "https://h.example.com"),
-                ("WALGIT__EVENTS__NATS__NOPE", "1"),
-                ("PORT", "9999"),
-            ]))
-            .unwrap();
+        c.apply_env(vars(&[
+            ("WALGIT__EVENTS__NATS__STREAM", "ACME"),
+            ("WALGIT__STORE__BUCKET", "env-bucket"),
+            ("WALGIT__EVENTS__NATS__START", "head"),
+            ("WALGIT__SERVER__LISTEN", "0.0.0.0:1"),
+            ("WALGIT__SERVER__AUTH__MODE", "none"),
+            ("WALGIT__SERVER__NOPE", "1"),
+            ("WALGIT__EVENTS__WEBHOOK_URL", "https://h.example.com"),
+            ("PORT", "9999"),
+        ]))
+        .unwrap();
         assert_eq!(c.events.nats.stream, "ACME");
         assert_eq!(c.store.bucket, "env-bucket");
         assert_eq!(c.events.nats.start, NatsStart::Head);
-        assert_eq!(ignored.len(), 1, "{ignored:?}");
-        assert!(ignored[0].0.ends_with("NATS__NOPE"));
+    }
+
+    #[test]
+    fn env_overrides_unknown_to_both_binaries_or_mistyped_fail_closed() {
+        let mut c = NatsConfig::default();
+        let err = c
+            .apply_env(vars(&[
+                ("WALGIT__EVENTS__NATS__NOPE", "1"),
+                ("WALGIT__EVENTS__NATS__STREAM", "ACME"),
+                ("WALGIT__STORE__BUCKET__X", "1"),
+            ]))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("WALGIT__EVENTS__NATS__NOPE: "), "{err}");
+        assert!(err.contains("WALGIT__STORE__BUCKET__X: "), "{err}");
+        assert_eq!(
+            c.events.nats.stream,
+            NatsConfig::default().events.nats.stream
+        );
     }
 }

@@ -782,6 +782,74 @@ impl Config {
     }
 }
 
+/// Why an override at `path` does not deserialize: the error's first line, or for an unknown
+/// key the section it is not in and the nearest key serde offered (`expected one of `a`, …`),
+/// spelled as the variable to set instead.
+pub(crate) fn env_override_error(path: &[String], err: &str) -> String {
+    let first = err
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .unwrap_or("invalid")
+        .to_string();
+    // `unknown field `x`, expected one of `a`, `b`` → x, then the candidates.
+    let Some((_, tail)) = err.split_once("unknown field `") else {
+        return first;
+    };
+    let mut ticks = tail
+        .lines()
+        .next()
+        .unwrap_or_default()
+        .split('`')
+        .step_by(2);
+    let Some(field) = ticks.next() else {
+        return first;
+    };
+    let Some(depth) = path.iter().position(|p| p == field) else {
+        return first;
+    };
+    let section = match path.get(..depth) {
+        Some([]) | None => "the top level".to_string(),
+        Some(s) => format!("[{}]", s.join(".")),
+    };
+    let nearest = ticks
+        .filter(|c| !c.is_empty())
+        .map(|c| (edit_distance(field, c), c))
+        .min()
+        .filter(|(d, _)| *d <= 2.max(field.len() / 3));
+    match nearest {
+        Some((_, key)) => {
+            let fixed: Vec<&str> = path
+                .iter()
+                .take(depth)
+                .map(String::as_str)
+                .chain([key])
+                .collect();
+            format!(
+                "unknown key `{field}` in {section}; did you mean WALGIT__{}?",
+                fixed.join("__").to_ascii_uppercase()
+            )
+        }
+        None => format!("unknown key `{field}` in {section}"),
+    }
+}
+
+/// Levenshtein distance; enough to turn a typo'd override into a suggestion.
+fn edit_distance(a: &str, b: &str) -> usize {
+    let mut prev: Vec<usize> = (0..=b.chars().count()).collect();
+    for (i, ca) in a.chars().enumerate() {
+        let mut cur = vec![i + 1];
+        for (cb, pair) in b.chars().zip(prev.windows(2)) {
+            let left = cur.last().copied().unwrap_or_default();
+            if let [diag, up] = pair {
+                cur.push((diag + usize::from(ca != cb)).min(up + 1).min(left + 1));
+            }
+        }
+        prev = cur;
+    }
+    prev.last().copied().unwrap_or_default()
+}
+
 /// `owner/name` matches an entry of `list` (`owner/name`, `owner/*`, `*`; `.git` tolerated).
 pub fn repo_listed(list: &[String], owner: &str, name: &str) -> bool {
     list.iter().any(|r| {
@@ -1375,50 +1443,65 @@ mod tests {
         c.validate().unwrap();
     }
 
-    /// Config and image release independently: an override for a key this
-    /// build does not know (or a value it cannot parse) is ignored and
-    /// reported, the known ones still apply, startup continues.
+    /// An override this build cannot apply fails closed, like an unknown key in the
+    /// file: every such variable is named (with the nearest key for a typo), and none
+    /// of the batch is applied — not even the valid ones.
     #[test]
-    fn env_override_unknown_key_is_ignored_not_fatal() {
+    fn env_override_this_build_cannot_apply_is_an_error() {
         let mut c = Config::default();
-        let ignored = c
-            .apply_env_report(
+        let err = c
+            .apply_env(
                 vec![
+                    ("WALGIT__WAL__BATCH_WINDOW".to_string(), "30ms".to_string()),
                     (
-                        "WALGIT__CACHE__NOT_A_KEY_YET".to_string(),
-                        "0.9".to_string(),
+                        "WALGIT__SERVER__LSITEN".to_string(),
+                        "0.0.0.0:9".to_string(),
                     ),
                     (
                         "WALGIT__WAL__MAX_BATCH".to_string(),
                         "not-a-number".to_string(),
                     ),
                     ("WALGIT__NOSUCHSECTION__X".to_string(), "1".to_string()),
-                    ("WALGIT__WAL__BATCH_WINDOW".to_string(), "30ms".to_string()),
+                    ("WALGIT__CACHE____DIR".to_string(), "/x".to_string()),
                 ]
                 .into_iter(),
             )
-            .unwrap();
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains(
+                "WALGIT__SERVER__LSITEN: unknown key `lsiten` in [server]; did you mean WALGIT__SERVER__LISTEN?"
+            ),
+            "{err}"
+        );
+        assert!(err.contains("WALGIT__WAL__MAX_BATCH: "), "{err}");
+        assert!(
+            err.contains("WALGIT__NOSUCHSECTION__X: unknown key `nosuchsection` in the top level"),
+            "{err}"
+        );
+        assert!(!err.contains("did you mean WALGIT__NOSUCHSECTION"), "{err}");
+        assert!(
+            err.contains("WALGIT__CACHE____DIR: not a configuration path"),
+            "{err}"
+        );
+        assert!(
+            !err.contains("BATCH_WINDOW"),
+            "a valid override is not refused: {err}"
+        );
         assert_eq!(
             c.wal.batch_window,
-            Duration::from_millis(30),
-            "known override still applied"
+            Config::default().wal.batch_window,
+            "nothing applied from a refused batch"
         );
-        let keys: Vec<&str> = ignored.iter().map(|(k, _)| k.as_str()).collect();
-        assert_eq!(
-            keys,
-            [
-                "WALGIT__CACHE__NOT_A_KEY_YET",
-                "WALGIT__WAL__MAX_BATCH",
-                "WALGIT__NOSUCHSECTION__X"
-            ]
+        assert_eq!(c.server.listen, Config::default().server.listen);
+        // `Config::parse` (startup) reads the process env through the same path.
+        let mut c = Config::default();
+        assert!(
+            c.apply_env(vec![("WALGIT__GIT__BINARI".to_string(), "g".to_string())].into_iter())
+                .unwrap_err()
+                .to_string()
+                .contains("did you mean WALGIT__GIT__BINARY?")
         );
-        assert!(ignored[0].1.contains("unknown field"), "{:?}", ignored[0]);
-        // Plain apply_env is the same, just warns.
-        let mut c2 = Config::default();
-        c2.apply_env(
-            vec![("WALGIT__CACHE__NOT_A_KEY_YET".to_string(), "1".to_string())].into_iter(),
-        )
-        .unwrap();
     }
 
     /// A value that reads as a TOML number or boolean is still text to a key that takes
@@ -1426,39 +1509,37 @@ mod tests {
     #[test]
     fn env_override_text_that_looks_like_a_toml_scalar_applies() {
         let mut c = Config::default();
-        let ignored = c
-            .apply_env_report(
-                vec![
-                    ("WALGIT__STORE__BUCKET".to_string(), "20260915".to_string()),
-                    ("WALGIT__MAINTENANCE__HOST".to_string(), "true".to_string()),
-                    (
-                        "WALGIT__MAINTENANCE__FOLLOW_INTERVAL".to_string(),
-                        "0".to_string(),
-                    ),
-                    ("WALGIT__WAL__MAX_BATCH".to_string(), "7".to_string()),
-                ]
-                .into_iter(),
-            )
-            .unwrap();
-        assert!(ignored.is_empty(), "{ignored:?}");
+        c.apply_env(
+            vec![
+                ("WALGIT__STORE__BUCKET".to_string(), "20260915".to_string()),
+                ("WALGIT__MAINTENANCE__HOST".to_string(), "true".to_string()),
+                (
+                    "WALGIT__MAINTENANCE__FOLLOW_INTERVAL".to_string(),
+                    "0".to_string(),
+                ),
+                ("WALGIT__WAL__MAX_BATCH".to_string(), "7".to_string()),
+            ]
+            .into_iter(),
+        )
+        .unwrap();
         assert_eq!(c.store.bucket, "20260915");
         assert_eq!(c.maintenance.host.as_deref(), Some("true"));
         assert_eq!(c.maintenance.follow_interval, Duration::ZERO);
         assert_eq!(c.wal.max_batch, 7, "a TOML value still wins where it fits");
-        // A value that fits neither reading is still ignored, with the TOML reading's reason.
-        let ignored = c
-            .apply_env_report(
+        let err = c
+            .apply_env(
                 vec![
                     ("WALGIT__SERVER__HTTP2".to_string(), "1".to_string()),
                     ("WALGIT__STORE__BUCKET__NAME".to_string(), "b".to_string()),
                 ]
                 .into_iter(),
             )
-            .unwrap();
-        assert_eq!(ignored.len(), 2, "{ignored:?}");
-        assert!(ignored[0].1.contains("integer"), "{:?}", ignored[0]);
-        assert!(ignored[1].1.contains("not a table"), "{:?}", ignored[1]);
-        assert!(c.server.http2);
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("WALGIT__SERVER__HTTP2: "), "{err}");
+        assert!(err.contains("WALGIT__STORE__BUCKET__NAME: "), "{err}");
+        assert!(err.contains("not a table"), "{err}");
+        assert_eq!(c.server.http2, Config::default().server.http2);
         assert_eq!(c.store.bucket, "20260915");
     }
 
@@ -1644,17 +1725,34 @@ webhook_secret = "s"
     #[test]
     fn the_server_skips_nats_env_overrides_silently() {
         let mut c = Config::default();
-        let ignored = c
-            .apply_env_report(
-                vec![
-                    ("WALGIT__EVENTS__NATS__STREAM".to_string(), "X".to_string()),
-                    ("WALGIT__EVENTS__NOPE".to_string(), "1".to_string()),
-                ]
-                .into_iter(),
-            )
-            .unwrap();
-        assert_eq!(ignored.len(), 1, "{ignored:?}");
-        assert!(ignored[0].0.ends_with("NOPE"));
+        c.apply_env(
+            vec![
+                ("WALGIT__EVENTS__NATS__STREAM".to_string(), "X".to_string()),
+                ("WALGIT__EVENTS__NATS__NOPE".to_string(), "1".to_string()),
+                ("WALGIT__WAL__MAX_BATCH".to_string(), "7".to_string()),
+            ]
+            .into_iter(),
+        )
+        .unwrap();
+        assert_eq!(c.wal.max_batch, 7);
+        let err = c
+            .apply_env(vec![("WALGIT__EVENTS__NOPE".to_string(), "1".to_string())].into_iter())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("WALGIT__EVENTS__NOPE: unknown key `nope`"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn the_server_refuses_a_wrong_typed_value_for_a_key_it_owns() {
+        let mut c = Config::default();
+        let err = c
+            .apply_env(vec![("WALGIT__WAL__MAX_BATCH".to_string(), "many".to_string())].into_iter())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("WALGIT__WAL__MAX_BATCH: "), "{err}");
     }
 }
 

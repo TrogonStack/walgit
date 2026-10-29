@@ -511,6 +511,16 @@ full cold-read/resource acceptance gates listed in `docs/spec/README.md`.
   `walgit-telemetry` takes `&TelemetryConfig` and any `Settings`, not the server `Config`. The registry's full
   `Config` is built from `NatsConfig` in `walgit_nats::publisher_config`.
 
+- **D53 (2026-10-28): `WALGIT__` overrides fail closed.** An environment override this build cannot
+  apply (malformed name, unknown section or key, wrong type) is a startup and `config check` error that
+  names each variable and the nearest known key; nothing of the batch is applied. This supersedes the
+  warn-and-ignore loader (2026-08-21: a key newer than one host's image crash-looped it): a host running
+  on a default it was told to change is the worse failure, and the file already refuses unknown keys.
+  D52 stands: an override under another binary's `FOREIGN` path is still skipped without a warning, so one
+  environment can configure both binaries; only a name unknown to both binaries, or a wrong-typed value for
+  a key this binary owns, is refused. Roll the image before the env that needs it; gate the rollout on
+  `walgit config check --env-file` run by the binary that will serve.
+
 ## 5. Working rules
 
 - **No backwards compatibility (pre-1.0, banner at top):** change the shape and delete the old one in the same
