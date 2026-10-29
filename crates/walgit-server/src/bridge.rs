@@ -45,10 +45,12 @@ struct PublishedRef {
 struct Cursor {
     published_seq: u64,
     updated_at: String,
-    /// Refs as of `published_seq`. Older cursors have none: the bridge then
-    /// cannot reconstruct a gap, and stores them on its next successful pass.
-    #[serde(default)]
-    refs: Vec<PublishedRef>,
+    /// Refs as of `published_seq`. `None` is a cursor written before refs were
+    /// stored: the bridge cannot reconstruct a gap from it and records the refs
+    /// on its next successful pass. `Some(vec![])` is a repository that really
+    /// had no refs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    refs: Option<Vec<PublishedRef>>,
 }
 
 /// What one `catch_up` did.
@@ -140,14 +142,25 @@ impl Bridge {
                 .increment(readable_from - from);
             tracing::warn!(repo = %id, first = from + 1, last = readable_from,
                 "events bridge: entries folded into a checkpoint before they were published; publishing the refs that changed since the cursor");
-            if let Some(previous) = &cursor {
+            // The baseline is the checkpoint that folded the gap, not the
+            // current refs: the readable tail is published from the log right
+            // after, and must continue the old/new chain from this state.
+            if let Some(previous) = cursor.as_ref().and_then(|c| c.refs.as_ref()) {
                 let previous = previous
-                    .refs
                     .iter()
                     .map(|r| (r.name.clone(), r.oid.clone()))
                     .collect::<Vec<_>>();
+                let folded = handle
+                    .refs_at_seq(&manifest, readable_from)
+                    .await
+                    .context("events bridge: refs at the folding checkpoint")?;
+                let folded = folded
+                    .refs
+                    .into_iter()
+                    .map(|r| (r.name, r.oid))
+                    .collect::<Vec<_>>();
                 let mut batch = Vec::new();
-                refs_from_gap(id, &previous, &current.refs, readable_from, &mut batch);
+                refs_from_gap(id, &previous, &folded, readable_from, &mut batch);
                 if !batch.is_empty() {
                     // A failing sink returns here: cursor untouched, retried on
                     // the next wake-up with the same synthetic events.
@@ -179,12 +192,12 @@ impl Bridge {
             .collect::<Vec<_>>();
         let cursor_moved = cursor
             .as_ref()
-            .is_none_or(|c| c.published_seq != head || c.refs != refs);
+            .is_none_or(|c| c.published_seq != head || c.refs.as_ref() != Some(&refs));
         if cursor_moved {
             let body = serde_json::to_vec(&Cursor {
                 published_seq: head,
                 updated_at: Utc::now().to_rfc3339(),
-                refs,
+                refs: Some(refs),
             })?;
             let mode = match version {
                 Some(v) => PutMode::Update(v),
@@ -349,4 +362,25 @@ pub fn spawn_sweeper(state: Arc<crate::AppState>) {
             bridge.sweep().await;
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Cursor;
+
+    #[test]
+    fn a_cursor_without_refs_is_not_an_empty_snapshot() {
+        let legacy: Cursor =
+            serde_json::from_str(r#"{"published_seq":3,"updated_at":"t"}"#).unwrap();
+        assert_eq!(legacy.refs, None);
+        let empty: Cursor =
+            serde_json::from_str(r#"{"published_seq":3,"updated_at":"t","refs":[]}"#).unwrap();
+        assert_eq!(empty.refs, Some(Vec::new()));
+        assert!(
+            serde_json::to_string(&empty)
+                .unwrap()
+                .contains(r#""refs":[]"#)
+        );
+        assert!(!serde_json::to_string(&legacy).unwrap().contains("refs"));
+    }
 }

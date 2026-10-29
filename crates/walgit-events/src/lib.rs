@@ -159,16 +159,19 @@ pub fn refs_from_entries(repo: &RepoId, entries: &[LogEntry], out: &mut Vec<RefE
 }
 
 /// `ref` events for the refs that differ between the last published snapshot
-/// and the current refs.
+/// and the refs of the checkpoint that folded the gap.
 ///
 /// The bridge uses this when a checkpoint folded log entries it never read: the
 /// original entries are gone, but the cursor stored the refs that were visible
-/// at `published_seq`. The synthetic events carry the checkpoint's seq, so a
-/// consumer's `(repo, seq, ref_name)` dedup still holds on a retry.
+/// at `published_seq`. `folded` must be the refs at `seq` (the checkpoint), never
+/// newer ones: the readable tail is published from the log afterwards and has to
+/// continue from the state these events end in. The synthetic events carry the
+/// checkpoint's seq, so a consumer's `(repo, seq, ref_name)` dedup still holds on
+/// a retry.
 pub fn refs_from_gap(
     repo: &RepoId,
     previous: &[(String, String)],
-    current: &[walgit_git::Ref],
+    folded: &[(String, String)],
     seq: u64,
     out: &mut Vec<RefEvent>,
 ) {
@@ -176,9 +179,9 @@ pub fn refs_from_gap(
         .iter()
         .map(|(name, oid)| (name.as_str(), oid.as_str()))
         .collect();
-    let current: std::collections::BTreeMap<&str, &str> = current
+    let current: std::collections::BTreeMap<&str, &str> = folded
         .iter()
-        .map(|r| (r.name.as_str(), r.oid.as_str()))
+        .map(|(name, oid)| (name.as_str(), oid.as_str()))
         .collect();
     for (name, oid) in &current {
         match previous.get(*name) {
@@ -467,14 +470,6 @@ mod tests {
         );
     }
 
-    fn reference(name: &str, oid: &str) -> walgit_git::Ref {
-        walgit_git::Ref {
-            name: name.to_owned(),
-            oid: oid.to_owned(),
-            peeled: String::new(),
-        }
-    }
-
     #[test]
     fn gap_events_cover_updates_creates_and_deletes() {
         let repo = walgit_git::RepoId::new("t", "r").unwrap();
@@ -483,8 +478,8 @@ mod tests {
             ("refs/heads/gone".to_owned(), "bbbb".to_owned()),
         ];
         let current = vec![
-            reference("refs/heads/main", "cccc"),
-            reference("refs/heads/new", "dddd"),
+            ("refs/heads/main".to_owned(), "cccc".to_owned()),
+            ("refs/heads/new".to_owned(), "dddd".to_owned()),
         ];
         let mut out = Vec::new();
         refs_from_gap(&repo, &previous, &current, 7, &mut out);
@@ -508,9 +503,19 @@ mod tests {
     fn gap_events_skip_unchanged_refs() {
         let repo = walgit_git::RepoId::new("t", "r").unwrap();
         let previous = vec![("refs/heads/main".to_owned(), "aaaa".to_owned())];
-        let current = vec![reference("refs/heads/main", "aaaa")];
+        let current = vec![("refs/heads/main".to_owned(), "aaaa".to_owned())];
         let mut out = Vec::new();
         refs_from_gap(&repo, &previous, &current, 8, &mut out);
         assert!(out.is_empty());
+    }
+
+    #[test]
+    fn an_empty_snapshot_creates_every_folded_ref() {
+        let repo = walgit_git::RepoId::new("t", "r").unwrap();
+        let folded = vec![("refs/heads/main".to_owned(), "aaaa".to_owned())];
+        let mut out = Vec::new();
+        refs_from_gap(&repo, &[], &folded, 3, &mut out);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].action, Action::Create);
     }
 }

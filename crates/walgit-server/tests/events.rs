@@ -384,13 +384,18 @@ async fn bridge_publishes_entries_a_concurrent_checkpoint_folds() -> TestResult 
     Ok(())
 }
 
-/// Entries folded into a checkpoint before the bridge read them are gone from
-/// the log; the refs stored in the cursor let the bridge publish what changed.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn bridge_publishes_the_refs_a_folded_checkpoint_skipped() -> TestResult {
-    let (url, captured) = webhook().await;
-    let server = Server::start_with_tweak(bridge_cfg(&url, Duration::ZERO)).await?;
-    let bridge = server.state.bridge.clone().expect("bridge enabled");
+/// Publishes `a` on main, then pushes `b` (main), a new `side` and `c` (main), folds
+/// them in a checkpoint the bridge has not read, and pushes `d` (main) plus a new
+/// `late` that stay readable in the log.
+async fn repo_with_folded_gap(
+    server: &Server,
+    captured: &Captured,
+) -> anyhow::Result<(TestRepo, walgit_git::RepoId)> {
+    let bridge = server
+        .state
+        .bridge
+        .clone()
+        .ok_or_else(|| anyhow::anyhow!("bridge enabled"))?;
     server.put_repo("t", "r").await?;
     let id = walgit_git::RepoId::new("t", "r")?;
 
@@ -404,7 +409,7 @@ async fn bridge_publishes_the_refs_a_folded_checkpoint_skipped() -> TestResult {
     git_in(&src, &["push", "-u", "origin", "main"])?;
     let r = bridge.catch_up(&id).await?;
     assert_eq!((r.head_seq, r.emitted), (1, 1));
-    wait_for(&captured, 1).await;
+    wait_for(captured, 1).await;
 
     git_in(&src, &["commit", "--allow-empty", "-m", "b"])?;
     git_in(&src, &["push"])?;
@@ -420,20 +425,104 @@ async fn bridge_publishes_the_refs_a_folded_checkpoint_skipped() -> TestResult {
         .await?;
     git_in(&src, &["commit", "--allow-empty", "-m", "d"])?;
     git_in(&src, &["push"])?;
+    git_in(&src, &["push", "origin", "main:refs/heads/late"])?;
+    Ok((src, id))
+}
+
+fn events_for<'a>(got: &'a [serde_json::Value], name: &str) -> Vec<&'a serde_json::Value> {
+    got.iter().filter(|e| e["ref_name"] == name).collect()
+}
+
+/// Entries folded into a checkpoint before the bridge read them are gone from
+/// the log; the refs stored in the cursor let the bridge publish what changed.
+/// The gap is diffed against the checkpoint's refs, so the readable tail that
+/// follows continues each ref's old/new chain and no ref is announced twice.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn bridge_publishes_the_refs_a_folded_checkpoint_skipped() -> TestResult {
+    let (url, captured) = webhook().await;
+    let server = Server::start_with_tweak(bridge_cfg(&url, Duration::ZERO)).await?;
+    let bridge = server.state.bridge.clone().expect("bridge enabled");
+    let (_src, id) = repo_with_folded_gap(&server, &captured).await?;
 
     let r = bridge.catch_up(&id).await?;
     assert_eq!(r.gap, Some([2, 4]), "{r:?}");
-    assert_eq!((r.head_seq, r.emitted), (5, 3), "{r:?}");
-    let got = wait_for(&captured, 4).await;
-    let by_ref = |name: &str| {
-        got[1..]
-            .iter()
-            .filter(|e| e["ref_name"] == name)
-            .collect::<Vec<_>>()
-    };
-    assert_eq!(by_ref("refs/heads/side").len(), 1);
-    assert_eq!(by_ref("refs/heads/side")[0]["action"], "create");
-    assert_eq!(by_ref("refs/heads/main").len(), 2);
-    assert_eq!(cursor_seq(&server, "t", "r").await, Some(5));
+    assert_eq!((r.head_seq, r.emitted), (6, 4), "{r:?}");
+    let got = wait_for(&captured, 5).await;
+    assert_eq!(got.len(), 5, "{got:?}");
+
+    let main = events_for(&got, "refs/heads/main");
+    assert_eq!(main.len(), 3, "{main:?}");
+    assert_eq!(
+        main.iter()
+            .map(|e| e["_walgit"]["seq"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        ["1", "4", "5"]
+    );
+    for pair in main.windows(2) {
+        assert_eq!(
+            pair[1]["old"], pair[0]["new"],
+            "main chain broken: {main:?}"
+        );
+    }
+
+    let side = events_for(&got, "refs/heads/side");
+    assert_eq!(side.len(), 1, "{side:?}");
+    assert_eq!(side[0]["action"], "create");
+    assert_eq!(side[0]["_walgit"]["seq"], "4");
+
+    let late = events_for(&got, "refs/heads/late");
+    assert_eq!(late.len(), 1, "created after the fold: {late:?}");
+    assert_eq!(late[0]["action"], "create");
+    assert_eq!(late[0]["old"], ZERO_OID);
+    assert_eq!(late[0]["_walgit"]["seq"], "6");
+    assert_eq!(cursor_seq(&server, "t", "r").await, Some(6));
+    Ok(())
+}
+
+/// A cursor written before refs were stored cannot be diffed: the gap is skipped
+/// (only the readable tail is published, no `create` for every existing ref) and
+/// the refs are recorded for the next one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn bridge_skips_a_gap_for_a_cursor_without_refs() -> TestResult {
+    use walgit_store::{ObjectStoreExt, PutMode};
+    let (url, captured) = webhook().await;
+    let server = Server::start_with_tweak(bridge_cfg(&url, Duration::ZERO)).await?;
+    let bridge = server.state.bridge.clone().expect("bridge enabled");
+    let (_src, id) = repo_with_folded_gap(&server, &captured).await?;
+
+    let store = server.state.registry.open(&id).await?.store().clone();
+    let (meta, bytes) = store
+        .get_bytes("events/cursor.json")
+        .await?
+        .expect("cursor");
+    let mut cursor: serde_json::Value = serde_json::from_slice(&bytes)?;
+    assert!(cursor["refs"].is_array(), "{cursor}");
+    cursor.as_object_mut().unwrap().remove("refs");
+    store
+        .put_bytes(
+            "events/cursor.json",
+            serde_json::to_vec(&cursor)?,
+            PutMode::Update(meta.version),
+        )
+        .await?;
+
+    let r = bridge.catch_up(&id).await?;
+    assert_eq!(r.gap, Some([2, 4]), "{r:?}");
+    assert_eq!((r.head_seq, r.emitted), (6, 2), "{r:?}");
+    let got = wait_for(&captured, 3).await;
+    assert_eq!(got.len(), 3, "{got:?}");
+    assert!(
+        got[1..].iter().all(|e| e["_walgit"]["seq"] != "4"),
+        "no synthetic gap events: {got:?}"
+    );
+    assert_eq!(events_for(&got, "refs/heads/side").len(), 0, "{got:?}");
+
+    let (_, bytes) = store
+        .get_bytes("events/cursor.json")
+        .await?
+        .expect("cursor");
+    let cursor: serde_json::Value = serde_json::from_slice(&bytes)?;
+    assert_eq!(cursor["published_seq"], 6);
+    assert_eq!(cursor["refs"].as_array().map(Vec::len), Some(3), "{cursor}");
     Ok(())
 }

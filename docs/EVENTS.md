@@ -21,9 +21,12 @@ Invariants:
    (at-least-once) and carry a deterministic dedup key. What *can* happen is a **gap when the bridge lags behind
    log retention** (entries folded into a checkpoint before they were read): counted (`events_bridge_gap_total`)
    and warned. The webhook bridge repairs it from the refs its cursor stored: it publishes one `create` / `update` /
-   `delete` per ref that differs from the current refs, stamped with the checkpoint's seq (intermediate pushes
-   between two reads collapse into one event per ref). A cursor written before it stored refs is skipped for that
-   first gap and gets its refs on the next pass.
+   `delete` per ref that differs between the cursor's refs and the refs of the checkpoint that folded the gap,
+   stamped with that checkpoint's seq (intermediate pushes between two reads collapse into one event per ref). The
+   entries still readable in the log follow, so each ref's old/new chain continues unbroken and nothing is announced
+   twice. A cursor written before it stored refs (no `refs` key; an empty `refs` list is a real empty repository)
+   is skipped for that first gap and gets its refs on the next pass. Reading the checkpoint's refs costs one extra
+   GET (two for a checkpoint written before it carried `refs_key`), only on a pass that finds a gap.
 4. One producer, one instance.
 
 Only `ref` events exist. Not events: push denials and auth failures (metrics + logs), LFS, compaction/checkpoints
