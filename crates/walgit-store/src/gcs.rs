@@ -588,6 +588,21 @@ impl BulkHttp {
 }
 
 impl GcsStore {
+    /// A read request carrying the configured `store.max_retries` budget; the
+    /// clients themselves never retry so mutations stay single-attempt.
+    fn read_builder(
+        &self,
+        client: &Storage,
+        key: &str,
+    ) -> google_cloud_storage::builder::storage::ReadObject {
+        client
+            .read_object(self.bucket_resource.clone(), key.to_owned())
+            .with_retry_policy(
+                google_cloud_storage::retry_policy::RetryableErrors
+                    .with_attempt_limit(self.max_retries.saturating_add(1)),
+            )
+    }
+
     /// Read the object body with an optional range.
     async fn read_object_body(
         &self,
@@ -598,7 +613,7 @@ impl GcsStore {
             return Ok(self.bulk_http_read(key, range, None).await?.2);
         }
         let (client, permit) = self.data_client(key, range.is_some()).await;
-        let mut builder = client.read_object(self.bucket_resource.clone(), key.to_owned());
+        let mut builder = self.read_builder(client, key);
         if let Some(ref r) = range {
             builder = builder.set_read_range(range_to_read_range(r));
         }
@@ -745,12 +760,7 @@ impl ObjectStore for GcsStore {
             return Ok(GetResult::Object { meta, body });
         }
         let (client, permit) = self.data_client(key, opts.range.is_some()).await;
-        let mut builder = client
-            .read_object(self.bucket_resource.clone(), key.to_owned())
-            .with_retry_policy(
-                google_cloud_storage::retry_policy::RetryableErrors
-                    .with_attempt_limit(self.max_retries.saturating_add(1)),
-            );
+        let mut builder = self.read_builder(client, key);
 
         if let Some(v) = &opts.if_match {
             if let Some(generation) = parse_generation(v) {
@@ -1694,6 +1704,95 @@ mod resume_tests {
             hits.load(Ordering::SeqCst),
             3,
             "first request + two resumes"
+        );
+    }
+
+    async fn store_against(endpoint: &str, max_retries: u32) -> GcsStore {
+        let anonymous = google_cloud_auth::credentials::anonymous::Builder::default().build();
+        let storage = Storage::builder()
+            .with_endpoint(endpoint)
+            .with_credentials(anonymous.clone())
+            .with_retry_policy(NeverRetry)
+            .build()
+            .await
+            .unwrap();
+        let control = StorageControl::builder()
+            .with_endpoint(endpoint)
+            .with_credentials(anonymous)
+            .with_retry_policy(NeverRetry)
+            .build()
+            .await
+            .unwrap();
+        GcsStore {
+            storage,
+            bulk: Vec::new(),
+            bulk_next: std::sync::atomic::AtomicUsize::new(0),
+            bulk_http: Vec::new(),
+            creds: None,
+            bucket: "b".into(),
+            bulk_permits: std::sync::Arc::new(tokio::sync::Semaphore::new(8)),
+            bulk_permits_total: 8,
+            permit_wait_warn: std::time::Duration::from_secs(1),
+            control,
+            bucket_resource: "projects/_/buckets/b".into(),
+            signing_signer: None,
+            signing_service_account: None,
+            max_retries,
+        }
+    }
+
+    /// The body fetch behind a conditional GET that missed (`manifest.pb`)
+    /// must spend `store.max_retries` on a transient error like any other read.
+    #[tokio::test]
+    async fn body_read_after_a_conditional_miss_uses_the_retry_budget() {
+        use axum::{Router, http::StatusCode, response::IntoResponse, routing::get};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let hits = std::sync::Arc::new(AtomicUsize::new(0));
+        let h = hits.clone();
+        let app = Router::new().route(
+            "/storage/v1/b/{bucket}/o/{key}",
+            get(move || {
+                let h = h.clone();
+                async move {
+                    if h.fetch_add(1, Ordering::SeqCst) < 2 {
+                        StatusCode::SERVICE_UNAVAILABLE.into_response()
+                    } else {
+                        (
+                            StatusCode::OK,
+                            [("x-goog-generation", "7"), ("x-goog-metageneration", "1")],
+                            b"manifest".to_vec(),
+                        )
+                            .into_response()
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let endpoint = format!("http://{addr}");
+
+        let store = store_against(&endpoint, 2).await;
+        let body = store
+            .read_object_body("repos/o/r/manifest.pb", None)
+            .await
+            .expect("two transient failures fit a budget of two retries");
+        let got = crate::util::collect(body, 8).await.unwrap();
+        assert_eq!(&got[..], b"manifest");
+        assert_eq!(hits.load(Ordering::SeqCst), 3);
+
+        hits.store(0, Ordering::SeqCst);
+        let store = store_against(&endpoint, 0).await;
+        assert!(
+            store
+                .read_object_body("repos/o/r/manifest.pb", None)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            1,
+            "a zero budget is one attempt"
         );
     }
 }
