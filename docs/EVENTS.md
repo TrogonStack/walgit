@@ -20,7 +20,10 @@ Invariants:
 3. No lost events: the cursor advances only after the webhook answered 2xx. Duplicates are possible
    (at-least-once) and carry a deterministic dedup key. What *can* happen is a **gap when the bridge lags behind
    log retention** (entries folded into a checkpoint before they were read): counted (`events_bridge_gap_total`)
-   and warned, never silently repaired — consumers backfill from the WAL.
+   and warned. The webhook bridge repairs it from the refs its cursor stored: it publishes one `create` / `update` /
+   `delete` per ref that differs from the current refs, stamped with the checkpoint's seq (intermediate pushes
+   between two reads collapse into one event per ref). A cursor written before it stored refs is skipped for that
+   first gap and gets its refs on the next pass.
 4. One producer, one instance.
 
 Only `ref` events exist. Not events: push denials and auth failures (metrics + logs), LFS, compaction/checkpoints
@@ -70,7 +73,8 @@ Answer 2xx to acknowledge; anything else (or a timeout, 10 s) leaves the cursor 
 retries the same range on the next wake-up. A consumer therefore sees at-least-once delivery of whole batches.
 Verify the signature with a constant-time compare before parsing.
 
-**Backfill contract (normative for consumers):** on any gap, read the WAL log from your last known seq
+**Backfill contract (normative for consumers):** on any gap the intermediate pushes are not individually
+announced (the bridge synthesizes the net change per ref, the JetStream sink does not); read the WAL log from your last known seq
 (`walgit wal ls`) and treat each PUSH / REF_UPDATE entry's ref transaction as the missed events. The webhook is
 a latency optimization over polling the log; correctness never depends on it.
 
@@ -86,7 +90,7 @@ writers (any host, broker, CLI, import) ── manifest.pb CAS ──► bucket 
 ```
 
 `catch_up(repo)` = read `repos/<o>/<r>/events/cursor.json` → fresh manifest → log entries `(cursor, head_seq]` →
-`ref` events → webhook → CAS the cursor to `head_seq`. A webhook error leaves the cursor; the next wake-up replays
+`ref` events → webhook → CAS the cursor (with the refs visible at `head_seq`) to `head_seq`. A webhook error leaves the cursor; the next wake-up replays
 the same range. A cold cursor starts at the oldest readable seq (`min_seq − 1`: everything still in the manifest's
 log window is published once; pre-seed the cursor to skip history). Every published event is also one structured
 log line (`event_type="ref"`). Metrics: `events_published_total{sink}`, `events_bridge_lag_entries{repo}`,
@@ -167,7 +171,7 @@ both; a key unknown to both is still warned about.
 - **Wake-ups.** A queue-group subscription on `events.nats.notify_subject` accepts the same notification
   shapes as `POST /_events/notify` (S3 event JSON, a GCS envelope, `{"key": ...}`, `{"repo": ...}`), and
   `events.sweep_interval` is the backstop with the same warning when it finds unpublished entries.
-  Gap detection matches the bridge: a log gap is logged and the entries that are readable are published.
+  Gap detection matches the bridge, but the stream holds no ref snapshot to diff against: a log gap is logged and counted and only the entries that are readable are published.
 - **Service API.** `walgit-nats` registers a NATS micro service `walgit-events` (`$SRV.PING|INFO|STATS`, built in)
   with one endpoint, `<subject_prefix>.events.catch-up`. Request `{"repo": "o/r"}`, reply the catch-up report
   (`repo`, `from_seq`, `head_seq`, `emitted`, `conflict`); an unknown repository is a 404 service error.

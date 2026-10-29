@@ -383,3 +383,57 @@ async fn bridge_publishes_entries_a_concurrent_checkpoint_folds() -> TestResult 
     assert_eq!(cursor_seq(&server, "t", "r").await, Some(2));
     Ok(())
 }
+
+/// Entries folded into a checkpoint before the bridge read them are gone from
+/// the log; the refs stored in the cursor let the bridge publish what changed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn bridge_publishes_the_refs_a_folded_checkpoint_skipped() -> TestResult {
+    let (url, captured) = webhook().await;
+    let server = Server::start_with_tweak(bridge_cfg(&url, Duration::ZERO)).await?;
+    let bridge = server.state.bridge.clone().expect("bridge enabled");
+    server.put_repo("t", "r").await?;
+    let id = walgit_git::RepoId::new("t", "r")?;
+
+    let src = TestRepo::synthetic(1, 1)?;
+    git_in(&src, &["commit", "--allow-empty", "-m", "a"])?;
+    git_in(&src, &["branch", "-M", "main"])?;
+    git_in(
+        &src,
+        &["remote", "add", "origin", &server.repo_url("t", "r")],
+    )?;
+    git_in(&src, &["push", "-u", "origin", "main"])?;
+    let r = bridge.catch_up(&id).await?;
+    assert_eq!((r.head_seq, r.emitted), (1, 1));
+    wait_for(&captured, 1).await;
+
+    git_in(&src, &["commit", "--allow-empty", "-m", "b"])?;
+    git_in(&src, &["push"])?;
+    git_in(&src, &["push", "origin", "main:refs/heads/side"])?;
+    git_in(&src, &["commit", "--allow-empty", "-m", "c"])?;
+    git_in(&src, &["push"])?;
+    server
+        .state
+        .registry
+        .open(&id)
+        .await?
+        .write_checkpoint()
+        .await?;
+    git_in(&src, &["commit", "--allow-empty", "-m", "d"])?;
+    git_in(&src, &["push"])?;
+
+    let r = bridge.catch_up(&id).await?;
+    assert_eq!(r.gap, Some([2, 4]), "{r:?}");
+    assert_eq!((r.head_seq, r.emitted), (5, 3), "{r:?}");
+    let got = wait_for(&captured, 4).await;
+    let by_ref = |name: &str| {
+        got[1..]
+            .iter()
+            .filter(|e| e["ref_name"] == name)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(by_ref("refs/heads/side").len(), 1);
+    assert_eq!(by_ref("refs/heads/side")[0]["action"], "create");
+    assert_eq!(by_ref("refs/heads/main").len(), 2);
+    assert_eq!(cursor_seq(&server, "t", "r").await, Some(5));
+    Ok(())
+}
