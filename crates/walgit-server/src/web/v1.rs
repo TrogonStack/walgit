@@ -16,13 +16,13 @@ use std::sync::Arc;
 use axum::{
     Router,
     body::Body,
-    extract::{Path, Request, State},
+    extract::{Path, Query, Request, State},
     http::{HeaderMap, HeaderValue, Method, StatusCode, header},
     middleware::Next,
     response::{Html, IntoResponse, Response},
     routing::{get, post},
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::repo::RepoRoute;
 use crate::web::api::{Need, RefInfo, etag_for, json_swr, run};
@@ -71,7 +71,24 @@ pub fn router(state: Arc<AppState>) -> Router {
 
 // ---- CORS (browser lane from other origins) -----------------------------------
 
+/// The canonical serialization of `origin` when it is exactly a serialized
+/// origin (`scheme://host[:port]`). A `?`, `#`, `\\`, path or userinfo makes a
+/// browser read a different origin than a string matcher sees, so anything that
+/// does not round-trip through the URL parser is refused.
+fn serialized_origin(origin: &str) -> Option<String> {
+    let url = url::Url::parse(origin).ok()?;
+    let canonical = url.origin();
+    if !canonical.is_tuple() {
+        return None;
+    }
+    let canonical = canonical.ascii_serialization();
+    (canonical == origin).then_some(canonical)
+}
+
 fn origin_allowed(cfg: &walgit_config::Config, origin: &str) -> bool {
+    let Some(origin) = serialized_origin(origin) else {
+        return false;
+    };
     cfg.server.cors_origins.iter().any(|pat| {
         if let Some((scheme, host)) = pat.split_once("://*.") {
             origin
@@ -79,12 +96,11 @@ fn origin_allowed(cfg: &walgit_config::Config, origin: &str) -> bool {
                 .and_then(|o| o.strip_prefix("://"))
                 .is_some_and(|o| {
                     o.ends_with(host)
-                        && o.len() > host.len()
+                        && o.len() > host.len() + 1
                         && o.as_bytes()[o.len() - host.len() - 1] == b'.'
-                        && !o.contains('/')
                 })
         } else {
-            pat.eq_ignore_ascii_case(origin)
+            pat.eq_ignore_ascii_case(&origin)
         }
     })
 }
@@ -277,10 +293,46 @@ async fn me(State(st): State<Arc<AppState>>, headers: HeaderMap) -> Response {
 /// `require_auth` sends an unauthenticated browser through sign-in first; this
 /// authenticated page then tells its opener and closes. The SDK opens it when a
 /// browser-lane call answers 401.
-async fn authenticate(State(st): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+#[derive(Deserialize)]
+struct AuthenticateQuery {
+    origin: Option<String>,
+}
+
+async fn authenticate(
+    State(st): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Query(query): Query<AuthenticateQuery>,
+) -> Response {
+    if query
+        .origin
+        .as_ref()
+        .is_some_and(|origin| !origin_allowed(&st.cfg, origin))
+    {
+        return ApiError::Forbidden.into_response();
+    }
+    let target = query.origin.as_ref().map_or_else(
+        || "window.location.origin".to_owned(),
+        |origin| script_json(origin),
+    );
     match st.auth.require_read(&headers).await {
         Ok(p) => {
-            let page = AUTHENTICATE_HTML.replace("{{principal}}", &html_escape(&p.name));
+            let values = [
+                ("{{principal}}", html_escape(&p.name)),
+                ("{{principal_json}}", script_json(&p.name)),
+                ("{{target_origin}}", target),
+            ];
+            // Substitute only original template tokens, never tokens in user data.
+            let page: String = AUTHENTICATE_HTML
+                .split_inclusive("}}")
+                .map(|part| {
+                    for (token, value) in &values {
+                        if let Some(prefix) = part.strip_suffix(token) {
+                            return format!("{prefix}{value}");
+                        }
+                    }
+                    part.to_owned()
+                })
+                .collect();
             let mut r = Html(page).into_response();
             r.headers_mut()
                 .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
@@ -298,14 +350,21 @@ const AUTHENTICATE_HTML: &str = r#"<!doctype html>
 <p id="m">You can close this window.</p>
 <script>
 (function () {
-  var msg = { type: "repos:authenticated", principal: "{{principal}}" };
-  try { if (window.opener) { window.opener.postMessage(msg, "*"); } } catch (e) {}
-  try { if (window.parent && window.parent !== window) { window.parent.postMessage(msg, "*"); } } catch (e) {}
+  var msg = { type: "repos:authenticated", principal: {{principal_json}} };
+  try { if (window.opener) { window.opener.postMessage(msg, {{target_origin}}); } } catch (e) {}
+  try { if (window.parent && window.parent !== window) { window.parent.postMessage(msg, {{target_origin}}); } } catch (e) {}
   // Only a window we opened ourselves (same site or cross-site via the SDK) is closed.
   if (window.opener) { setTimeout(function () { window.close(); }, 150); }
 })();
 </script>
 "#;
+
+// JSON encoding alone permits </script>; HTML's script parser sees that before JS.
+fn script_json(value: &str) -> String {
+    serde_json::Value::String(value.into())
+        .to_string()
+        .replace('<', "\\u003c")
+}
 
 fn html_escape(s: &str) -> String {
     s.replace('&', "&amp;")
@@ -427,5 +486,49 @@ mod tests {
         assert!(!is_cors_api_path("/acme/monorepo.git/info/refs"));
         assert!(!is_cors_api_path("/_auth/check"));
         assert!(!is_cors_api_path("/services/api/owners"));
+    }
+
+    fn cfg_with(origins: &[&str]) -> walgit_config::Config {
+        let mut cfg = walgit_config::Config::default();
+        cfg.server.cors_origins = origins.iter().map(|o| (*o).to_owned()).collect();
+        cfg
+    }
+
+    #[test]
+    fn origin_allowed_matches_exact_and_wildcard_origins() {
+        let cfg = cfg_with(&["https://app.example.org", "https://*.example.com"]);
+        assert!(origin_allowed(&cfg, "https://app.example.org"));
+        assert!(origin_allowed(&cfg, "https://a.example.com"));
+        assert!(origin_allowed(&cfg, "https://a.b.example.com"));
+        assert!(!origin_allowed(&cfg, "https://example.com"));
+        assert!(!origin_allowed(&cfg, "https://.example.com"));
+        assert!(!origin_allowed(&cfg, "http://a.example.com"));
+        assert!(!origin_allowed(&cfg, "https://evilexample.com"));
+        assert!(!origin_allowed(&cfg, "https://other.example.org"));
+    }
+
+    #[test]
+    fn origin_allowed_rejects_origins_a_browser_would_read_differently() {
+        let cfg = cfg_with(&["https://*.example.com", "https://app.example.org"]);
+        for origin in [
+            "https://evil.com?.example.com",
+            "https://evil.com#.example.com",
+            "https://evil.com\\.example.com",
+            "https://evil.com/.example.com",
+            "https://evil.com/?.example.com",
+            "https://user@a.example.com",
+            "https://a.example.com/",
+            "https://a.example.com/path",
+            "https://a.example.com?",
+            "https://a.example.com#",
+            "https://app.example.org/",
+            "https://app.example.org?",
+            "https://app.example.org#x",
+            "",
+            "null",
+            "file:///a.example.com",
+        ] {
+            assert!(!origin_allowed(&cfg, origin), "accepted {origin:?}");
+        }
     }
 }

@@ -5980,6 +5980,7 @@ dependencies = [
  "tower-http",
  "tracing",
  "tracing-subscriber",
+ "url",
  "uuid",
  "walgit-config",
  "walgit-events",
