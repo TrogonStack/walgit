@@ -1070,7 +1070,6 @@ mod tests {
     use aws_sdk_s3::error::SdkError;
     use aws_sdk_s3::operation::list_objects_v2::ListObjectsV2Error;
     use aws_sdk_s3::operation::put_object::PutObjectError;
-    use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     /// A fake S3 that answers every request with one status and error code.
@@ -1337,10 +1336,12 @@ mod tests {
         let (endpoint, heads) = recording_s3().await;
         let store = S3Store {
             client: client_for(&endpoint),
+            read_client: client_for(&endpoint),
             bucket: "b".into(),
             http: reqwest::Client::new(),
             multipart_threshold: u64::MAX,
             multipart_part_size: 8 << 20,
+            max_retries: 0,
         };
         let put = store
             .put(
