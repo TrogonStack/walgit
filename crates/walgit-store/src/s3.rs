@@ -418,7 +418,7 @@ impl ObjectStore for S3Store {
     async fn delete(&self, key: &str, if_version: Option<Version>) -> Result<()> {
         let mut request = self.client.delete_object().bucket(&self.bucket).key(key);
         if let Some(want) = &if_version {
-            request = request.if_match(want.as_str());
+            request = request.if_match(entity_tag(want));
         }
         let resp = request.send().await;
 
@@ -789,7 +789,7 @@ impl ObjectStore for S3Store {
         let complete = match &opts.mode {
             PutMode::Overwrite => complete,
             PutMode::Create => complete.if_none_match("*"),
-            PutMode::Update(v) => complete.if_match(v.as_str()),
+            PutMode::Update(v) => complete.if_match(entity_tag(v)),
         };
         let resp = match complete.send().await {
             Ok(r) => r,
@@ -989,7 +989,7 @@ impl S3Store {
         let complete = match &opts.mode {
             PutMode::Overwrite => complete,
             PutMode::Create => complete.if_none_match("*"),
-            PutMode::Update(v) => complete.if_match(v.as_str()),
+            PutMode::Update(v) => complete.if_match(entity_tag(v)),
         };
         let resp = match complete.send().await {
             Ok(r) => r,
@@ -1147,9 +1147,10 @@ mod tests {
             )
                 .into_response();
         }
+        let quoted_current = state.current.as_ref().map(|c| format!("\"{c}\""));
         if matched
             .as_ref()
-            .is_some_and(|v| Some(v) != state.current.as_ref())
+            .is_some_and(|v| Some(v) != quoted_current.as_ref())
             || (absent.as_deref() == Some("*") && state.current.is_some())
         {
             return (
@@ -1222,7 +1223,7 @@ mod tests {
             assert_eq!(state.requests.len(), 2);
             assert_eq!(state.requests[0].0, "DELETE", "no HEAD/check/delete window");
             assert_eq!(state.requests[1].0, "HEAD", "failure-only probe");
-            assert_eq!(state.requests[0].2.as_deref(), Some("captured"));
+            assert_eq!(state.requests[0].2.as_deref(), Some("\"captured\""));
         }
         store
             .delete("key", Some(Version::new("rival")))
@@ -1233,6 +1234,11 @@ mod tests {
             state.lock().requests.len(),
             3,
             "successful delete uses one request"
+        );
+        assert_eq!(
+            state.lock().requests[2].2.as_deref(),
+            Some("\"rival\""),
+            "delete carries a quoted entity-tag"
         );
         assert!(matches!(
             store.delete("key", Some(Version::new("rival"))).await,
@@ -1285,6 +1291,15 @@ mod tests {
                 assert_eq!(
                     completes[0].3.as_deref(),
                     matches!(mode, PutMode::Create).then_some("*")
+                );
+                assert_eq!(
+                    completes[0].2.as_deref(),
+                    match &mode {
+                        PutMode::Update(v) => Some(format!("\"{}\"", v.as_str())),
+                        _ => None,
+                    }
+                    .as_deref(),
+                    "completion carries a quoted entity-tag"
                 );
                 assert_eq!(
                     state
