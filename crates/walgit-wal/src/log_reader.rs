@@ -103,7 +103,12 @@ async fn replay_refs(
 ) -> Result<(walgit_proto::v1::RefSnapshot, u64), WalError> {
     // Start point: checkpoint ≤ cut (checkpoint created_at on the ref; when
     // the ref has no timestamp, fall back to replaying from seq 0).
-    let mut snap = walgit_proto::v1::RefSnapshot::default();
+    // A repository with no HEAD record (before its first checkpoint or symbolic update)
+    // points at the implicit default, as every live copy of it does.
+    let mut snap = walgit_proto::v1::RefSnapshot {
+        head_target: walgit_git::IMPLICIT_HEAD.to_string(),
+        ..Default::default()
+    };
     let mut from_seq = 0u64;
     if let Some(cp) = manifest.checkpoint.as_ref() {
         // A checkpoint holds the state as of its newest folded entry (`as_of`),

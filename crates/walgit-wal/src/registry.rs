@@ -11,11 +11,15 @@ use prost::Message;
 use walgit_git::{LocalRepo, ObjectFormat, RepoId};
 use walgit_proto::WAL_FORMAT_VERSION;
 use walgit_proto::keys;
-use walgit_proto::v1::Manifest;
+use walgit_proto::v1::{EntryKind, LogEntry, LogSegmentRef, Manifest, RefTransaction, RefUpdate};
 use walgit_store::{DynStore, ObjectStore, Prefixed, PutBody, PutMode, StoreError};
 
 use crate::error::WalError;
 use crate::handle::RepoHandle;
+use crate::publish::{
+    ClaimOutcome, SlotEvidence, cas_landed, claim_log_slot, drop_own_slot, slot_evidence,
+    sweep_burned,
+};
 use crate::state::{RepoState, load_state, save_state};
 use crate::store_proto::get_message;
 
@@ -211,33 +215,101 @@ impl Registry {
         Ok(())
     }
 
-    /// CAS-create manifest.pb (`PutMode::Create`). Err(AlreadyExists) on 412.
-    /// The Create PUT is the only authority, warm handle or not: a cached handle
-    /// is not evidence the manifest still exists (another host may have deleted
-    /// it) and must not turn a second create into a success.
+    /// Create a repository whose HEAD names this host's `git.default_branch`
+    /// ([`Self::create_with_default_branch`]).
     pub async fn create(
         &self,
         id: &RepoId,
         format: ObjectFormat,
     ) -> Result<Arc<RepoHandle>, WalError> {
+        let branch = self.cfg.git.default_branch.clone();
+        self.create_with_default_branch(id, format, &branch).await
+    }
+
+    /// CAS-create manifest.pb (`PutMode::Create`) with HEAD -> `refs/heads/<branch>`.
+    /// Err(AlreadyExists) on 412, Err(Invalid) for a bad branch name.
+    /// The Create PUT is the only authority, warm handle or not: a cached handle
+    /// is not evidence the manifest still exists (another host may have deleted
+    /// it) and must not turn a second create into a success.
+    ///
+    /// HEAD lives where every ref lives (checkpoint `RefSnapshot.head_target` plus the
+    /// log's symbolic `HEAD` updates) and a repository with no record means
+    /// [`walgit_git::IMPLICIT_HEAD`]. That target needs no record: creation stays the one
+    /// Create it always was. Any other target is recorded as the repository's first entry
+    /// (a HEAD-only `REF_UPDATE`): its log slot is claimed exactly as a publish claims one
+    /// (`claim_log_slot`, orphans burned) and the manifest Create lists it, so the
+    /// repository appears with its HEAD in one commit or not at all: 2 sequential
+    /// requests instead of 1 (docs/ROUNDTRIPS.md). A Create answered 412 or with an
+    /// ambiguous error is resolved by the manifest's evidence of that exact segment
+    /// (`slot_evidence`), as a publish resolves its CAS: our own slot is deleted only when
+    /// the manifest proves a concurrent creator won.
+    pub async fn create_with_default_branch(
+        &self,
+        id: &RepoId,
+        format: ObjectFormat,
+        branch: &str,
+    ) -> Result<Arc<RepoHandle>, WalError> {
+        let head = walgit_config::refs::branch_ref(branch)
+            .map_err(|e| WalError::Invalid(format!("default branch: {e}")))?;
         let gate = self.opening.entry(id.clone()).or_default().clone();
-        let _g = gate.lock().await;
+        let guard = gate.lock().await;
 
         let prefix = id.store_prefix();
         let prefixed = Prefixed::new(self.store.clone(), prefix);
+        let writer = crate::handle::instance_id();
 
-        // Create manifest with PutMode::Create
+        let initial = (head != walgit_git::IMPLICIT_HEAD).then(|| RefTransaction {
+            updates: vec![RefUpdate {
+                name: "HEAD".into(),
+                new_symbolic_target: head.clone(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+        let created_at = walgit_proto::time::now();
+        let slot = match &initial {
+            None => None,
+            Some(txn) => {
+                let entry = |seq: u64| LogEntry {
+                    seq,
+                    kind: EntryKind::RefUpdate as i32,
+                    txn: Some(txn.clone()),
+                    created_at: Some(created_at),
+                    writer: writer.clone(),
+                    ..Default::default()
+                };
+                match claim_log_slot(&prefixed, 0, |seq| {
+                    walgit_proto::frame::encode_entries(std::iter::once(&entry(seq)))
+                })
+                .await?
+                {
+                    ClaimOutcome::Claimed(slot) => Some(slot),
+                    // A committed entry holds the slot: the repository exists.
+                    ClaimOutcome::Contended => return Err(WalError::AlreadyExists),
+                }
+            }
+        };
+
         let manifest = Manifest {
             format_version: WAL_FORMAT_VERSION,
             repo: id.to_string(),
             object_format: format.as_str().to_string(),
-            head_seq: 0,
+            head_seq: slot.as_ref().map_or(0, |s| s.first_seq),
             min_seq: 0,
             checkpoint: None,
-            log_segments: vec![],
+            log_segments: slot
+                .iter()
+                .map(|s| LogSegmentRef {
+                    key: s.key.clone(),
+                    first_seq: s.first_seq,
+                    last_seq: s.first_seq,
+                    size: s.bytes.len() as u64,
+                    sealed: true,
+                })
+                .collect(),
             packs: vec![],
             updated_at: Some(walgit_proto::time::now()),
-            writer: crate::handle::instance_id(),
+            writer,
             revision: 1,
             settings: None,
             retired_packs: Vec::new(),
@@ -259,68 +331,58 @@ impl Registry {
             }
         })
         .await
-        .map_err(|e| WalError::Corrupt(format!("local copy task: {e}")))??;
+        .map_err(|e| WalError::Corrupt(format!("local copy task: {e}")))
+        .and_then(|r| r);
+        let marked_here = match marked_here {
+            Ok(v) => v,
+            Err(e) => {
+                if let Some(slot) = &slot {
+                    drop_own_slot(&prefixed, slot).await;
+                }
+                return Err(e);
+            }
+        };
 
         let buf = manifest.encode_to_vec();
-        match prefixed
+        let put = prefixed
             .put(
                 keys::MANIFEST,
                 PutBody::Bytes(bytes::Bytes::from(buf)),
                 PutMode::Create.into(),
             )
-            .await
-        {
-            Ok(meta) => {
-                // The Create landed, so nothing cached or on disk belongs to this
-                // manifest. Evict the stale handle so `open` cannot hand it out, then
-                // wait for its in-flight work before the directory is reset in place:
-                // holders keep the path, so the handle is retired and drained first.
-                // Nothing is cached until the new copy is fully built, so a failure
-                // below leaves `open` to rebuild from the manifest.
-                let stale = self.repos.remove(id).map(|(_, handle)| handle);
-                self.invalidate_listing();
-                if let Some(handle) = &stale {
-                    handle.retire_and_drain().await;
+            .await;
+        let landed: Result<(Manifest, walgit_store::Version), WalError> = match (put, &slot) {
+            (Ok(meta), _) => Ok((manifest, meta.version)),
+            (Err(StoreError::PreconditionFailed { .. }), None) => Err(WalError::AlreadyExists),
+            // A 412 is a concurrent creator, or a client library retrying our own landed
+            // Create: the segment is deleted only when the manifest lists neither it nor a fold.
+            (Err(StoreError::PreconditionFailed { .. }), Some(slot)) => {
+                match slot_evidence(&prefixed, slot).await {
+                    Ok(SlotEvidence::Committed(fresh, version)) => Ok((*fresh, version)),
+                    Ok(SlotEvidence::Unlisted) => {
+                        drop_own_slot(&prefixed, slot).await;
+                        Err(WalError::AlreadyExists)
+                    }
+                    Ok(SlotEvidence::Unknown) => Err(WalError::CommitUnknown(
+                        "repository Create answered 412 and the manifest no longer shows whether it landed"
+                            .into(),
+                    )),
+                    Err(e) => Err(e),
                 }
-                let cache_root = self.cache_root.clone();
-                let owned_id = id.clone();
-                let local = tokio::task::spawn_blocking(move || {
-                    reset_local_copy(&cache_root, &owned_id, format)
-                })
-                .await
-                .map_err(|e| WalError::Corrupt(format!("local copy task: {e}")))??;
-
-                let state = RepoState {
-                    manifest_version: Some(meta.version.as_str().to_string()),
-                    revision: manifest.revision,
-                    packs_revision: manifest.revision,
-                    ..Default::default()
-                };
-                save_state(local.path(), &state)?;
-
-                let handle = RepoHandle::new(
-                    id.clone(),
-                    local,
-                    prefixed,
-                    self.cfg.clone(),
-                    manifest,
-                    Some(meta.version),
-                    state,
-                    self.tasks.clone(),
-                    self.blocks.clone(),
-                );
-                let handle = Arc::new(handle);
-                handle.set_self_arc(handle.clone());
-
-                self.repos.insert(id.clone(), handle.clone());
-                self.invalidate_listing();
-                Ok(handle)
             }
-            Err(StoreError::PreconditionFailed { .. }) => {
+            (Err(e), None) => Err(WalError::Store(e)),
+            (Err(e), Some(slot)) => match cas_landed(&prefixed, slot).await {
+                Ok(Some(landed)) => Ok(landed),
+                _ => Err(WalError::CommitUnknown(e.to_string())),
+            },
+        };
+        let (manifest, version) = match landed {
+            Ok(landed) => landed,
+            Err(WalError::AlreadyExists) => {
                 if marked_here {
                     let _ = tokio::fs::remove_file(&marker).await;
                 }
-                Err(WalError::AlreadyExists)
+                return Err(WalError::AlreadyExists);
             }
             Err(e) => {
                 // The Create may have landed behind a lost reply: the marker stays, and
@@ -329,9 +391,71 @@ impl Registry {
                     self.invalidate_listing();
                     stale.retire_and_drain().await;
                 }
-                Err(WalError::Store(e))
+                return Err(e);
             }
+        };
+
+        if let Some(slot) = &slot {
+            sweep_burned(&prefixed, slot).await;
         }
+
+        // The Create landed, so nothing cached or on disk belongs to this
+        // manifest. Evict the stale handle so `open` cannot hand it out, then
+        // wait for its in-flight work before the directory is reset in place:
+        // holders keep the path, so the handle is retired and drained first.
+        // Nothing is cached until the new copy is fully built, so a failure
+        // below leaves `open` to rebuild from the manifest.
+        let stale = self.repos.remove(id).map(|(_, handle)| handle);
+        self.invalidate_listing();
+        if let Some(handle) = &stale {
+            handle.retire_and_drain().await;
+        }
+        if manifest.revision != 1 {
+            // Resolved by evidence and the repository has moved on since our Create: the local
+            // copy built below would lag the manifest version it is stamped with. The marker
+            // makes `open` rebuild it from the manifest.
+            drop(guard);
+            return self.open(id).await;
+        }
+
+        let cache_root = self.cache_root.clone();
+        let owned_id = id.clone();
+        let local =
+            tokio::task::spawn_blocking(move || reset_local_copy(&cache_root, &owned_id, format))
+                .await
+                .map_err(|e| WalError::Corrupt(format!("local copy task: {e}")))??;
+        if let Some(txn) = &initial {
+            local.apply_ref_txn(txn, false)?;
+        }
+        let state = RepoState {
+            manifest_version: Some(version.as_str().to_string()),
+            applied_seq: manifest.head_seq,
+            revision: manifest.revision,
+            packs_revision: manifest.revision,
+            ..Default::default()
+        };
+        save_state(local.path(), &state)?;
+
+        let head_seq = manifest.head_seq;
+        let handle = RepoHandle::new(
+            id.clone(),
+            local,
+            prefixed.clone(),
+            self.cfg.clone(),
+            manifest,
+            Some(version),
+            state,
+            self.tasks.clone(),
+            self.blocks.clone(),
+        );
+        let handle = Arc::new(handle);
+        handle.set_self_arc(handle.clone());
+        if head_seq > 0 {
+            crate::publish::note_entry_time(&handle, head_seq, &created_at);
+        }
+        self.repos.insert(id.clone(), handle.clone());
+        self.invalidate_listing();
+        Ok(handle)
     }
 
     /// Open or create. Losing a create race (another request or host created it
