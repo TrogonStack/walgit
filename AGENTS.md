@@ -106,7 +106,7 @@ machines whose "disk" is 20 GiB of tmpfs, next to a long tail of small repositor
   the token and names `/_auth/tokens`); sets exactly `credential.https://<host>.helper` = `""` then ours,
   `fetch.uriProtocols https`; self-tests
   (`/api/v1/me`, or `ls-remote` of `?repo=`). Recipes come from one place (`setup::Recipes`,
-  `/services/setup.json`); the Clone menu, API page, overview and git error help render them.
+  `/services/setup.json`); the Clone menu, API page and overview render them.
 - **Host to host**: a front that forwards pushes to a broker presents `wal.push_broker_token` (or
   `WALGIT_BROKER_TOKEN`); the broker lists it in `tokens` and its principal in `trusted_forwarders`, so the end
   user travels in `X-Walgit-Principal`.

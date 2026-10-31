@@ -1162,8 +1162,20 @@ impl Settings for Config {
         if a.mode == AuthMode::Oidc {
             if let Some(name) = &a.provider_name {
                 anyhow::ensure!(
-                    !name.trim().is_empty() && !name.chars().any(char::is_control),
-                    "server.auth.provider_name must be nonempty and contain no control characters"
+                    !name.trim().is_empty()
+                        && name.len() <= 256
+                        && !name.chars().any(|c| {
+                            c.is_control()
+                                || matches!(
+                                    c,
+                                    '\u{061C}'
+                                        | '\u{200E}'
+                                        | '\u{200F}'
+                                        | '\u{202A}'..='\u{202E}'
+                                        | '\u{2066}'..='\u{2069}'
+                                )
+                        }),
+                    "server.auth.provider_name must be nonempty, at most 256 bytes, and contain no control or bidirectional formatting characters"
                 );
             }
             anyhow::ensure!(
@@ -1759,7 +1771,16 @@ audiences = ["git"]
         assert_eq!(cfg.server.auth.provider_name.as_deref(), Some("Équipe SSO"));
         assert_eq!(cfg.server.auth.issuer, "https://login.example.com");
 
-        for invalid in ["", "   ", "Acme\nSSO", "Acme\x1b[31mSSO"] {
+        let oversized = "A".repeat(257);
+        for invalid in [
+            "",
+            "   ",
+            "Acme\nSSO",
+            "Acme\x1b[31mSSO",
+            "Acme\u{202E}OSS",
+            "Acme\u{2066}SSO",
+            oversized.as_str(),
+        ] {
             cfg.server.auth.provider_name = Some(invalid.into());
             let err = cfg.validate().unwrap_err();
             assert!(err.to_string().contains("provider_name"), "{err}");
