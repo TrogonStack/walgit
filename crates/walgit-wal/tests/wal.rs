@@ -4040,3 +4040,31 @@ async fn publish_head_needs_an_existing_target_on_every_attempt_and_is_idempoten
         Err(walgit_wal::WalError::Git(_))
     ));
 }
+
+#[tokio::test]
+async fn replayed_refs_carry_the_implicit_head_when_nothing_records_one() {
+    let cache = tempfile::tempdir().unwrap();
+    let registry = Registry::new(
+        MemoryStore::shared(),
+        Arc::new(make_config(cache.path(), 0)),
+    );
+    let work = WorkRepo::new();
+
+    let plain = registry
+        .create(&repo_id("o", "plain"), ObjectFormat::Sha1)
+        .await
+        .unwrap();
+    seed_commit(&plain, &work).await;
+    let snap = plain
+        .refs_at_seq(&plain.manifest(), plain.manifest().head_seq)
+        .await
+        .unwrap();
+    assert_eq!(snap.head_target, "refs/heads/main");
+
+    let trunk = registry
+        .create_with_default_branch(&repo_id("o", "trunk"), ObjectFormat::Sha1, "trunk")
+        .await
+        .unwrap();
+    let snap = trunk.refs_at_seq(&trunk.manifest(), 1).await.unwrap();
+    assert_eq!(snap.head_target, "refs/heads/trunk");
+}

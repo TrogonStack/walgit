@@ -565,7 +565,7 @@ async fn check_truth(c: &Cluster, pushers: &[Pusher]) -> Result<()> {
     for e in &log {
         if let Some(t) = &e.txn {
             // A symbolic update (HEAD's target: the heal a push into a repository without
-            // `main` carries, D52) names a ref, not an object: nothing to fold or fetch.
+            // `main` carries, D54) names a ref, not an object: nothing to fold or fetch.
             for u in t
                 .updates
                 .iter()
