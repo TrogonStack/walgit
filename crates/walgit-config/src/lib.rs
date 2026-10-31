@@ -44,12 +44,8 @@ pub struct Config {
 #[serde(deny_unknown_fields, default)]
 pub struct ServerConfig {
     pub listen: SocketAddr,
-    pub http2: bool,
-    pub max_concurrent_requests: usize,
     /// Per-repo cap on concurrent upload-pack/receive-pack processes.
     pub max_concurrent_per_repo: usize,
-    #[serde(with = "humantime_serde")]
-    pub request_timeout: Duration,
     /// Graceful drain after SIGTERM: new object work (fetch/push/LFS) is
     /// refused with 503 + Retry-After and `/readyz` turns 503 at once; in-flight
     /// requests and the running maintenance unit get this long to finish
@@ -268,7 +264,6 @@ pub enum StoreBackend {
 pub struct GcsConfig {
     /// gRPC endpoint.
     pub endpoint: String,
-    pub direct_connectivity: bool,
     /// Service account for signed URLs; None = ADC/IAM signBlob.
     pub signing_service_account: Option<String>,
     /// Separate data clients (own channels) for bulk traffic — pack/idx/side-
@@ -584,11 +579,8 @@ pub struct UpstreamConfig {
     reason = "Independent configuration switches, not mutually exclusive states"
 )]
 pub struct GitConfig {
-    /// Path to the upstream git binary (repack, optional upload-pack engine).
-    pub binary: PathBuf,
     pub upload_pack_engine: UploadPackEngine,
     pub allow_filter: bool,
-    pub allow_any_sha1_in_want: bool,
     /// Default object format for new repos.
     pub object_format: ObjectFormat,
     /// Maintain a split commit-graph chain per local repo: tier-2 packs that
@@ -863,10 +855,7 @@ impl Default for ServerConfig {
     fn default() -> Self {
         ServerConfig {
             listen: std::net::SocketAddr::from(([127, 0, 0, 1], 8080)),
-            http2: true,
-            max_concurrent_requests: 512,
             max_concurrent_per_repo: 64,
-            request_timeout: Duration::from_hours(1),
             drain_timeout: Duration::from_secs(20),
             max_push_bytes: ByteSize::gib(64),
             roles: vec![],
@@ -919,7 +908,6 @@ impl Default for GcsConfig {
     fn default() -> Self {
         GcsConfig {
             endpoint: "https://storage.googleapis.com".into(),
-            direct_connectivity: true,
             signing_service_account: None,
             bulk_clients: 4,
             bulk_concurrency: 32,
@@ -991,10 +979,8 @@ impl Default for LfsConfig {
 impl Default for GitConfig {
     fn default() -> Self {
         GitConfig {
-            binary: PathBuf::from("git"),
             upload_pack_engine: UploadPackEngine::Auto,
             allow_filter: true,
-            allow_any_sha1_in_want: false,
             object_format: ObjectFormat::Sha1,
             commit_graph: true,
             commit_graph_changed_paths: false,
@@ -1503,10 +1489,12 @@ mod tests {
         // `Config::parse` (startup) reads the process env through the same path.
         let mut c = Config::default();
         assert!(
-            c.apply_env(vec![("WALGIT__GIT__BINARI".to_string(), "g".to_string())].into_iter())
-                .unwrap_err()
-                .to_string()
-                .contains("did you mean WALGIT__GIT__BINARY?")
+            c.apply_env(
+                vec![("WALGIT__GIT__HISTORY_PAC".to_string(), "g".to_string())].into_iter()
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("did you mean WALGIT__GIT__HISTORY_PACK?")
         );
     }
 
@@ -1535,17 +1523,23 @@ mod tests {
         let err = c
             .apply_env(
                 vec![
-                    ("WALGIT__SERVER__HTTP2".to_string(), "1".to_string()),
+                    (
+                        "WALGIT__SERVER__ACCEL_REDIRECT".to_string(),
+                        "1".to_string(),
+                    ),
                     ("WALGIT__STORE__BUCKET__NAME".to_string(), "b".to_string()),
                 ]
                 .into_iter(),
             )
             .unwrap_err()
             .to_string();
-        assert!(err.contains("WALGIT__SERVER__HTTP2: "), "{err}");
+        assert!(err.contains("WALGIT__SERVER__ACCEL_REDIRECT: "), "{err}");
         assert!(err.contains("WALGIT__STORE__BUCKET__NAME: "), "{err}");
         assert!(err.contains("not a table"), "{err}");
-        assert_eq!(c.server.http2, Config::default().server.http2);
+        assert_eq!(
+            c.server.accel_redirect,
+            Config::default().server.accel_redirect
+        );
         assert_eq!(c.store.bucket, "20260915");
     }
 
@@ -1562,6 +1556,17 @@ mod tests {
         base.store.bucket = "b".into();
         assert!(base.with_settings("[bundles]\nenabled = false\n").is_err());
         assert!(!base.public_settings_toml().unwrap().contains("[bundles]"));
+    }
+
+    #[test]
+    fn removed_global_request_limit_configuration_is_rejected() {
+        for input in [
+            "[server]\nmax_concurrent_requests = 512\n",
+            "[server]\nrequest_timeout = \"1h\"\n",
+        ] {
+            assert!(Config::parse(input).is_err(), "{input}");
+            assert!(Config::default().with_settings(input).is_err(), "{input}");
+        }
     }
 
     #[test]
@@ -1582,6 +1587,23 @@ mod tests {
                 .unwrap()
                 .contains("[compaction]")
         );
+    }
+
+    #[test]
+    fn removed_git_binary_configuration_is_rejected() {
+        let input = "[git]\nbinary = \"/opt/git/bin/git\"\n";
+        assert!(Config::parse(input).is_err());
+        assert!(Config::default().with_settings(input).is_err());
+    }
+
+    #[test]
+    fn removed_transport_switches_are_rejected() {
+        for input in [
+            "[server]\nhttp2 = false\n",
+            "[store.gcs]\ndirect_connectivity = false\n",
+        ] {
+            assert!(Config::parse(input).is_err(), "{input}");
+        }
     }
 
     #[test]
