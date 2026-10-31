@@ -153,6 +153,9 @@ pub struct AuthConfig {
     /// (Google, Microsoft Entra, Okta, Auth0, Keycloak, Dex, GitLab, ...). No default:
     /// `Config::validate` refuses `oidc` mode until it is set.
     pub issuer: String,
+    /// Friendly OIDC provider name for client-facing authentication help. Unset: show `issuer`.
+    /// Display only; does not affect discovery or token validation.
+    pub provider_name: Option<String>,
     /// Email domains accepted by `oidc` (the `email` claim, `email_verified` required).
     pub allowed_domains: Vec<String>,
     /// Individual identities accepted by `oidc` (exact `email` match).
@@ -875,6 +878,7 @@ impl Default for AuthConfig {
             anonymous_read: true,
             tokens: vec![],
             issuer: String::new(),
+            provider_name: None,
             allowed_domains: vec![],
             allowed_emails: vec![],
             audiences: vec![],
@@ -1156,6 +1160,24 @@ impl Settings for Config {
             );
         }
         if a.mode == AuthMode::Oidc {
+            if let Some(name) = &a.provider_name {
+                anyhow::ensure!(
+                    !name.trim().is_empty()
+                        && name.len() <= 256
+                        && !name.chars().any(|c| {
+                            c.is_control()
+                                || matches!(
+                                    c,
+                                    '\u{061C}'
+                                        | '\u{200E}'
+                                        | '\u{200F}'
+                                        | '\u{202A}'..='\u{202E}'
+                                        | '\u{2066}'..='\u{2069}'
+                                )
+                        }),
+                    "server.auth.provider_name must be nonempty, at most 256 bytes, and contain no control or bidirectional formatting characters"
+                );
+            }
             anyhow::ensure!(
                 !a.anonymous_read,
                 "server.auth.anonymous_read must be false in oidc mode"
@@ -1720,6 +1742,51 @@ audiences = ["walgit-cli", "https://git.example.com"]
         assert_eq!(none.server.auth.issuer, "");
         let tok = Config::parse("[store]\nbucket = \"b\"\n[server.auth]\nmode = \"token\"\ntokens = [{ principal = \"ci\", token = \"s\" }]\n").unwrap();
         assert_eq!(tok.server.auth.issuer, "");
+    }
+
+    #[test]
+    fn oidc_provider_name_is_display_only_and_safe_for_terminal_output() {
+        let mut cfg = Config::parse(
+            r#"
+[server.auth]
+mode = "oidc"
+issuer = "https://login.example.com"
+provider_name = "Acme SSO"
+anonymous_read = false
+allowed_domains = ["example.com"]
+audiences = ["git"]
+"#,
+        )
+        .unwrap();
+        assert_eq!(cfg.server.auth.provider_name.as_deref(), Some("Acme SSO"));
+        cfg.apply_env(
+            [(
+                "WALGIT__SERVER__AUTH__PROVIDER_NAME".into(),
+                "Équipe SSO".into(),
+            )]
+            .into_iter(),
+        )
+        .unwrap();
+        cfg.validate().unwrap();
+        assert_eq!(cfg.server.auth.provider_name.as_deref(), Some("Équipe SSO"));
+        assert_eq!(cfg.server.auth.issuer, "https://login.example.com");
+
+        let oversized = "A".repeat(257);
+        for invalid in [
+            "",
+            "   ",
+            "Acme\nSSO",
+            "Acme\x1b[31mSSO",
+            "Acme\u{202E}OSS",
+            "Acme\u{2066}SSO",
+            oversized.as_str(),
+        ] {
+            cfg.server.auth.provider_name = Some(invalid.into());
+            let err = cfg.validate().unwrap_err();
+            assert!(err.to_string().contains("provider_name"), "{err}");
+        }
+        cfg.server.auth.provider_name = None;
+        cfg.validate().unwrap();
     }
 
     #[test]
